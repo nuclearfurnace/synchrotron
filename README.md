@@ -1,2 +1,2 @@
-# amaranthine
+# synchrotron
 Caching layer load balancer.
