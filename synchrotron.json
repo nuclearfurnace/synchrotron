@@ -1,0 +1,14 @@
+{
+  "pools": [
+    {
+      "pool_type": "redis",
+      "pool_address": "127.0.0.1:6380",
+      "pool_options": {
+        "hash": "md5"
+      },
+      "backends": [
+        "127.0.0.1:6379:1"
+      ]
+    }
+  ]
+}
