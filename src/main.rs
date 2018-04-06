@@ -16,9 +16,9 @@ extern crate rs_futures_spmc;
 extern crate net2;
 
 use tokio::prelude::*;
-use tokio::io::copy;
 use tokio::reactor::Handle;
 use rs_futures_spmc::channel;
+use std::thread;
 
 #[macro_use]
 extern crate log;
@@ -31,10 +31,9 @@ extern crate slog_async;
 
 use slog::Drain;
 
-use std::thread;
-
 mod config;
 mod listener;
+mod pool;
 
 use config::Configuration;
 
@@ -53,17 +52,13 @@ fn main() {
             debug!("[core] signal received: {:?}", signal);
 
             match signal {
-                Signal::USR1 => {
-                    // signal to spawn new process
-                },
+                Signal::USR1 => {}, // signal to spawn new process
                 Signal::INT => {
                     // signal to close this process
                     let _ = close_tx.send(()).wait();
                     break;
                 },
-                _ => {
-                    // we don't care about the rest
-                }
+                _ => {} // we don't care about the rest
             }
         }
     });
@@ -82,40 +77,25 @@ fn main() {
     let _log_guard = slog_stdlog::init().unwrap();
     info!("[core] logging configured");
 
+
     tokio::run(future::lazy(move || {
-        // set up our listeners
+        // Spin up all of the configured pools.
         let configuration = Configuration::from_path("synchrotron.json")
             .unwrap();
 
         for pool_config in configuration.pools {
             let close = close_rx.clone();
-            let pool_address = pool_config.pool_address.clone();
+            let config = pool_config.clone();
             let reactor = Handle::current();
-            let listener = listener::get_listener(&pool_address, &reactor).unwrap();
-            let server = listener.incoming()
-                .map_err(|e| error!("accept failed = {:?}", e))
-                .for_each(|sock| {
-                    let (reader, writer) = sock.split();
-                    let bytes_copied = copy(reader, writer);
-                    let handle_conn = bytes_copied.map(|amt| {
-                        info!("wrote {:?} bytes", amt)
-                    }).map_err(|e| {
-                        error!("IO error {:?}", e)
-                    });
 
-                    tokio::spawn(handle_conn)
-                })
-                .select2(close.into_future())
-                .then(|_| {
-                    info!("[pool] shutting down listener");
-                    future::ok(())
-                });
+            let pool = pool::from_config(reactor, config, close);
+            tokio::spawn(pool);
 
-            tokio::spawn(server);
-
-            info!("[pool] listening on {}...", pool_address);
+            info!("[pool] starting listening '{}'", pool_config.address);
         }
 
+        info!("[core] synchrotron running");
+
         Ok(())
-    }));
+    }))
 }

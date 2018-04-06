@@ -9,12 +9,13 @@ pub struct Configuration {
     pub pools: Vec<PoolConfiguration>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct PoolConfiguration {
-    pub pool_type: String,
-    pub pool_address: String,
-    pub pool_options: HashMap<String, String>,
-    pub backends: Vec<String>,
+    pub protocol: String,
+    pub address: String,
+    pub options: HashMap<String, String>,
+    pub backends: HashMap<String, Vec<String>>,
+    pub routing: HashMap<String, String>,
 }
 
 impl Configuration {
