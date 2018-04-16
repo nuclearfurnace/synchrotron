@@ -1,3 +1,4 @@
+#![feature(test)]
 #![recursion_limit = "1024"]
 
 #[macro_use]
@@ -11,9 +12,12 @@ extern crate chan_signal;
 use chan_signal::Signal;
 
 extern crate tokio;
+extern crate tokio_io;
+#[macro_use]
 extern crate futures;
 extern crate rs_futures_spmc;
 extern crate net2;
+extern crate multiqueue;
 
 use tokio::prelude::*;
 use tokio::reactor::Handle;
@@ -31,9 +35,21 @@ extern crate slog_async;
 
 use slog::Drain;
 
+extern crate bytes;
+extern crate atoi;
+extern crate rand;
+
+#[cfg(test)]
+extern crate test;
+
+#[cfg(test)]
+extern crate spectral;
+
 mod config;
 mod listener;
 mod pool;
+mod protocol;
+mod backend;
 
 use config::Configuration;
 
@@ -49,7 +65,7 @@ fn main() {
     thread::spawn(move || {
         loop {
             let signal = signals.recv().unwrap();
-            debug!("[core] signal received: {:?}", signal);
+            info!("[core] signal received: {:?}", signal);
 
             match signal {
                 Signal::USR1 => {}, // signal to spawn new process

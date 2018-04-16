@@ -6,11 +6,9 @@
       "options": {
         "hash": "md5"
       },
-      "backends": {
-        "main": [
-          "127.0.0.1:6379:1"
-        ]
-      },
+      "backends": [
+        "127.0.0.1:6379"
+      ],
       "routing": {
         "type": "random"
       }

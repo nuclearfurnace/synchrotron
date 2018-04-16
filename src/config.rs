@@ -2,6 +2,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::io;
 use std::fs::File;
+use std::net::SocketAddr;
 use std::path::Path;
 
 #[derive(Deserialize, Debug)]
@@ -14,7 +15,7 @@ pub struct PoolConfiguration {
     pub protocol: String,
     pub address: String,
     pub options: HashMap<String, String>,
-    pub backends: HashMap<String, Vec<String>>,
+    pub backends: Vec<SocketAddr>,
     pub routing: HashMap<String, String>,
 }
 

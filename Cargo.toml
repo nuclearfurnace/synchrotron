@@ -14,8 +14,17 @@ serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 tokio = "0.1.5"
+tokio-io = "0.1.6"
 futures = "0.1"
 net2 = "0.2.32"
 rs-futures-spmc = { git = "https://github.com/mredlek/rs-futures-spmc" }
 chan = "0.1.19"
 chan-signal = "0.3.1"
+bytes = "0.4"
+atoi = "0.2.3"
+multiqueue = "0.3.2"
+rand = "0.5.0-pre.0"
+
+[dev-dependencies]
+spectral = "0.6.0"
+matches = "0.1.6"
