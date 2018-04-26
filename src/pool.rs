@@ -2,6 +2,7 @@ use std::io::Error;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio;
+use tokio::io;
 use tokio::reactor::Handle;
 use tokio::net::TcpStream;
 use tokio_io::AsyncRead;
@@ -24,16 +25,21 @@ pub fn from_config(reactor: Handle, config: PoolConfiguration, close: Receiver<(
     let listener = listener::get_listener(&listen_address, &reactor).unwrap();
     listener.incoming()
         .map_err(|e| error!("[pool] accept failed: {:?}", e))
-        .for_each(|socket| {
+        .for_each(move |socket| {
             let clone_pool = backend_pool.clone();
-            let proto = protocol::RedisClientProtocol::new(socket)
+            let (client_rx, client_tx) = socket.split();
+            let proto = protocol::RedisClientProtocol::new(client_rx)
                 .map_err(|e| { error!("[client] caught error while reading from client: {:?}", e); })
-                .for_each(|cmd| {
-                    info!("got command: {:?}", cmd);
-                    let mut pool = backend_pool.lock().unwrap();
-                    let mut stream = pool.get();
+                .for_each(move |cmd| {
+                    let mut pool = clone_pool.lock().unwrap();
+                    let backend = (*pool).get();
+                    let process = backend
+                        .and_then(move |server| io::write_all(server, cmd.buf()))
+                        .and_then(|(server, _)| io::copy(server, client_tx))
+                        .map(|(n, _, _)| info!("wrote {} bytes from server to client", n))
+                        .map_err(|err| error!("IO error {:?}", err));
 
-                    Ok(())
+                    tokio::spawn(process)
                 });
 
             tokio::spawn(proto)

@@ -1,7 +1,6 @@
 use std::io::{Error, ErrorKind};
 use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncWrite, AsyncRead};
-use tokio::net::TcpStream;
+use tokio::io::AsyncRead;
 use futures::prelude::*;
 use atoi::atoi;
 
@@ -14,10 +13,11 @@ const REDIS_COMMAND_MULTI: u8 = '*' as u8;
 const REDIS_CLIENT_ERROR_BAD_COMMAND_FORMAT: &str = "bad command format";
 const REDIS_CLIENT_ERROR_NON_RESP_PAYLOAD: &str = "payload must be in RESP format";
 
-pub struct RedisClientProtocol {
-    socket: TcpStream,
+pub struct RedisClientProtocol<R>
+    where R: AsyncRead
+{
+    rx: R,
     rd: BytesMut,
-    wr: BytesMut,
 }
 
 #[derive(Debug)]
@@ -34,6 +34,10 @@ pub struct RedisCommand {
 impl RedisCommand {
     pub fn args(&self) -> &Vec<RedisCommandArg> {
         &self.args
+    }
+
+    pub fn buf(&self) -> BytesMut {
+        self.buf.clone()
     }
 }
 
@@ -71,35 +75,21 @@ impl RedisCommand {
 }
 
 // shamelessly inspired from Tokio's chat server example
-impl RedisClientProtocol {
-    pub fn new(socket: TcpStream) -> Self {
+impl<R> RedisClientProtocol<R>
+    where R: AsyncRead
+{
+    pub fn new(rx: R) -> Self {
         RedisClientProtocol {
-            socket,
+            rx: rx,
             rd: BytesMut::new(),
-            wr: BytesMut::new(),
         }
-    }
-
-    fn buffer(&mut self, buf: &[u8]) {
-        self.wr.reserve(buf.len());
-        self.wr.put(buf);
-    }
-
-    fn poll_flush(&mut self) -> Poll<(), Error> {
-        while !self.wr.is_empty() {
-            let n = try_ready!(self.socket.poll_write(&self.wr));
-            assert!(n > 0);
-            let _ = self.wr.split_to(n);
-        }
-
-        Ok(Async::Ready(()))
     }
 
     fn fill_read_buf(&mut self) -> Poll<(), Error> {
         loop {
             self.rd.reserve(1024);
 
-            let n = try_ready!(self.socket.read_buf(&mut self.rd));
+            let n = try_ready!(self.rx.read_buf(&mut self.rd));
             if n == 0 {
                 return Ok(Async::Ready(()));
             }
@@ -107,7 +97,9 @@ impl RedisClientProtocol {
     }
 }
 
-impl Stream for RedisClientProtocol {
+impl<R> Stream for RedisClientProtocol<R>
+    where R: AsyncRead
+{
     type Item = RedisCommand;
     type Error = Error;
 
