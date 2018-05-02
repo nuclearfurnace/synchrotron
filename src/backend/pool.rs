@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use rand::{thread_rng, RngCore};
-use futures::future;
-use futures::future::{Future, Either};
+use futures::prelude::*;
 use tokio::net::TcpStream;
-use tokio::io::Error;
+use multiqueue::{mpmc_queue, MPMCSender, MPMCReceiver};
+use std::sync::mpsc::{TrySendError, TryRecvError};
 
 pub struct BackendDescriptor;
 
@@ -16,26 +17,67 @@ impl BackendDescriptor {
 
 pub struct Backend {
     address: SocketAddr,
-    conns: Vec<TcpStream>,
+    conns_tx: Arc<MPMCSender<TcpStream>>,
+    conns_rx: Arc<MPMCReceiver<TcpStream>>,
 }
 
 impl Backend {
     pub fn new(addr: SocketAddr) -> Backend {
+        let (conns_tx, conns_rx) = mpmc_queue(1);
+
         Backend {
             address: addr,
-            conns: Vec::new(),
+            conns_tx: Arc::new(conns_tx),
+            conns_rx: Arc::new(conns_rx),
         }
     }
 
-    pub fn get(&mut self) -> impl Future<Item=TcpStream, Error=Error> {
-        match self.conns.pop() {
-            Some(conn) => Either::B(future::ok::<TcpStream, Error>(conn)),
-            None => Either::A(TcpStream::connect(&self.address)),
+    pub fn subscribe(&self) -> BackendParticipant {
+        BackendParticipant {
+            conns_tx: self.conns_tx.clone(),
+            conns_rx: self.conns_rx.clone(),
+        }
+    }
+}
+
+/// A placeholder for a caller interested in getting a connection from a backend.
+///
+/// This wraps the underlying MPMC queue that we use for shuttling connections in and out of the
+/// Backend itself in a Stream/Sink compatible footprint.
+pub struct BackendParticipant {
+    conns_tx: Arc<MPMCSender<TcpStream>>,
+    conns_rx: Arc<MPMCReceiver<TcpStream>>,
+}
+
+impl Stream for BackendParticipant {
+    type Item = TcpStream;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        // TODO: how do we signal demand (to create new streams, or replenish when old streams die)
+        // when we have no coordination point with the parent `Backend`?
+        match self.conns_rx.try_recv() {
+            Ok(conn) => Ok(Async::Ready(Some(conn))),
+            Err(TryRecvError::Empty) => Ok(Async::NotReady),
+            Err(TryRecvError::Disconnected) => panic!("backend conn sender disconnected!"),
+        }
+    }
+}
+
+impl Sink for BackendParticipant {
+    type SinkItem = TcpStream;
+    type SinkError = ();
+
+    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+        match self.conns_tx.try_send(item) {
+            Ok(_) => Ok(AsyncSink::Ready),
+            Err(TrySendError::Full(msg)) => Ok(AsyncSink::NotReady(msg)),
+            Err(TrySendError::Disconnected(_)) => panic!("backend conn receiver disconnected!"),
         }
     }
 
-    pub fn put(&mut self, stream: TcpStream) {
-        self.conns.push(stream);
+    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+        Ok(Async::Ready(()))
     }
 }
 
@@ -72,7 +114,7 @@ pub struct BackendPool<D>
 {
     addresses: Vec<SocketAddr>,
     distributor: D,
-    backends: Vec<Backend>,
+    backends: Vec<Arc<Backend>>,
 }
 
 impl<D> BackendPool<D>
@@ -84,10 +126,10 @@ impl<D> BackendPool<D>
         let mut descriptors = vec![];
         for address in &addresses {
             let backend = Backend::new(address.clone());
-            backends.push(backend);
+            backends.push(Arc::new(backend));
 
             // eventually, we'll populate this with weight, etc, so that
-            // so can... do weighted things.
+            // we can actually do weighted things.
             let descriptor = BackendDescriptor::new();
             descriptors.push(descriptor);
         }
@@ -102,10 +144,10 @@ impl<D> BackendPool<D>
         }
     }
 
-    pub fn get(&mut self) -> impl Future<Item=TcpStream, Error=Error> {
+    pub fn get(&mut self) -> BackendParticipant {
         let backend_idx = self.distributor.choose(1);
-        match self.backends.get_mut(backend_idx) {
-            Some(backend) => backend.get(),
+        match self.backends.get(backend_idx) {
+            Some(backend) => backend.subscribe(),
             None => unreachable!("incorrect backend idx"),
         }
     }

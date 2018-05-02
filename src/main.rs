@@ -37,6 +37,7 @@ use slog::Drain;
 
 extern crate bytes;
 extern crate atoi;
+extern crate itoa;
 extern crate rand;
 
 #[cfg(test)]

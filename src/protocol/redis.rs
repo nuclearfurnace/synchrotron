@@ -1,8 +1,10 @@
 use std::io::{Error, ErrorKind};
 use bytes::{BufMut, BytesMut};
-use tokio::io::AsyncRead;
+use tokio::io;
+use tokio::io::{AsyncRead, AsyncWrite};
 use futures::prelude::*;
 use atoi::atoi;
+use itoa;
 
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
 const REDIS_COMMAND_STATUS: u8 = '+' as u8;
@@ -10,76 +12,66 @@ const REDIS_COMMAND_INTEGER: u8 = ':' as u8;
 const REDIS_COMMAND_BULK: u8 = '$' as u8;
 const REDIS_COMMAND_MULTI: u8 = '*' as u8;
 
-const REDIS_CLIENT_ERROR_BAD_COMMAND_FORMAT: &str = "bad command format";
+const REDIS_NULL_BUF: [u8; 5] = [b'$', b'-', b'1', b'\r', b'\n'];
+const REDIS_OK_BUF: [u8; 5] = [b'+', b'O', b'K', b'\r', b'\n'];
+
+const REDIS_CLIENT_ERROR_PROTOCOL: &str = "protocol error; invalid payload";
 const REDIS_CLIENT_ERROR_NON_RESP_PAYLOAD: &str = "payload must be in RESP format";
 
-pub struct RedisClientProtocol<R>
+pub struct RedisCommandStream<R>
     where R: AsyncRead
 {
     rx: R,
     rd: BytesMut,
 }
 
-#[derive(Debug)]
-pub struct RedisCommandArg {
-    buf: BytesMut,
+pub struct RedisOneshotRead<R>
+    where R: AsyncRead
+{
+    rx: R,
+    rd: BytesMut,
 }
 
-#[derive(Debug)]
-pub struct RedisCommand {
-    buf: BytesMut,
-    args: Vec<RedisCommandArg>,
+pub enum RedisMessage {
+    Null,
+    OK,
+    Integer(BytesMut, i64),
+    Data(BytesMut),
+    Bulk(BytesMut, Vec<RedisMessage>),
+    Status(BytesMut),
 }
 
-impl RedisCommand {
-    pub fn args(&self) -> &Vec<RedisCommandArg> {
-        &self.args
+impl RedisMessage {
+    pub fn from_inline(cmd: &str) -> RedisMessage {
+        let s = cmd.clone();
+        let buf = s.as_bytes();
+        let mut rd = BytesMut::with_capacity(buf.len());
+        rd.put_slice(&buf[..]);
+
+        let bulk = RedisMessage::Data(rd);
+        let args = Vec::new();
+        args.push(bulk);
+
+        RedisMessage::Bulk(rd.clone(), args)
     }
 
-    pub fn buf(&self) -> BytesMut {
-        self.buf.clone()
-    }
-}
-
-impl RedisCommandArg {
-    fn from_buf(buf: BytesMut) -> RedisCommandArg {
-        RedisCommandArg {
-            buf: buf,
-        }
-    }
-
-    pub fn buf(&self) -> &[u8] {
-        self.buf.as_ref()
-    }
-}
-
-impl RedisCommand {
-    fn from_args(buf: BytesMut, args: Vec<RedisCommandArg>) -> RedisCommand {
-        RedisCommand {
-            buf: buf,
-            args: args,
-        }
-    }
-
-    fn from_single(buf: &str) -> RedisCommand {
-        let raw = buf.as_bytes();
-        let mut buf = BytesMut::with_capacity(raw.len());
-        buf.put_slice(raw);
-        let arg = RedisCommandArg::from_buf(buf.clone());
-
-        RedisCommand {
-            buf: buf,
-            args: vec![arg],
+    pub fn as_buf(&self) -> BytesMut {
+        match self {
+            RedisMessage::Null => BytesMut::from(&REDIS_NULL_BUF[..]),
+            RedisMessage::OK => BytesMut::from(&REDIS_OK_BUF[..]),
+            RedisMessage::Status(buf) => buf.clone(),
+            RedisMessage::Integer(buf, _) => buf.clone(),
+            RedisMessage::Data(buf) => buf.clone(),
+            RedisMessage::Bulk(buf, parts) => buf.clone(),
         }
     }
 }
 
-// shamelessly inspired from Tokio's chat server example
-impl<R> RedisClientProtocol<R>
+impl<R> RedisCommandStream<R>
     where R: AsyncRead
 {
     pub fn new(rx: R) -> Self {
-        RedisClientProtocol {
+        RedisCommandStream {
             rx: rx,
             rd: BytesMut::new(),
         }
@@ -97,26 +89,16 @@ impl<R> RedisClientProtocol<R>
     }
 }
 
-impl<R> Stream for RedisClientProtocol<R>
+impl<R> Stream for RedisCommandStream<R>
     where R: AsyncRead
 {
-    type Item = RedisCommand;
+    type Item = RedisMessage;
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
 
-        // Check to see what we have for payload.  We have some special cases and constraints here:
-        // - if the payload is "PING", we package that up by hand.
-        // - if the payload start with "*" -- aka array/multi aka a command -- then we process it
-        //
-        // Everything else is invalid.  We expect to be talking to a client, which should only be
-        // giving us commands to execute on its behalf, and we expect those commands (with the
-        // small exception of PING) to be in RESP format.
-
-        // This is contorted but we can't try `try_ready!` over `read_command` because it has no
-        // concept of the socket being dead (aka Ready(None)), we have to inject that here.
-        match read_command(&mut self.rd) {
+        match read_message(&mut self.rd) {
             Ok(Async::Ready(cmd)) => Ok(Async::Ready(Some(cmd))),
             Err(e) => Err(e),
             _ => match socket_closed {
@@ -128,9 +110,64 @@ impl<R> Stream for RedisClientProtocol<R>
     }
 }
 
-/// Searches `rd` for a CRLF-terminated line, and returns the position within `rd`
-/// to the end of the line, CRLF included.
-fn get_line(rd: &BytesMut) -> Poll<usize, Error> {
+impl<R> RedisOneshotRead<R>
+    where R: AsyncRead
+{
+    pub fn new(rx: R) -> Self {
+        RedisOneshotRead {
+            rx: rx,
+            rd: BytesMut::new(),
+        }
+    }
+
+    fn fill_read_buf(&mut self) -> Poll<(), Error> {
+        loop {
+            self.rd.reserve(1024);
+
+            let n = try_ready!(self.rx.read_buf(&mut self.rd));
+            if n == 0 {
+                return Ok(Async::Ready(()));
+            }
+        }
+    }
+}
+
+impl<R> Future for RedisOneshotRead<R>
+    where R: AsyncRead
+{
+    type Item = (R, RedisMessage);
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let socket_closed = self.fill_read_buf()?.is_ready();
+
+        // This is contorted but we can't try `try_ready!` over `read_message` because it has no
+        // concept of the socket being dead (aka Ready(None)), we have to inject that here.
+        match read_message(&mut self.rd) {
+            Ok(Async::Ready(cmd)) => Ok(Async::Ready((self.rx, cmd))),
+            Err(e) => Err(e),
+            _ => match socket_closed {
+                // If the socket is closed, let's also close up shop.
+                true => Err(Error::new(ErrorKind::Other, "backend closed before sending response")),
+                false => Ok(Async::NotReady),
+            },
+        }
+    }
+}
+
+pub fn read_client_commands<R>(rx: R) -> RedisCommandStream<R>
+    where R: AsyncRead
+{
+    RedisCommandStream::new(rx)
+}
+
+pub fn read_resp<R>(rx: R) -> RedisOneshotRead<R>
+    where R: AsyncRead
+{
+    RedisOneshotRead::new(rx)
+}
+
+fn read_line(rd: &BytesMut) -> Poll<usize, Error> {
     let result = rd.windows(2).enumerate()
         .find(|&(_, bytes)| bytes == b"\r\n")
         .map(|(i, _)| i);
@@ -141,15 +178,15 @@ fn get_line(rd: &BytesMut) -> Poll<usize, Error> {
     }
 }
 
-fn read_multi_count(rd: &BytesMut) -> Poll<(usize, usize, BytesMut), Error> {
+fn read_bulk_count(rd: &BytesMut) -> Poll<(usize, usize, BytesMut), Error> {
     let mut buf = rd.clone();
 
     // Make sure we have a line in our buffer.  We can't possibly proceed without one.
-    let pos = try_ready!(get_line(&buf));
+    let pos = try_ready!(read_line(&buf));
 
     // Make sure it's an array.
     if buf.first() != Some(&REDIS_COMMAND_MULTI) {
-        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_BAD_COMMAND_FORMAT))
+        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))
     }
 
     // Pull out the line into `buf`, leaving the remainder of the buffer in `rest`.
@@ -159,7 +196,7 @@ fn read_multi_count(rd: &BytesMut) -> Poll<(usize, usize, BytesMut), Error> {
     let _ = buf.split_off(buf_len); // Strip CRLF off the end.
     match atoi::<usize>(&buf) {
         Some(count) => Ok(Async::Ready((pos + 2, count, rest))),
-        None => Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_BAD_COMMAND_FORMAT)),
+        None => Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL)),
     }
 }
 
@@ -167,11 +204,11 @@ fn read_bulk_arg(rd: &BytesMut) -> Poll<(usize, BytesMut, BytesMut), Error> {
     let mut buf = rd.clone();
 
     // Make sure we have a line in our buffer.  We can't possibly proceed without one.
-    let len_crlf_pos = try_ready!(get_line(&buf));
+    let len_crlf_pos = try_ready!(read_line(&buf));
 
     // Make sure it's a bulk value.
     if buf.first() != Some(&REDIS_COMMAND_BULK) {
-        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_BAD_COMMAND_FORMAT))
+        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))
     }
 
     // This gets confusing, but, we're trying to find and chop off the "length of argument" line.
@@ -185,7 +222,7 @@ fn read_bulk_arg(rd: &BytesMut) -> Poll<(usize, BytesMut, BytesMut), Error> {
     let mut len_buf = buf.split_off(1); // Strip sigil off the front.
     let len_buf_len = len_buf.len() - 2;
     let _ = len_buf.split_off(len_buf_len); // Strip CRLF off the end.
-    let len = atoi::<usize>(&len_buf).ok_or(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_BAD_COMMAND_FORMAT))?;
+    let len = atoi::<usize>(&len_buf).ok_or(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
 
     // We've parsed the length line, and `bulk_rest` is everything after it.  We need to make sure
     // that we even have enough data left to finish parsing this arg, or we need to signal to the
@@ -207,20 +244,38 @@ fn read_bulk_arg(rd: &BytesMut) -> Poll<(usize, BytesMut, BytesMut), Error> {
     Ok(Async::Ready((total_read, bulk_rest, rest)))
 }
 
-fn read_command(rd: &mut BytesMut) -> Poll<RedisCommand, Error> {
+fn read_message(rd: &mut BytesMut) -> Poll<RedisMessage, Error> {
+    // The only command we handle in non-RESP format is PING.  This is for simplicity
+    // and compatibility with redis-benchmark.
+    if rd.starts_with(&b"ping"[..]) || rd.starts_with(&b"PING"[..]) {
+        return Ok(Async::Ready(RedisMessage::from_inline("ping")))
+    }
+
+    // Try reading a single byte to see if we have a message.  Match it against known
+    // message types, and process accordingly.
+    match rd.first() {
+        None => Ok(Async::NotReady),
+        Some(t) => match t {
+            &REDIS_COMMAND_MULTI => read_bulk(rd),
+            _ => Ok(Async::NotReady),
+        }
+    }
+}
+
+fn read_bulk(rd: &mut BytesMut) -> Poll<RedisMessage, Error> {
+    let mut buf = rd.clone();
+
     // We need to keep track of the total bytes "read" so we can properly slice rd to
     // ignore what we've "read."
     let mut total = 0;
 
-    // Check our special case of "ping".
-    if rd.starts_with(&b"ping"[..]) || rd.starts_with(&b"PING"[..]) {
-        return Ok(Async::Ready(RedisCommand::from_single("ping")))
-    }
+    // Make sure we have a line in our buffer.  We can't possibly proceed without one.
+    let pos = try_ready!(read_line(&buf));
 
     // Get the number of items in the command.
-    let (n, count, mut rest) = try_ready!(read_multi_count(&rd));
+    let (n, count, mut rest) = try_ready!(read_bulk_count(&rd));
     if count < 1 {
-        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_BAD_COMMAND_FORMAT))
+        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))
     }
     total = total + n;
 
@@ -232,12 +287,29 @@ fn read_command(rd: &mut BytesMut) -> Poll<RedisCommand, Error> {
         rest = new_rest;
         total = total + n;
 
-        args.push(RedisCommandArg::from_buf(buf));
+        args.push(RedisMessage::Data(buf));
     }
 
     // Slice off all the bytes we "read", updating the original in the process, and pass them along
     let buf = rd.split_to(total);
-    Ok(Async::Ready(RedisCommand::from_args(buf, args)))
+    Ok(Async::Ready(RedisMessage::Bulk(buf, args)))
+}
+
+pub fn write_resp<T>(tx: T, msg: RedisMessage) -> impl Future<Item=(T, usize), Error=Error>
+    where T: AsyncWrite
+{
+    let buf = msg.as_buf();
+    io::write_all(tx, buf).map(|(w, b)| (w, b.len()))
+}
+
+fn integer_to_buf(val: u64) -> BytesMut {
+    // Forcefully unwrap, because this should never fail.
+    let mut buf = [b'\0'; 20];
+    let n = itoa::write(&mut buf[..], val).unwrap();
+
+    let rd = BytesMut::with_capacity(buf.len());
+    rd.put_slice(&buf[..n]);
+    rd
 }
 
 #[cfg(test)]
@@ -261,7 +333,7 @@ mod tests {
     fn get_command_from_buf(buf: &[u8]) -> DataResult {
         let mut rd = BytesMut::with_capacity(buf.len());
         rd.put_slice(&buf[..]);
-        read_command(&mut rd)
+        read_message(&mut rd)
     }
 
     #[test]
@@ -270,10 +342,10 @@ mod tests {
         assert_that(&res).is_ok().matches(|val| val.is_ready());
 
         match res.unwrap() {
-            Async::Ready(cmd) => {
-                assert_that(cmd.args()).has_length(2);
-                assert_eq!(cmd.args()[0].buf(), b"get");
-                assert_eq!(cmd.args()[1].buf(), b"foobar");
+            Async::Ready(RedisMessage::Bulk(_, ref args)) => {
+                assert_that(args).has_length(2);
+                assert_eq!(args[0].as_buf().as_ref(), b"get");
+                assert_eq!(args[1].as_buf().as_ref(), b"foobar");
             },
             _ => panic!("should have had command"),
         }
@@ -321,9 +393,9 @@ mod tests {
         assert_that(&res).is_ok().matches(|val| val.is_ready());
 
         match res.unwrap() {
-            Async::Ready(cmd) => {
-                assert_that(cmd.args()).has_length(1);
-                assert_eq!(cmd.args()[0].buf(), b"ping");
+            Async::Ready(RedisMessage::Bulk(_, ref args)) => {
+                assert_that(args).has_length(1);
+                assert_eq!(args[0].as_buf().as_ref(), b"ping");
             },
             _ => panic!("should have had command"),
         }
@@ -335,9 +407,9 @@ mod tests {
         assert_that(&res).is_ok().matches(|val| val.is_ready());
 
         match res.unwrap() {
-            Async::Ready(cmd) => {
-                assert_that(cmd.args()).has_length(1);
-                assert_eq!(cmd.args()[0].buf(), b"ping");
+            Async::Ready(RedisMessage::Bulk(_, ref args)) => {
+                assert_that(args).has_length(1);
+                assert_eq!(args[0].as_buf().as_ref(), b"ping");
             },
             _ => panic!("should have had command"),
         }
