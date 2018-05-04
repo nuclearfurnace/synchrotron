@@ -1,3 +1,8 @@
+# Profiling.
+.flamegraph
+out.stacks
+profile.svg
 
+# Normal Rust-y stuff.
 /target/
 **/*.rs.bk
