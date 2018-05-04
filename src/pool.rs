@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokio;
 use tokio::reactor::Handle;
@@ -23,32 +23,28 @@ pub fn from_config(reactor: Handle, config: PoolConfiguration, close: Receiver<(
         .map_err(|e| error!("[pool] accept failed: {:?}", e))
         .for_each(move |socket| {
             let client_addr = socket.peer_addr().unwrap();
-            info!("[client] connection established -> {:?}", client_addr);
+            debug!("[client] connection established -> {:?}", client_addr);
 
             let pool = backend_pool.clone();
             let (client_rx, client_tx) = socket.split();
             let client_proto = redis::read_client_commands(client_rx)
                 .map_err(|e| { error!("[client] caught error while reading from client: {:?}", e); })
                 .fold(client_tx, move |tx, cmd| {
-                    info!("got command");
+                    let subscription = pool.get();
+                    let (conn_tx, conn_rx) = subscription.split();
 
-                    // Backend is a stream that we split so we can "receive" a connection
-                    // from it and then "send" it back.
-                    let (conn_tx, conn_rx) = pool.get().split();
-
-                    conn_rx.take(1) // grab a connection
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-                        .and_then(move |server| redis::write_resp(server, cmd)) // write client command to backend
-                        .and_then(|(server, _)| redis::read_resp(server)) // wait until we get a response from backend
+                    conn_rx.take(1).into_future()
+                        .map_err(|(err, _)| err)
+                        .and_then(|(conn, _)| conn.unwrap())
+                        .and_then(move |server| redis::write_resp(server, cmd))
+                        .and_then(|(server, _)| redis::read_resp(server))
                         .and_then(move |(server, res)| {
-                            redis::write_resp(tx, res) // write that response to client
-                                .join(conn_tx.send(server)) // and also send back the connection
+                            redis::write_resp(tx, res)
+                                .join(conn_tx.send(server)
+                                      .map_err(|_| Error::new(ErrorKind::Other, "failed to return backend connection to pool")))
                         })
-                        .map(|((w, n), _)| {
-                            info!("wrote {} bytes from server to client", n);
-                            w
-                        })
-                        .map_err(|err| error!("IO error {:?}", err))
+                        .map(|((w, n), _)| w)
+                        .map_err(|err| error!("[client] caught error while handling request: {:?}", err))
                 })
                 .map(|_| ());
 

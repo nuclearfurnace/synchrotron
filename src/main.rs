@@ -87,7 +87,7 @@ fn main() {
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
     let logger = slog::Logger::root(
-        slog::LevelFilter::new(drain, slog::Level::Debug).fuse(),
+        slog::LevelFilter::new(drain, slog::Level::Info).fuse(),
         slog_o!("version" => env!("CARGO_PKG_VERSION")));
 
     let _scope_guard = slog_scope::set_global_logger(logger);

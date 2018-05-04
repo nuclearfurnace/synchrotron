@@ -3,6 +3,10 @@ name = "synchrotron"
 version = "0.1.0"
 authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
 
+[profile.release]
+debug = true
+lto = true
+
 [dependencies]
 log = "0.4"
 slog = "2.2.3"

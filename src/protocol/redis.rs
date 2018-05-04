@@ -9,8 +9,8 @@ use itoa;
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
 const REDIS_COMMAND_STATUS: u8 = '+' as u8;
 const REDIS_COMMAND_INTEGER: u8 = ':' as u8;
-const REDIS_COMMAND_BULK: u8 = '$' as u8;
-const REDIS_COMMAND_MULTI: u8 = '*' as u8;
+const REDIS_COMMAND_DATA: u8 = '$' as u8;
+const REDIS_COMMAND_BULK: u8 = '*' as u8;
 
 const REDIS_NULL_BUF: [u8; 5] = [b'$', b'-', b'1', b'\r', b'\n'];
 const REDIS_OK_BUF: [u8; 5] = [b'+', b'O', b'K', b'\r', b'\n'];
@@ -28,17 +28,24 @@ pub struct RedisCommandStream<R>
 pub struct RedisOneshotRead<R>
     where R: AsyncRead
 {
-    rx: R,
+    rx: Option<R>,
     rd: BytesMut,
 }
 
+/// A RESP-based client/server message for Redis.
+///
+/// For all possible responses that contain dynamic data, we provide the full message as a BytesMut
+/// buffer in the 1st field slot.  The 2nd field slot contains the "value" itself
+///
+/// For example, for a bulk message containing the string "foobar", the 1st field would represent the
+/// entire message payload of "*6\r\nfoobar\r\n", but the 2nd field would represent "foobar".
 pub enum RedisMessage {
     Null,
     OK,
     Integer(BytesMut, i64),
-    Data(BytesMut),
+    Data(BytesMut, BytesMut),
     Bulk(BytesMut, Vec<RedisMessage>),
-    Status(BytesMut),
+    Status(BytesMut, BytesMut),
 }
 
 impl RedisMessage {
@@ -48,21 +55,21 @@ impl RedisMessage {
         let mut rd = BytesMut::with_capacity(buf.len());
         rd.put_slice(&buf[..]);
 
-        let bulk = RedisMessage::Data(rd);
-        let args = Vec::new();
+        let bulk = RedisMessage::Data(rd.clone(), rd.clone());
+        let mut args = Vec::new();
         args.push(bulk);
 
-        RedisMessage::Bulk(rd.clone(), args)
+        RedisMessage::Bulk(rd, args)
     }
 
-    pub fn as_buf(&self) -> BytesMut {
+    pub fn as_resp(&self) -> BytesMut {
         match self {
             RedisMessage::Null => BytesMut::from(&REDIS_NULL_BUF[..]),
             RedisMessage::OK => BytesMut::from(&REDIS_OK_BUF[..]),
-            RedisMessage::Status(buf) => buf.clone(),
+            RedisMessage::Status(buf, _) => buf.clone(),
             RedisMessage::Integer(buf, _) => buf.clone(),
-            RedisMessage::Data(buf) => buf.clone(),
-            RedisMessage::Bulk(buf, parts) => buf.clone(),
+            RedisMessage::Data(buf, _) => buf.clone(),
+            RedisMessage::Bulk(buf, _) => buf.clone(),
         }
     }
 }
@@ -98,8 +105,11 @@ impl<R> Stream for RedisCommandStream<R>
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
 
-        match read_message(&mut self.rd) {
-            Ok(Async::Ready(cmd)) => Ok(Async::Ready(Some(cmd))),
+        match read_message(&self.rd) {
+            Ok(Async::Ready((remaining, cmd))) => {
+                self.rd = remaining;
+                Ok(Async::Ready(Some(cmd)))
+            },
             Err(e) => Err(e),
             _ => match socket_closed {
                 // If the socket is closed, let's also close up shop.
@@ -115,7 +125,7 @@ impl<R> RedisOneshotRead<R>
 {
     pub fn new(rx: R) -> Self {
         RedisOneshotRead {
-            rx: rx,
+            rx: Some(rx),
             rd: BytesMut::new(),
         }
     }
@@ -124,7 +134,7 @@ impl<R> RedisOneshotRead<R>
         loop {
             self.rd.reserve(1024);
 
-            let n = try_ready!(self.rx.read_buf(&mut self.rd));
+            let n = try_ready!(self.rx.as_mut().unwrap().read_buf(&mut self.rd));
             if n == 0 {
                 return Ok(Async::Ready(()));
             }
@@ -141,10 +151,8 @@ impl<R> Future for RedisOneshotRead<R>
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
 
-        // This is contorted but we can't try `try_ready!` over `read_message` because it has no
-        // concept of the socket being dead (aka Ready(None)), we have to inject that here.
-        match read_message(&mut self.rd) {
-            Ok(Async::Ready(cmd)) => Ok(Async::Ready((self.rx, cmd))),
+        match read_message(&self.rd) {
+            Ok(Async::Ready((_remaining, cmd))) => Ok(Async::Ready((self.rx.take().unwrap(), cmd))),
             Err(e) => Err(e),
             _ => match socket_closed {
                 // If the socket is closed, let's also close up shop.
@@ -167,6 +175,36 @@ pub fn read_resp<R>(rx: R) -> RedisOneshotRead<R>
     RedisOneshotRead::new(rx)
 }
 
+fn read_message(rd: &BytesMut) -> Poll<(BytesMut, RedisMessage), Error> {
+    let mut buf = rd.clone();
+
+    // The only command we handle in non-RESP format is PING.  This is for simplicity
+    // and compatibility with redis-benchmark.
+    if buf.starts_with(&b"ping"[..]) || buf.starts_with(&b"PING"[..]) {
+        let _ = buf.split_to(4);
+        return Ok(Async::Ready((buf, RedisMessage::from_inline("ping"))))
+    }
+
+    read_message_internal(&buf)
+}
+
+fn read_message_internal(rd: &BytesMut) -> Poll<(BytesMut, RedisMessage), Error> {
+    // Try reading a single byte to see if we have a message.  Match it against known
+    // message types, and process accordingly.
+    let first_buf = rd.clone();
+    match first_buf.first() {
+        None => Ok(Async::NotReady),
+        Some(t) => match t {
+            &REDIS_COMMAND_BULK => read_bulk(rd),
+            &REDIS_COMMAND_DATA => read_data(rd),
+            x => {
+                info!("got unknown type sigil: {:?}", x);
+                Ok(Async::NotReady)
+            },
+        }
+    }
+}
+
 fn read_line(rd: &BytesMut) -> Poll<usize, Error> {
     let result = rd.windows(2).enumerate()
         .find(|&(_, bytes)| bytes == b"\r\n")
@@ -178,127 +216,80 @@ fn read_line(rd: &BytesMut) -> Poll<usize, Error> {
     }
 }
 
-fn read_bulk_count(rd: &BytesMut) -> Poll<(usize, usize, BytesMut), Error> {
+fn read_bulk_count(rd: &BytesMut) -> Poll<(BytesMut, usize), Error> {
     let mut buf = rd.clone();
 
-    // Make sure we have a line in our buffer.  We can't possibly proceed without one.
+    // Make sure there's at least a CRLF-terminated line in the buffer.
     let pos = try_ready!(read_line(&buf));
 
-    // Make sure it's an array.
-    if buf.first() != Some(&REDIS_COMMAND_MULTI) {
-        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))
-    }
-
-    // Pull out the line into `buf`, leaving the remainder of the buffer in `rest`.
+    // Try to extract the bulk count integer, leaving the rest.
     let rest = buf.split_off(pos + 2);
-    let mut buf = buf.split_off(1); // Strip sigil off the front.
     let buf_len = buf.len() - 2;
-    let _ = buf.split_off(buf_len); // Strip CRLF off the end.
-    match atoi::<usize>(&buf) {
-        Some(count) => Ok(Async::Ready((pos + 2, count, rest))),
+    match atoi::<usize>(&buf[1..buf_len]) {
+        Some(count) => Ok(Async::Ready((rest, count))),
         None => Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL)),
     }
 }
 
-fn read_bulk_arg(rd: &BytesMut) -> Poll<(usize, BytesMut, BytesMut), Error> {
+fn read_data(rd: &BytesMut) -> Poll<(BytesMut, RedisMessage), Error> {
+    let mut full = rd.clone();
     let mut buf = rd.clone();
 
-    // Make sure we have a line in our buffer.  We can't possibly proceed without one.
+    // Make sure there's at least a CRLF-terminated line in the buffer.
     let len_crlf_pos = try_ready!(read_line(&buf));
 
-    // Make sure it's a bulk value.
-    if buf.first() != Some(&REDIS_COMMAND_BULK) {
-        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))
-    }
+    // Try to extract the data length integer, leaving the rest.
+    let mut data = buf.split_off(len_crlf_pos + 2);
+    let buf_len = buf.len() - 2;
+    let len = atoi::<usize>(&buf[1..buf_len]).ok_or(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
 
-    // This gets confusing, but, we're trying to find and chop off the "length of argument" line.
-    // All the chopping does is split the buffers, so we chop in a way that if there was another
-    // arg after this one, or another command, or whatever... the caller will get back the
-    // remaining buffer to continue processing.  We also return the exact number of bytes we read
-    // so the caller can update their master buffer.
-
-    // First, try and chop off the "length of bulk string" line, and parse the value as an integer.
-    let mut bulk_rest = buf.split_off(len_crlf_pos + 2); // Extract the length-of-arg line into `buf`.
-    let mut len_buf = buf.split_off(1); // Strip sigil off the front.
-    let len_buf_len = len_buf.len() - 2;
-    let _ = len_buf.split_off(len_buf_len); // Strip CRLF off the end.
-    let len = atoi::<usize>(&len_buf).ok_or(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
-
-    // We've parsed the length line, and `bulk_rest` is everything after it.  We need to make sure
-    // that we even have enough data left to finish parsing this arg, or we need to signal to the
-    // caller that we're not ready to complete parsing the overall command.
-    //
-    // The "2" here is the CRLF that comes at the end of a value.  Even though the data is
-    // length-prefixed, it still has a CRLF trailer.
-    if bulk_rest.len() < len + 2 {
-        // Not enough data to proceed.
+    // See if the actual data is available in the buffer.
+    if data.len() < len + 2 {
         return Ok(Async::NotReady);
     }
 
-    // Split the line, so that `bulk_rest` has only the bulk data and `rest` is everything
-    // remaining after this whole arg.  We also strip off the CRLF.
-    let rest = bulk_rest.split_off(len + 2);
-    let _ = bulk_rest.split_off(len);
+    // Now chop off just the data value.
+    let _ = data.split_off(len);
 
+    // Slice off the entire message.
     let total_read = len_crlf_pos + 2 + len + 2;
-    Ok(Async::Ready((total_read, bulk_rest, rest)))
+    let remaining = full.split_off(total_read);
+
+    Ok(Async::Ready((remaining, RedisMessage::Data(full, data))))
 }
 
-fn read_message(rd: &mut BytesMut) -> Poll<RedisMessage, Error> {
-    // The only command we handle in non-RESP format is PING.  This is for simplicity
-    // and compatibility with redis-benchmark.
-    if rd.starts_with(&b"ping"[..]) || rd.starts_with(&b"PING"[..]) {
-        return Ok(Async::Ready(RedisMessage::from_inline("ping")))
-    }
-
-    // Try reading a single byte to see if we have a message.  Match it against known
-    // message types, and process accordingly.
-    match rd.first() {
-        None => Ok(Async::NotReady),
-        Some(t) => match t {
-            &REDIS_COMMAND_MULTI => read_bulk(rd),
-            _ => Ok(Async::NotReady),
-        }
-    }
-}
-
-fn read_bulk(rd: &mut BytesMut) -> Poll<RedisMessage, Error> {
+fn read_bulk(rd: &BytesMut) -> Poll<(BytesMut, RedisMessage), Error> {
     let mut buf = rd.clone();
 
-    // We need to keep track of the total bytes "read" so we can properly slice rd to
-    // ignore what we've "read."
-    let mut total = 0;
-
     // Make sure we have a line in our buffer.  We can't possibly proceed without one.
-    let pos = try_ready!(read_line(&buf));
+    let _pos = try_ready!(read_line(&buf));
 
     // Get the number of items in the command.
-    let (n, count, mut rest) = try_ready!(read_bulk_count(&rd));
+    let (mut rest, count) = try_ready!(read_bulk_count(&buf));
     if count < 1 {
         return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))
     }
-    total = total + n;
 
-    // Loop through, trying to read the number of arguments we were told exist in the command.
-    // This can legitimately fail because, at this point, rd might not contain the full command.
+    // Loop through, trying to read the number of arguments we were told exist in the message.
+    // This can legitimately fail because, at this point, buf might not contain the full message.
     let mut args = Vec::new();
     for _ in 0..count {
-        let (n, buf, new_rest) = try_ready!(read_bulk_arg(&rest));
+        let (new_rest, msg) = try_ready!(read_message_internal(&rest));
         rest = new_rest;
-        total = total + n;
 
-        args.push(RedisMessage::Data(buf));
+        args.push(msg);
     }
 
-    // Slice off all the bytes we "read", updating the original in the process, and pass them along
-    let buf = rd.split_to(total);
-    Ok(Async::Ready(RedisMessage::Bulk(buf, args)))
+    // Slice off all the bytes we "read", updating the original in the process, and pass them along.
+    let total = buf.len() - rest.len();
+    let remaining = buf.split_off(total);
+    Ok(Async::Ready((rest, RedisMessage::Bulk(buf, args))))
 }
 
 pub fn write_resp<T>(tx: T, msg: RedisMessage) -> impl Future<Item=(T, usize), Error=Error>
     where T: AsyncWrite
 {
-    let buf = msg.as_buf();
+    let buf = msg.as_resp();
     io::write_all(tx, buf).map(|(w, b)| (w, b.len()))
 }
 
@@ -307,7 +298,7 @@ fn integer_to_buf(val: u64) -> BytesMut {
     let mut buf = [b'\0'; 20];
     let n = itoa::write(&mut buf[..], val).unwrap();
 
-    let rd = BytesMut::with_capacity(buf.len());
+    let mut rd = BytesMut::with_capacity(buf.len());
     rd.put_slice(&buf[..n]);
     rd
 }
