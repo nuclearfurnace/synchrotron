@@ -89,6 +89,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "config"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "lazy_static 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nom 3.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde 1.0.35 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_json 1.0.13 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "crossbeam"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -231,6 +242,14 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
+name = "memchr"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "libc 0.2.40 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "memoffset"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -290,6 +309,14 @@ dependencies = [
 name = "nodrop"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "nom"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "memchr 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
 
 [[package]]
 name = "num"
@@ -600,6 +627,7 @@ dependencies = [
  "bytes 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "chan 0.1.21 (registry+https://github.com/rust-lang/crates.io-index)",
  "chan-signal 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "config 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.1.20 (registry+https://github.com/rust-lang/crates.io-index)",
  "itoa 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -838,6 +866,7 @@ dependencies = [
 "checksum chan-signal 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)" = "f1f1e11f6e1c14c9e805a87c622cb8fcb636283b3119a2150af390cc6702d7fe"
 "checksum chrono 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)" = "ba5f60682a4c264e7f8d77b82e7788938a76befdf949d4a98026d19099c9d873"
 "checksum cloudabi 0.0.3 (registry+https://github.com/rust-lang/crates.io-index)" = "ddfc5b9aa5d4507acaf872de71051dfd0e309860e88966e1051e462a077aac4f"
+"checksum config 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)" = "e595d1735d8ab6b04906bbdcfc671cce2a5e609b6f8e92865e67331cc2f41ba4"
 "checksum crossbeam 0.2.12 (registry+https://github.com/rust-lang/crates.io-index)" = "bd66663db5a988098a89599d4857919b3acf7f61402e61365acfd3919857b9be"
 "checksum crossbeam-deque 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)" = "c1bdc73742c36f7f35ebcda81dbb33a7e0d33757d03a06d9ddca762712ec5ea2"
 "checksum crossbeam-epoch 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)" = "9b4e2817eb773f770dcb294127c011e22771899c21d18fce7dd739c0b9832e81"
@@ -858,12 +887,14 @@ dependencies = [
 "checksum log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)" = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
 "checksum log 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)" = "89f010e843f2b1a31dbd316b3b8d443758bc634bed37aabade59c686d644e0a2"
 "checksum matches 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)" = "100aabe6b8ff4e4a7e32c1c13523379802df0772b82466207ac25b013f193376"
+"checksum memchr 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)" = "148fab2e51b4f1cfc66da2a7c32981d1d3c083a803978268bb11fe4b86925e7a"
 "checksum memoffset 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "0f9dc261e2b62d7a622bf416ea3c5245cdd5d9a7fcc428c0d06804dfce1775b3"
 "checksum mio 0.6.14 (registry+https://github.com/rust-lang/crates.io-index)" = "6d771e3ef92d58a8da8df7d6976bfca9371ed1de6619d9d5a5ce5b1f29b85bfe"
 "checksum miow 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "8c1f2f3b1cf331de6896aabf6e9d55dca90356cc9960cca7eaaf408a355ae919"
 "checksum multiqueue 0.3.2 (registry+https://github.com/rust-lang/crates.io-index)" = "4059673f3516669cbf7ebb448cb37171559ed22e6d8bc79cf0cf9394cf9e73fd"
 "checksum net2 0.2.32 (registry+https://github.com/rust-lang/crates.io-index)" = "9044faf1413a1057267be51b5afba8eb1090bd2231c693664aa1db716fe1eae0"
 "checksum nodrop 0.1.12 (registry+https://github.com/rust-lang/crates.io-index)" = "9a2228dca57108069a5262f2ed8bd2e82496d2e074a06d1ccc7ce1687b6ae0a2"
+"checksum nom 3.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "05aec50c70fd288702bcd93284a8444607f3292dbdf2a30de5ea5dcdbe72287b"
 "checksum num 0.1.42 (registry+https://github.com/rust-lang/crates.io-index)" = "4703ad64153382334aa8db57c637364c322d3372e097840c72000dabdcf6156e"
 "checksum num-bigint 0.1.43 (registry+https://github.com/rust-lang/crates.io-index)" = "81b483ea42927c463e191802e7334556b48e7875297564c0e9951bd3a0ae53e3"
 "checksum num-complex 0.1.43 (registry+https://github.com/rust-lang/crates.io-index)" = "b288631d7878aaf59442cffd36910ea604ecd7745c36054328595114001c9656"

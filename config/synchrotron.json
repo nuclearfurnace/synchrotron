@@ -1,4 +1,7 @@
 {
+  "logging": {
+    "level": "info"
+  },
   "pools": [
     {
       "protocol": "redis",

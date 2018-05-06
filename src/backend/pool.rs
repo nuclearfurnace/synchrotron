@@ -28,7 +28,7 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(addr: SocketAddr, conn_limit: usize) -> Backend {
-        let (conns_tx, conns_rx) = mpmc_queue(1);
+        let (conns_tx, conns_rx) = mpmc_queue(conn_limit as u64);
 
         Backend {
             address: addr,
@@ -170,7 +170,7 @@ impl<D> BackendPool<D>
         let mut backends = vec![];
         let mut descriptors = vec![];
         for address in &addresses {
-            let backend = Backend::new(address.clone(), 1);
+            let backend = Backend::new(address.clone(), 4);
             backends.push(Arc::new(backend));
 
             // eventually, we'll populate this with weight, etc, so that

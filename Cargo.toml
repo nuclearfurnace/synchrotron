@@ -30,6 +30,11 @@ atoi = "0.2.3"
 itoa = "0.4.1"
 rand = "0.5.0-pre.0"
 
+[dependencies.config]
+version = "0.8"
+default-features = false
+features = ["json"]
+
 [dev-dependencies]
 spectral = "0.6.0"
 matches = "0.1.6"

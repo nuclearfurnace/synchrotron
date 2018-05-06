@@ -1,10 +1,11 @@
 #![feature(test)]
 #![recursion_limit = "1024"]
 
-#[macro_use]
-extern crate serde_derive;
+extern crate config;
 extern crate serde;
 extern crate serde_json;
+#[macro_use]
+extern crate serde_derive;
 
 extern crate chan;
 extern crate chan_signal;
@@ -46,13 +47,14 @@ extern crate test;
 #[cfg(test)]
 extern crate spectral;
 
-mod config;
+mod conf;
 mod listener;
 mod pool;
 mod protocol;
 mod backend;
 
-use config::Configuration;
+use conf::Configuration;
+use conf::LevelExt;
 
 fn main() {
     // Due to the way signal masking apparently works, or works with this library, we
@@ -80,6 +82,9 @@ fn main() {
         }
     });
 
+    let configuration = Configuration::new()
+        .expect("failed to parse configuration");
+
     // Configure our logging.  This gives us fully asynchronous logging to the terminal
     // which is also level filtered.  As well, we've replaced the global std logger
     // and pulled in helper macros that correspond to the various logging levels.
@@ -87,19 +92,15 @@ fn main() {
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
     let logger = slog::Logger::root(
-        slog::LevelFilter::new(drain, slog::Level::Info).fuse(),
+        slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
         slog_o!("version" => env!("CARGO_PKG_VERSION")));
 
     let _scope_guard = slog_scope::set_global_logger(logger);
     let _log_guard = slog_stdlog::init().unwrap();
     info!("[core] logging configured");
 
-
+    // Now run.
     tokio::run(future::lazy(move || {
-        // Spin up all of the configured pools.
-        let configuration = Configuration::from_path("synchrotron.json")
-            .unwrap();
-
         for pool_config in configuration.pools {
             let close = close_rx.clone();
             let config = pool_config.clone();

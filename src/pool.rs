@@ -9,7 +9,7 @@ use rs_futures_spmc::Receiver;
 
 use listener;
 use protocol::redis;
-use config::PoolConfiguration;
+use conf::PoolConfiguration;
 use backend::pool::{RandomDistributor, BackendPool};
 
 pub fn from_config(reactor: Handle, config: PoolConfiguration, close: Receiver<()>) -> impl Future<Item=(), Error=()> {
