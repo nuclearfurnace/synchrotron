@@ -170,7 +170,7 @@ impl<D> BackendPool<D>
         let mut backends = vec![];
         let mut descriptors = vec![];
         for address in &addresses {
-            let backend = Backend::new(address.clone(), 4);
+            let backend = Backend::new(address.clone(), 1);
             backends.push(Arc::new(backend));
 
             // eventually, we'll populate this with weight, etc, so that

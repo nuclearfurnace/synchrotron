@@ -1,8 +1,14 @@
 build:
-    cargo +nightly build
+    cargo build
 
 build-release:
-    cargo +nightly build --release
+    cargo build --release
+
+test:
+    cargo test
+
+bench:
+    cargo bench
 
 profile: build
     sudo dtrace -c './target/debug/synchrotron' -o out.stacks -n 'profile-997 /execname == "synchrotron"/ { @[ustack(100)] = count(); }'
