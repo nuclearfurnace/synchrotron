@@ -19,4 +19,5 @@ profile-release: build-release
 profile-svg:
     test -d .flamegraph || git clone https://github.com/brendangregg/FlameGraph.git .flamegraph
     .flamegraph/stackcollapse.pl out.stacks | .flamegraph/flamegraph.pl > profile.svg
+    ./fix-rust-dtrace-symbols.sh
     open profile.svg
