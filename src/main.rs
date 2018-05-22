@@ -18,7 +18,6 @@ extern crate tokio_io;
 extern crate futures;
 extern crate rs_futures_spmc;
 extern crate net2;
-extern crate multiqueue;
 
 use tokio::prelude::*;
 use tokio::reactor::Handle;

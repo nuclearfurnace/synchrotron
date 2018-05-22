@@ -6,8 +6,6 @@ use rand::{thread_rng, RngCore};
 use futures::prelude::*;
 use futures::future::Either;
 use tokio::net::{TcpStream, ConnectFuture};
-use multiqueue::{mpmc_queue, MPMCSender, MPMCReceiver};
-use std::sync::mpsc::{TrySendError, TryRecvError};
 
 pub struct BackendDescriptor;
 
@@ -20,20 +18,16 @@ impl BackendDescriptor {
 
 pub struct Backend {
     address: SocketAddr,
-    conns_tx: Arc<Mutex<MPMCSender<TcpConnection>>>,
-    conns_rx: Arc<Mutex<MPMCReceiver<TcpConnection>>>,
+    conns: Arc<Mutex<Vec<TcpConnection>>>,
     conn_count: Arc<AtomicUsize>,
     conn_limit: usize,
 }
 
 impl Backend {
     pub fn new(addr: SocketAddr, conn_limit: usize) -> Backend {
-        let (conns_tx, conns_rx) = mpmc_queue(conn_limit as u64);
-
         Backend {
             address: addr,
-            conns_tx: Arc::new(Mutex::new(conns_tx)),
-            conns_rx: Arc::new(Mutex::new(conns_rx)),
+            conns: Arc::new(Mutex::new(Vec::new())),
             conn_count: Arc::new(AtomicUsize::new(0)),
             conn_limit: conn_limit,
         }
@@ -42,8 +36,7 @@ impl Backend {
     pub fn subscribe(&self) -> BackendParticipant {
         BackendParticipant {
             address: self.address.clone(),
-            conns_tx: self.conns_tx.clone(),
-            conns_rx: self.conns_rx.clone(),
+            conns: self.conns.clone(),
             conn_count: self.conn_count.clone(),
             conn_limit: self.conn_limit,
         }
@@ -77,8 +70,7 @@ impl Future for ExistingTcpStream {
 /// Backend itself in a Stream/Sink compatible footprint.
 pub struct BackendParticipant {
     address: SocketAddr,
-    conns_tx: Arc<Mutex<MPMCSender<TcpConnection>>>,
-    conns_rx: Arc<Mutex<MPMCReceiver<TcpConnection>>>,
+    conns: Arc<Mutex<Vec<TcpConnection>>>,
     conn_count: Arc<AtomicUsize>,
     conn_limit: usize,
 }
@@ -88,10 +80,10 @@ impl Stream for BackendParticipant {
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let mut rx = self.conns_rx.lock().unwrap();
-        match rx.try_recv() {
-            Ok(conn) => Ok(Async::Ready(Some(conn))),
-            Err(TryRecvError::Empty) => {
+        let mut conns = self.conns.lock().unwrap();
+        match conns.pop() {
+            Some(conn) => Ok(Async::Ready(Some(conn))),
+            None => {
                 let current_conns = self.conn_count.load(Ordering::SeqCst);
                 if current_conns < self.conn_limit {
                     let old = self.conn_count.compare_and_swap(current_conns, current_conns + 1, Ordering::SeqCst);
@@ -102,8 +94,7 @@ impl Stream for BackendParticipant {
                 }
 
                 Ok(Async::NotReady)
-            },
-            Err(TryRecvError::Disconnected) => panic!("backend conn sender disconnected!"),
+            }
         }
     }
 }
@@ -113,12 +104,9 @@ impl Sink for BackendParticipant {
     type SinkError = ();
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let mut tx = self.conns_tx.lock().unwrap();
-        match tx.try_send(Either::A(ExistingTcpStream::from_stream(item))) {
-            Ok(_) => Ok(AsyncSink::Ready),
-            Err(TrySendError::Full(_)) => panic!("backend conn queue should not be full via participant!"),
-            Err(TrySendError::Disconnected(_)) => panic!("backend conn receiver disconnected!"),
-        }
+        let mut conns = self.conns.lock().unwrap();
+        conns.push(Either::A(ExistingTcpStream::from_stream(item)));
+        Ok(AsyncSink::Ready)
     }
 
     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
@@ -157,7 +145,6 @@ impl Distributor for RandomDistributor {
 pub struct BackendPool<D>
     where D: Distributor
 {
-    addresses: Vec<SocketAddr>,
     distributor: D,
     backends: Vec<Arc<Backend>>,
 }
@@ -183,7 +170,6 @@ impl<D> BackendPool<D>
         dist.seed(descriptors);
 
         BackendPool {
-            addresses: addresses,
             backends: backends,
             distributor: dist,
         }

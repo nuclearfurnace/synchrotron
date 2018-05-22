@@ -27,7 +27,7 @@ pub fn from_config(reactor: Handle, config: PoolConfiguration, close: Receiver<(
 
             let pool = backend_pool.clone();
             let (client_rx, client_tx) = socket.split();
-            let client_proto = redis::read_client_commands(client_rx)
+            let client_proto = redis::read_client_messages(client_rx)
                 .map_err(|e| { error!("[client] caught error while reading from client: {:?}", e); })
                 .fold(client_tx, move |tx, cmd| {
                     let subscription = pool.get();
@@ -36,14 +36,14 @@ pub fn from_config(reactor: Handle, config: PoolConfiguration, close: Receiver<(
                     conn_rx.take(1).into_future()
                         .map_err(|(err, _)| err)
                         .and_then(|(conn, _)| conn.unwrap())
-                        .and_then(move |server| redis::write_resp(server, cmd))
-                        .and_then(|(server, _)| redis::read_resp(server))
+                        .and_then(move |server| redis::write_message(server, cmd))
+                        .and_then(|(server, _)| redis::read_client_message(server))
                         .and_then(move |(server, res)| {
-                            redis::write_resp(tx, res)
+                            redis::write_message(tx, res)
                                 .join(conn_tx.send(server)
                                       .map_err(|_| Error::new(ErrorKind::Other, "failed to return backend connection to pool")))
                         })
-                        .map(|((w, n), _)| w)
+                        .map(|((w, _n), _)| w)
                         .map_err(|err| error!("[client] caught error while handling request: {:?}", err))
                 })
                 .map(|_| ());
