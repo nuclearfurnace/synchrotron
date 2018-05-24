@@ -28,6 +28,7 @@ bytes = "0.4"
 atoi = "0.2.3"
 itoa = "0.4.1"
 rand = "0.5.0-pre.0"
+rust-crypto = "^0.2"
 
 [dependencies.config]
 version = "0.8"

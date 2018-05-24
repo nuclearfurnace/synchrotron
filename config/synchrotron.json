@@ -1,6 +1,6 @@
 {
   "logging": {
-    "level": "info"
+    "level": "debug"
   },
   "pools": [
     {

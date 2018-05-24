@@ -2,6 +2,7 @@
 #![recursion_limit = "1024"]
 
 extern crate config;
+extern crate crypto;
 extern crate serde;
 extern crate serde_json;
 #[macro_use]
@@ -51,6 +52,7 @@ mod listener;
 mod pool;
 mod protocol;
 mod backend;
+mod util;
 
 use conf::Configuration;
 use conf::LevelExt;

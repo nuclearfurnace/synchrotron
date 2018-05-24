@@ -4,19 +4,22 @@ use tokio;
 use tokio::reactor::Handle;
 use tokio_io::AsyncRead;
 use futures::prelude::*;
-use futures::future;
+use futures::future::join_all;
 use rs_futures_spmc::Receiver;
 
 use listener;
 use protocol::redis;
 use conf::PoolConfiguration;
-use backend::pool::{RandomDistributor, BackendPool};
+use backend::pool::{BackendPool, RandomDistributor, MD5Hasher};
+use backend::redis::RedisBackendQueue;
+use util::ext::StreamExt;
 
 pub fn from_config(reactor: Handle, config: PoolConfiguration, close: Receiver<()>) -> impl Future<Item=(), Error=()> {
     let listen_address = config.address.clone();
     let backend_addresses = config.backends.clone();
     let distributor = RandomDistributor::new();
-    let backend_pool = Arc::new(BackendPool::new(backend_addresses, distributor));
+    let hasher = MD5Hasher::new();
+    let backend_pool = Arc::new(BackendPool::new(backend_addresses, distributor, hasher));
 
     let listener = listener::get_listener(&listen_address, &reactor).unwrap();
     listener.incoming()
@@ -29,21 +32,19 @@ pub fn from_config(reactor: Handle, config: PoolConfiguration, close: Receiver<(
             let (client_rx, client_tx) = socket.split();
             let client_proto = redis::read_client_messages(client_rx)
                 .map_err(|e| { error!("[client] caught error while reading from client: {:?}", e); })
-                .fold(client_tx, move |tx, cmd| {
-                    let subscription = pool.get();
-                    let (conn_tx, conn_rx) = subscription.split();
+                .batch(128)
+                .fold(client_tx, move |tx, msgs| {
+                    let queues = RedisBackendQueue::to_queues(&pool, msgs);
+                    join_all(queues)
+                        .and_then(|results| {
+                            let mut items = results.into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>();
 
-                    conn_rx.take(1).into_future()
-                        .map_err(|(err, _)| err)
-                        .and_then(|(conn, _)| conn.unwrap())
-                        .and_then(move |server| redis::write_message(server, cmd))
-                        .and_then(|(server, _)| redis::read_client_message(server))
-                        .and_then(move |(server, res)| {
-                            redis::write_message(tx, res)
-                                .join(conn_tx.send(server)
-                                      .map_err(|_| Error::new(ErrorKind::Other, "failed to return backend connection to pool")))
+                            items.sort_by(|(idx, _msg)| idx);
+                            items
                         })
-                        .map(|((w, _n), _)| w)
+                        .and_then(move |items| redis::write_messages(tx, items))
                         .map_err(|err| error!("[client] caught error while handling request: {:?}", err))
                 })
                 .map(|_| ());

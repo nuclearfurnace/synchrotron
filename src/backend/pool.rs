@@ -6,6 +6,8 @@ use rand::{thread_rng, RngCore};
 use futures::prelude::*;
 use futures::future::Either;
 use tokio::net::{TcpStream, ConnectFuture};
+use crypto::md5::Md5;
+use crypto::digest::Digest;
 
 pub struct BackendDescriptor;
 
@@ -142,17 +144,43 @@ impl Distributor for RandomDistributor {
     }
 }
 
-pub struct BackendPool<D>
-    where D: Distributor
+pub trait Hasher {
+    fn hash(&self, buf: &[u8]) -> u64;
+}
+
+pub struct MD5Hasher;
+
+impl MD5Hasher {
+    pub fn new() -> MD5Hasher {
+        MD5Hasher {
+        }
+    }
+}
+
+impl Hasher for MD5Hasher {
+    fn hash(&self, buf: &[u8]) -> u64 {
+        let mut hasher = Md5::new();
+        hasher.input(buf);
+
+        let result = [0; 16];
+        hasher.result(&mut result);
+
+        (((result[3] as u32) << 24) + ((result[2] as u32) << 16) + ((result[1] as u32) << 8) + result[0] as u32) as u64
+    }
+}
+
+pub struct BackendPool<D, H>
+    where D: Distributor, H: Hasher
 {
     distributor: D,
+    hasher: H,
     backends: Vec<Arc<Backend>>,
 }
 
-impl<D> BackendPool<D>
-    where D: Distributor
+impl<D, H> BackendPool<D, H>
+    where D: Distributor, H: Hasher
 {
-    pub fn new(addresses: Vec<SocketAddr>, mut dist: D) -> BackendPool<D> {
+    pub fn new(addresses: Vec<SocketAddr>, mut dist: D, hasher: H) -> BackendPool<D, H> {
         // Assemble the list of backends and backend descriptors.
         let mut backends = vec![];
         let mut descriptors = vec![];
@@ -172,12 +200,17 @@ impl<D> BackendPool<D>
         BackendPool {
             backends: backends,
             distributor: dist,
+            hasher: hasher,
         }
     }
 
-    pub fn get(&self) -> BackendParticipant {
-        let backend_idx = self.distributor.choose(1);
-        match self.backends.get(backend_idx) {
+    pub fn get_backend_index(&self, key: &[u8]) -> usize {
+        let key_id = self.hasher.hash(key);
+        self.distributor.choose(key_id)
+    }
+
+    pub fn get_backend_by_index(&self, idx: usize) -> BackendParticipant {
+        match self.backends.get(idx) {
             Some(backend) => backend.subscribe(),
             None => unreachable!("incorrect backend idx"),
         }
