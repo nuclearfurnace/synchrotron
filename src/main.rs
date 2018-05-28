@@ -18,27 +18,27 @@ extern crate tokio;
 extern crate tokio_io;
 #[macro_use]
 extern crate futures;
-extern crate rs_futures_spmc;
 extern crate net2;
+extern crate rs_futures_spmc;
 
-use tokio::prelude::*;
-use tokio::reactor::Handle;
 use rs_futures_spmc::channel;
 use std::thread;
+use tokio::prelude::*;
+use tokio::reactor::Handle;
 
 #[macro_use]
 extern crate log;
 #[macro_use(slog_o, slog_kv)]
 extern crate slog;
-extern crate slog_stdlog;
-extern crate slog_scope;
-extern crate slog_term;
 extern crate slog_async;
+extern crate slog_scope;
+extern crate slog_stdlog;
+extern crate slog_term;
 
 use slog::Drain;
 
-extern crate bytes;
 extern crate atoi;
+extern crate bytes;
 extern crate itoa;
 extern crate rand;
 
@@ -48,11 +48,11 @@ extern crate test;
 #[cfg(test)]
 extern crate spectral;
 
+mod backend;
 mod conf;
 mod listener;
 mod pool;
 mod protocol;
-mod backend;
 mod util;
 
 use conf::Configuration;
@@ -73,19 +73,18 @@ fn main() {
             info!("[core] signal received: {:?}", signal);
 
             match signal {
-                Signal::USR1 => {}, // signal to spawn new process
+                Signal::USR1 => {} // signal to spawn new process
                 Signal::INT => {
                     // signal to close this process
                     let _ = close_tx.send(()).wait();
                     break;
-                },
+                }
                 _ => {} // we don't care about the rest
             }
         }
     });
 
-    let configuration = Configuration::new()
-        .expect("failed to parse configuration");
+    let configuration = Configuration::new().expect("failed to parse configuration");
 
     // Configure our logging.  This gives us fully asynchronous logging to the terminal
     // which is also level filtered.  As well, we've replaced the global std logger
@@ -95,7 +94,8 @@ fn main() {
     let drain = slog_async::Async::new(drain).build().fuse();
     let logger = slog::Logger::root(
         slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
-        slog_o!("version" => env!("CARGO_PKG_VERSION")));
+        slog_o!("version" => env!("CARGO_PKG_VERSION")),
+    );
 
     let _scope_guard = slog_scope::set_global_logger(logger);
     let _log_guard = slog_stdlog::init().unwrap();

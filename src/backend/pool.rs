@@ -1,23 +1,17 @@
+use super::distributor::{BackendDescriptor, Distributor};
+use super::hasher::Hasher;
+use futures::future::Either;
+use futures::prelude::*;
 use std::io::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use rand::{thread_rng, RngCore};
-use futures::prelude::*;
-use futures::future::Either;
-use tokio::net::{TcpStream, ConnectFuture};
-use crypto::md5::Md5;
-use crypto::digest::Digest;
+use std::sync::{Arc, Mutex};
+use tokio::net::{ConnectFuture, TcpStream};
 
-pub struct BackendDescriptor;
-
-impl BackendDescriptor {
-    pub fn new() -> BackendDescriptor {
-        BackendDescriptor {
-        }
-    }
-}
-
+/// Managed connections to a backend server.
+///
+/// This will maintain a specific number of connections to the backend, giving them out and
+/// reclaiming them during normal operation.
 pub struct Backend {
     address: SocketAddr,
     conns: Arc<Mutex<Vec<TcpConnection>>>,
@@ -53,7 +47,9 @@ pub struct ExistingTcpStream {
 
 impl ExistingTcpStream {
     pub fn from_stream(stream: TcpStream) -> ExistingTcpStream {
-        ExistingTcpStream { stream: Some(stream) }
+        ExistingTcpStream {
+            stream: Some(stream),
+        }
     }
 }
 
@@ -68,8 +64,8 @@ impl Future for ExistingTcpStream {
 
 /// A placeholder for a caller interested in getting a connection from a backend.
 ///
-/// This wraps the underlying MPMC queue that we use for shuttling connections in and out of the
-/// Backend itself in a Stream/Sink compatible footprint.
+/// This provides a Stream/Sink interface to the underlying queue of backend connections so that
+/// getting a connection, and returning it, can be easily composed.
 pub struct BackendParticipant {
     address: SocketAddr,
     conns: Arc<Mutex<Vec<TcpConnection>>>,
@@ -88,10 +84,16 @@ impl Stream for BackendParticipant {
             None => {
                 let current_conns = self.conn_count.load(Ordering::SeqCst);
                 if current_conns < self.conn_limit {
-                    let old = self.conn_count.compare_and_swap(current_conns, current_conns + 1, Ordering::SeqCst);
+                    let old = self.conn_count.compare_and_swap(
+                        current_conns,
+                        current_conns + 1,
+                        Ordering::SeqCst,
+                    );
                     if old == current_conns {
                         debug!("[backend] creating new connection to {}", &self.address);
-                        return Ok(Async::Ready(Some(Either::B(TcpStream::connect(&self.address)))))
+                        return Ok(Async::Ready(Some(Either::B(TcpStream::connect(
+                            &self.address,
+                        )))));
                     }
                 }
 
@@ -116,70 +118,13 @@ impl Sink for BackendParticipant {
     }
 }
 
-pub trait Distributor {
-    fn seed(&mut self, backends: Vec<BackendDescriptor>);
-    fn choose(&self, point: u64) -> usize;
-}
-
-pub struct RandomDistributor {
-    backends: Vec<BackendDescriptor>,
-}
-
-impl RandomDistributor {
-    pub fn new() -> RandomDistributor {
-        RandomDistributor {
-            backends: vec![],
-        }
-    }
-}
-
-impl Distributor for RandomDistributor {
-    fn seed(&mut self, backends: Vec<BackendDescriptor>) {
-        self.backends = backends;
-    }
-
-    fn choose(&self, _point: u64) -> usize {
-        let mut rng = thread_rng();
-        rng.next_u64() as usize % self.backends.len()
-    }
-}
-
-pub trait Hasher {
-    fn hash(&self, buf: &[u8]) -> u64;
-}
-
-pub struct MD5Hasher;
-
-impl MD5Hasher {
-    pub fn new() -> MD5Hasher {
-        MD5Hasher {
-        }
-    }
-}
-
-impl Hasher for MD5Hasher {
-    fn hash(&self, buf: &[u8]) -> u64 {
-        let mut hasher = Md5::new();
-        hasher.input(buf);
-
-        let mut result = [0; 16];
-        hasher.result(&mut result);
-
-        (((result[3] as u32) << 24) + ((result[2] as u32) << 16) + ((result[1] as u32) << 8) + result[0] as u32) as u64
-    }
-}
-
-pub struct BackendPool<D, H>
-    where D: Distributor, H: Hasher
-{
+pub struct BackendPool<D: Distributor, H: Hasher> {
     distributor: D,
     hasher: H,
     backends: Vec<Arc<Backend>>,
 }
 
-impl<D, H> BackendPool<D, H>
-    where D: Distributor, H: Hasher
-{
+impl<D: Distributor, H: Hasher> BackendPool<D, H> {
     pub fn new(addresses: Vec<SocketAddr>, mut dist: D, hasher: H) -> BackendPool<D, H> {
         // Assemble the list of backends and backend descriptors.
         let mut backends = vec![];

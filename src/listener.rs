@@ -1,8 +1,8 @@
+use net2::TcpBuilder;
 use std::net::SocketAddr;
 use tokio::io;
-use tokio::reactor::Handle;
 use tokio::net::TcpListener;
-use net2::TcpBuilder;
+use tokio::reactor::Handle;
 
 pub fn get_listener(addr_str: &String, handle: &Handle) -> io::Result<TcpListener> {
     let addr = addr_str.parse().unwrap();
@@ -13,9 +13,9 @@ pub fn get_listener(addr_str: &String, handle: &Handle) -> io::Result<TcpListene
     configure_builder(&builder)?;
     builder.reuse_address(true)?;
     builder.bind(addr)?;
-    builder.listen(1024).and_then(|l| {
-        TcpListener::from_std(l, handle)
-    })
+    builder
+        .listen(1024)
+        .and_then(|l| TcpListener::from_std(l, handle))
 }
 
 #[cfg(unix)]

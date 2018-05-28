@@ -1,7 +1,7 @@
-use std::env;
+use config::{Config, ConfigError, Environment, File};
 use std::collections::HashMap;
+use std::env;
 use std::net::SocketAddr;
-use config::{ConfigError, Config, File, Environment};
 
 #[derive(Deserialize, Debug)]
 pub struct Configuration {
