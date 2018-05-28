@@ -1,4 +1,5 @@
 #![feature(test)]
+#![feature(iterator_flatten)]
 #![recursion_limit = "1024"]
 
 extern crate config;

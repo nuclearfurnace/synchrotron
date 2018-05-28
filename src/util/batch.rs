@@ -1,8 +1,13 @@
 use std::mem;
 use futures::stream::{Stream, Fuse};
-use futures::sink::Sink;
-use futures::{Async, Poll, StartSend};
+use futures::{Async, Poll};
 
+/// An adapter for batching up items in a stream opportunistically.
+///
+/// On each call to `poll`, the adapter will poll the underlying stream in a loop until the
+/// underlying stream reports that it is not ready.  Any items returned during this loop will be
+/// stored and forwarded on either when the batch capacity is met or when the underlying stream
+/// signals that it has no available items.
 #[derive(Debug)]
 #[must_use = "streams do nothing unless polled"]
 pub struct Batch<S>
@@ -25,54 +30,10 @@ pub fn new<S>(s: S, capacity: usize) -> Batch<S>
     }
 }
 
-impl<S> Sink for Batch<S>
-    where S: Sink + Stream
-{
-    type SinkItem = S::SinkItem;
-    type SinkError = S::SinkError;
-
-    fn start_send(&mut self, item: S::SinkItem) -> StartSend<S::SinkItem, S::SinkError> {
-        self.stream.start_send(item)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), S::SinkError> {
-        self.stream.poll_complete()
-    }
-
-    fn close(&mut self) -> Poll<(), S::SinkError> {
-        self.stream.close()
-    }
-}
-
-impl<S> Batch<S>
-    where S: Stream
-{
+impl<S: Stream> Batch<S> {
     fn take(&mut self) -> Vec<S::Item> {
         let cap = self.items.capacity();
         mem::replace(&mut self.items, Vec::with_capacity(cap))
-    }
-
-    /// Acquires a reference to the underlying stream that this combinator is
-    /// pulling from.
-    pub fn get_ref(&self) -> &S {
-        self.stream.get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying stream that this
-    /// combinator is pulling from.
-    ///
-    /// Note that care must be taken to avoid tampering with the state of the
-    /// stream which may otherwise confuse this combinator.
-    pub fn get_mut(&mut self) -> &mut S {
-        self.stream.get_mut()
-    }
-
-    /// Consumes this combinator, returning the underlying stream.
-    ///
-    /// Note that this may discard intermediate state of this combinator, so
-    /// care should be taken to avoid losing resources when this is called.
-    pub fn into_inner(self) -> S {
-        self.stream.into_inner()
     }
 }
 
@@ -80,7 +41,7 @@ impl<S> Stream for Batch<S>
     where S: Stream
 {
     type Item = Vec<<S as Stream>::Item>;
-    type Error = <S as Stream>::Error;  
+    type Error = <S as Stream>::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         if let Some(err) = self.err.take() {
@@ -95,10 +56,7 @@ impl<S> Stream for Batch<S>
                 // no items, then tell the caller we aren't ready.
                 Ok(Async::NotReady) => return match self.items.len() {
                     0 => Ok(Async::NotReady),
-                    _ => {
-                        let items = mem::replace(&mut self.items, Vec::new());
-                        Ok(Some(items).into())
-                    },
+                    _ => Ok(Some(self.take()).into()),
                 },
 
                 // If the underlying stream is ready and has items, buffer them until we hit our
@@ -118,8 +76,7 @@ impl<S> Stream for Batch<S>
                 // we have anything at all.
                 Ok(Async::Ready(None)) => {
                     return if self.items.len() > 0 {
-                        let items = mem::replace(&mut self.items, Vec::new());
-                        Ok(Some(items).into())
+                        Ok(Some(self.take()).into())
                     } else {
                         Ok(Async::Ready(None))
                     }

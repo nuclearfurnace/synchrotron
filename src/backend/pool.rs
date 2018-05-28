@@ -103,7 +103,7 @@ impl Stream for BackendParticipant {
 
 impl Sink for BackendParticipant {
     type SinkItem = TcpStream;
-    type SinkError = ();
+    type SinkError = Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         let mut conns = self.conns.lock().unwrap();
@@ -162,7 +162,7 @@ impl Hasher for MD5Hasher {
         let mut hasher = Md5::new();
         hasher.input(buf);
 
-        let result = [0; 16];
+        let mut result = [0; 16];
         hasher.result(&mut result);
 
         (((result[3] as u32) << 24) + ((result[2] as u32) << 16) + ((result[1] as u32) << 8) + result[0] as u32) as u64

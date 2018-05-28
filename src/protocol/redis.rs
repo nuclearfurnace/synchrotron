@@ -16,7 +16,7 @@ const REDIS_OK_BUF: [u8; 5] = [b'+', b'O', b'K', b'\r', b'\n'];
 
 const REDIS_CLIENT_ERROR_PROTOCOL: &str = "protocol error; invalid payload";
 
-/// A stream of Redis messages pulled from an asynchronous reader.
+/// An unbounded stream of Redis messages pulled from an asynchronous reader.
 pub struct RedisMessageStream<R>
     where R: AsyncRead
 {
@@ -24,12 +24,15 @@ pub struct RedisMessageStream<R>
     rd: BytesMut,
 }
 
-/// A future that pulls a single Redis message from an asynchronous reader.
-pub struct RedisSingleMessage<R>
+/// A future that pulls multiple Redis messages from an asynchronous reader.
+pub struct RedisMultipleMessages<R>
     where R: AsyncRead
 {
     rx: Option<R>,
     rd: BytesMut,
+    bytes_read: usize,
+    msg_count: usize,
+    msgs: Option<Vec<RedisMessage>>,
 }
 
 /// A RESP-based client/server message for Redis.
@@ -128,13 +131,16 @@ impl<R> Stream for RedisMessageStream<R>
     }
 }
 
-impl<R> RedisSingleMessage<R>
+impl<R> RedisMultipleMessages<R>
     where R: AsyncRead
 {
-    pub fn new(rx: R) -> Self {
-        RedisSingleMessage {
+    pub fn new(rx: R, msg_count: usize) -> Self {
+        RedisMultipleMessages {
             rx: Some(rx),
             rd: BytesMut::new(),
+            bytes_read: 0,
+            msg_count: msg_count,
+            msgs: Some(Vec::with_capacity(msg_count)),
         }
     }
 
@@ -143,6 +149,8 @@ impl<R> RedisSingleMessage<R>
             self.rd.reserve(1024);
 
             let n = try_ready!(self.rx.as_mut().unwrap().read_buf(&mut self.rd));
+            self.bytes_read += n;
+
             if n == 0 {
                 return Ok(Async::Ready(()));
             }
@@ -150,41 +158,54 @@ impl<R> RedisSingleMessage<R>
     }
 }
 
-impl<R> Future for RedisSingleMessage<R>
+impl<R> Future for RedisMultipleMessages<R>
     where R: AsyncRead
 {
-    type Item = (R, RedisMessage);
+    type Item = (R, usize, Vec<RedisMessage>);
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
 
-        match read_message(&mut self.rd) {
-            Ok(Async::Ready((bytes_read, cmd))) => {
-                debug!("[protocol] got message from server! ({} bytes)", bytes_read);
-                Ok(Async::Ready((self.rx.take().unwrap(), cmd)))
+        loop {
+            // We've collected all the messages, time to return.
+            if self.msg_count == 0 {
+                return Ok(Async::Ready((self.rx.take().unwrap(), self.bytes_read, self.msgs.take().unwrap())));
             }
-            Err(e) => Err(e),
-            _ => match socket_closed {
-                // If the socket is closed, let's also close up shop.
-                true => Err(Error::new(ErrorKind::Other, "backend closed before sending response")),
-                false => Ok(Async::NotReady),
-            },
+
+            let result = read_message(&mut self.rd);
+            match result {
+                Ok(Async::Ready((bytes_read, msg))) => {
+                    // We read a message successfully, store it and continue on.
+                    debug!("[protocol] got message from server! ({} bytes)", bytes_read);
+
+                    let mut msgs = self.msgs.as_mut().unwrap();
+                    msgs.push(msg);
+                    self.msg_count -= 1;
+                },
+                Err(e) => return Err(e),
+                _ => return match socket_closed {
+                    // If the socket is closed, let's also close up shop.
+                    true => Err(Error::new(ErrorKind::Other, "backend closed before sending response")),
+                    false => Ok(Async::NotReady),
+                },
+            }
         }
     }
 }
 
-pub fn read_client_messages<R>(rx: R) -> RedisMessageStream<R>
+pub fn read_messages_stream<R>(rx: R) -> RedisMessageStream<R>
     where R: AsyncRead
 {
     RedisMessageStream::new(rx)
 }
 
-pub fn read_client_message<R>(rx: R) -> RedisSingleMessage<R>
+pub fn read_messages<R>(rx: R, msg_count: usize) -> RedisMultipleMessages<R>
     where R: AsyncRead
 {
-    RedisSingleMessage::new(rx)
+    RedisMultipleMessages::new(rx, msg_count)
 }
+
 
 fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
     // The only command we handle in non-RESP format is PING.  This is for simplicity
@@ -338,11 +359,23 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
     Ok(Async::Ready((total, RedisMessage::Bulk(buf, args))))
 }
 
-pub fn write_message<T>(tx: T, msg: RedisMessage) -> impl Future<Item=(T, usize), Error=Error>
+pub fn write_messages<T>(tx: T, mut msgs: Vec<RedisMessage>) -> impl Future<Item=(T, usize), Error=Error>
     where T: AsyncWrite
 {
-    let buf = msg.as_resp();
-    io::write_all(tx, buf).map(|(w, b)| (w, b.len()))
+    let msgs_len = msgs.len();
+    let buf = match msgs_len {
+        1 => msgs.remove(0).as_resp(),
+        _ => msgs.into_iter()
+            .fold(BytesMut::new(), |mut buf, msg| {
+                let msg_buf = msg.as_resp();
+                buf.extend_from_slice(&msg_buf[..]);
+                buf
+            }),
+    };
+
+    let buf_len = buf.len();
+    io::write_all(tx, buf)
+        .map(move |(tx, _buf)| (tx, buf_len))
 }
 
 #[cfg(test)]
