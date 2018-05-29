@@ -1,13 +1,13 @@
-use std::net::SocketAddr;
-use net2::TcpBuilder;
 use backend::pool::BackendPool;
 use backend::redis::generate_batched_writes;
 use backend::{distributor, hasher};
 use conf::PoolConfiguration;
 use futures::future::{join_all, ok};
 use futures::prelude::*;
+use net2::TcpBuilder;
 use protocol::redis;
 use rs_futures_spmc::Receiver;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio;
 use tokio::io;

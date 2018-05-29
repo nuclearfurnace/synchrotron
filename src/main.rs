@@ -51,7 +51,6 @@ extern crate spectral;
 mod backend;
 mod conf;
 mod listener;
-mod pool;
 mod protocol;
 mod util;
 
