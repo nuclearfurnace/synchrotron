@@ -202,7 +202,7 @@ where
                             "backend closed before sending response",
                         )),
                         false => Ok(Async::NotReady),
-                    }
+                    };
                 }
             }
         }

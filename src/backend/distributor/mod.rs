@@ -23,3 +23,10 @@ pub trait Distributor {
     /// `seed`.
     fn choose(&self, point: u64) -> usize;
 }
+
+pub fn configure_distributor(dist_type: String) -> impl Distributor {
+    match dist_type.as_str() {
+        "random" => RandomDistributor::new(),
+        s => panic!("unknown distributor type {}", s),
+    }
+}

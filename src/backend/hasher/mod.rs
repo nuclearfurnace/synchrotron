@@ -8,3 +8,10 @@ pub use self::md5::MD5Hasher;
 pub trait Hasher {
     fn hash(&self, buf: &[u8]) -> u64;
 }
+
+pub fn configure_hasher(hash_type: String) -> impl Hasher {
+    match hash_type.as_str() {
+        "md5" => MD5Hasher::new(),
+        s => panic!("unknown hash type {}", s),
+    }
+}

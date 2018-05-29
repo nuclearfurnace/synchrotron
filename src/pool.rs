@@ -1,18 +1,16 @@
+use backend::pool::BackendPool;
+use backend::redis::generate_batched_writes;
+use backend::{distributor, hasher};
+use conf::PoolConfiguration;
 use futures::future::{join_all, ok};
 use futures::prelude::*;
+use listener;
+use protocol::redis;
 use rs_futures_spmc::Receiver;
 use std::sync::Arc;
 use tokio;
 use tokio::reactor::Handle;
 use tokio_io::AsyncRead;
-
-use backend::distributor::RandomDistributor;
-use backend::hasher::MD5Hasher;
-use backend::pool::BackendPool;
-use backend::redis::generate_batched_writes;
-use conf::PoolConfiguration;
-use listener;
-use protocol::redis;
 use util::{flatten_ordered_messages, StreamExt};
 
 /// Creates a listener from the given configuration.
@@ -25,10 +23,35 @@ pub fn from_config(
     config: PoolConfiguration,
     close: Receiver<()>,
 ) -> impl Future<Item = (), Error = ()> {
+    let protocol = config.protocol.to_lowercase();
+    match protocol.as_str() {
+        "redis" => redis_from_config(reactor, config, close),
+        s => panic!("unknown protocol type: {}", s),
+    }
+}
+
+fn redis_from_config(
+    reactor: Handle,
+    mut config: PoolConfiguration,
+    close: Receiver<()>,
+) -> impl Future<Item = (), Error = ()> {
     let listen_address = config.address.clone();
     let backend_addresses = config.backends.clone();
-    let distributor = RandomDistributor::new();
-    let hasher = MD5Hasher::new();
+
+    let dist_type = config
+        .options
+        .entry("distribution".to_owned())
+        .or_insert("random".to_owned())
+        .to_lowercase();
+    let distributor = distributor::configure_distributor(dist_type);
+
+    let hash_type = config
+        .options
+        .entry("hash".to_owned())
+        .or_insert("md5".to_owned())
+        .to_lowercase();
+    let hasher = hasher::configure_hasher(hash_type);
+
     let backend_pool = Arc::new(BackendPool::new(backend_addresses, distributor, hasher));
 
     let listener = listener::get_listener(&listen_address, &reactor).unwrap();
