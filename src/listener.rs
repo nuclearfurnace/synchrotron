@@ -113,6 +113,9 @@ where
             let client_addr = socket.peer_addr().unwrap();
             debug!("[client] connection established -> {:?}", client_addr);
 
+            let cold = cold_pool.clone();
+            let warm = warm_pool.clone();
+
             let (client_rx, client_tx) = socket.split();
             let client_proto = redis::read_messages_stream(client_rx)
                 .map_err(|e| {
@@ -125,7 +128,7 @@ where
                     // Fire off our cold pool operations asynchronously so that we don't influence
                     // the normal client path.
                     let cold_msgs = msgs.clone();
-                    let cold_batches = generate_batched_writes(&cold_pool, cold_msgs);
+                    let cold_batches = generate_batched_writes(&cold, cold_msgs);
                     let cold_handler = join_all(cold_batches)
                         .map_err(|err| {
                             error!(
@@ -137,7 +140,7 @@ where
                     tokio::spawn(cold_handler);
 
                     // Now run our normal writes.
-                    join_all(generate_batched_writes(&warm_pool, msgs))
+                    join_all(generate_batched_writes(&warm, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
                         .and_then(move |items| redis::write_messages(tx, items))
                         .map(|(w, _n)| w)
@@ -161,7 +164,7 @@ where
     D: Distributor,
     H: Hasher,
 {
-    let pool = pools
+    let default_pool = pools
         .get("default")
         .expect("redis normal handler has no 'default' pool configured!")
         .clone();
@@ -173,6 +176,8 @@ where
             let client_addr = socket.peer_addr().unwrap();
             debug!("[client] connection established -> {:?}", client_addr);
 
+            let default = default_pool.clone();
+
             let (client_rx, client_tx) = socket.split();
             let client_proto = redis::read_messages_stream(client_rx)
                 .map_err(|e| {
@@ -182,7 +187,7 @@ where
                 .fold(client_tx, move |tx, msgs| {
                     debug!("[client] got batch of {} messages!", msgs.len());
 
-                    join_all(generate_batched_writes(&pool, msgs))
+                    join_all(generate_batched_writes(&default, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
                         .and_then(move |items| redis::write_messages(tx, items))
                         .map(|(w, _n)| w)
