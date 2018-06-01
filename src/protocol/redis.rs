@@ -49,7 +49,7 @@ where
 ///
 /// This means that callers themselves must chop off any remaining data, such as the trailing CRLF
 /// for data values.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RedisMessage {
     Null,
     OK,

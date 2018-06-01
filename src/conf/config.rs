@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 #[derive(Deserialize, Debug)]
 pub struct Configuration {
     pub logging: LoggingConfiguration,
-    pub pools: Vec<PoolConfiguration>,
+    pub listeners: Vec<ListenerConfiguration>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -15,12 +15,17 @@ pub struct LoggingConfiguration {
 }
 
 #[derive(Deserialize, Clone, Debug)]
-pub struct PoolConfiguration {
+pub struct ListenerConfiguration {
     pub protocol: String,
     pub address: String,
+    pub pools: HashMap<String, PoolConfiguration>,
+    pub routing: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct PoolConfiguration {
+    pub addresses: Vec<SocketAddr>,
     pub options: HashMap<String, String>,
-    pub backends: Vec<SocketAddr>,
-    pub routing: HashMap<String, String>,
 }
 
 impl Configuration {

@@ -2,6 +2,7 @@ use slog::Level;
 
 mod config;
 pub use self::config::Configuration;
+pub use self::config::ListenerConfiguration;
 pub use self::config::LoggingConfiguration;
 pub use self::config::PoolConfiguration;
 

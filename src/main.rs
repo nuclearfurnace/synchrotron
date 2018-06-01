@@ -102,15 +102,15 @@ fn main() {
 
     // Now run.
     tokio::run(future::lazy(move || {
-        for pool_config in configuration.pools {
+        for listener_config in configuration.listeners {
             let close = close_rx.clone();
-            let config = pool_config.clone();
+            let config = listener_config.clone();
             let reactor = Handle::current();
 
-            let pool = pool::from_config(reactor, config, close);
-            tokio::spawn(pool);
+            let listener = listener::from_config(reactor, config, close);
+            tokio::spawn(listener);
 
-            info!("[pool] starting listening '{}'", pool_config.address);
+            info!("[pool] starting listening '{}'", listener_config.address);
         }
 
         info!("[core] synchrotron running");
