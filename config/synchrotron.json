@@ -1,20 +1,33 @@
 {
   "logging": {
-    "level": "info"
+    "level": "debug"
   },
-  "pools": [
+  "listeners": [
     {
       "protocol": "redis",
       "address": "127.0.0.1:6380",
-      "options": {
-        "hash": "md5"
+      "pools": {
+        "default": {
+          "addresses": ["127.0.0.1:6379"],
+          "options": {}
+        }
       },
-      "backends": [
-        "127.0.0.1:6379"
-      ],
-      "routing": {
-        "type": "random"
-      }
+      "routing": "normal"
+    },
+    {
+      "protocol": "redis",
+      "address": "127.0.0.1:6381",
+      "pools": {
+        "warm": {
+          "addresses": ["127.0.0.1:6379"],
+          "options": {}
+        },
+        "cold": {
+          "addresses": ["127.0.0.1:6378"],
+          "options": {}
+        }
+      },
+      "routing": "warmup"
     }
   ]
 }

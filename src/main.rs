@@ -21,10 +21,13 @@ extern crate futures;
 extern crate net2;
 extern crate rs_futures_spmc;
 
+use futures::stream::iter_result;
 use rs_futures_spmc::channel;
+use std::error::Error;
+use std::process;
 use std::thread;
 use tokio::prelude::*;
-use tokio::reactor::Handle;
+use tokio::runtime::Runtime;
 
 #[macro_use]
 extern crate log;
@@ -57,7 +60,7 @@ mod util;
 use conf::Configuration;
 use conf::LevelExt;
 
-fn main() {
+fn run() -> i32 {
     // Due to the way signal masking apparently works, or works with this library, we
     // must initialize our signal handling code before *any* threads are spun up by
     // the process, otherwise we don't seem to get them delivered to us.
@@ -101,20 +104,56 @@ fn main() {
     info!("[core] logging configured");
 
     // Now run.
-    tokio::run(future::lazy(move || {
-        for listener_config in configuration.listeners {
+    let mut runtime = Runtime::new().expect("failed to create tokio runtime");
+    let reactor = runtime.reactor().clone();
+
+    let listeners = configuration
+        .listeners
+        .into_iter()
+        .map(|x| {
             let close = close_rx.clone();
-            let config = listener_config.clone();
-            let reactor = Handle::current();
+            let config = x.clone();
+            let handle = reactor.clone();
 
-            let listener = listener::from_config(reactor, config, close);
-            tokio::spawn(listener);
+            listener::from_config(handle, config, close)
+        })
+        .collect::<Vec<_>>();
 
-            info!("[pool] starting listening '{}'", listener_config.address);
+    let mut errors = Vec::new();
+    for listener in &listeners {
+        let result = listener.as_ref();
+        if result.is_err() {
+            let error = result.err().unwrap();
+            errors.push(error.description().to_owned());
+        }
+    }
+
+    if errors.len() > 0 {
+        error!("[core] encountered errors while spawning listeners:");
+
+        for error in errors {
+            error!("[core] - {}", error);
         }
 
-        info!("[core] synchrotron running");
+        return 1;
+    }
 
-        Ok(())
-    }))
+    info!("listeners to launch: {}", listeners.len());
+
+    // Launch all these listeners into the runtime.
+    runtime.spawn(
+        iter_result(listeners)
+            .map_err(|_| ())
+            .for_each(|listener| tokio::spawn(listener)),
+    );
+
+    info!("[core] synchrotron running");
+
+    runtime.shutdown_on_idle().wait().unwrap();
+    return 0;
+}
+
+fn main() {
+    let code = run();
+    process::exit(code);
 }

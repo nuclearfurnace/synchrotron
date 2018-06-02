@@ -4,12 +4,13 @@ use backend::pool::BackendPool;
 use backend::redis::generate_batched_writes;
 use backend::{distributor, hasher};
 use conf::ListenerConfiguration;
-use futures::future::{join_all, ok};
+use futures::future::{join_all, lazy, ok};
 use futures::prelude::*;
 use net2::TcpBuilder;
 use protocol::redis;
 use rs_futures_spmc::Receiver;
 use std::collections::HashMap;
+use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio;
@@ -19,6 +20,8 @@ use tokio::reactor::Handle;
 use tokio_io::AsyncRead;
 use util::{flatten_ordered_messages, StreamExt};
 
+type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 'static>;
+
 /// Creates a listener from the given configuration.
 ///
 /// The listener will spawn a socket for accepting client connections, and when a client connects,
@@ -26,9 +29,9 @@ use util::{flatten_ordered_messages, StreamExt};
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
     reactor: Handle,
-    mut config: ListenerConfiguration,
+    config: ListenerConfiguration,
     close: Receiver<()>,
-) -> Box<Future<Item = (), Error = ()> + Send + 'static> {
+) -> Result<GenericRuntimeFuture, Error> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
     let listener =
@@ -37,7 +40,7 @@ pub fn from_config(
     // Gather up all of the backend pools.
     let mut pools = HashMap::new();
     let pool_configs = config.pools.clone();
-    for (pool_name, pool_config) in pool_configs {
+    for (pool_name, mut pool_config) in pool_configs {
         let dist_type = pool_config
             .options
             .entry("distribution".to_owned())
@@ -59,26 +62,32 @@ pub fn from_config(
     // Get the correct handler based on protocol.
     let protocol = config.protocol.to_lowercase();
     let handler = match protocol.as_str() {
-        "redis" => redis_from_config(config, listener, pools),
+        "redis" => redis_from_config(config, listener, pools)?,
         s => panic!("unknown protocol type: {}", s),
     };
 
     // Make sure our handlers close out when told.
-    let wrapped = handler.select2(close.into_future()).then(move |_| {
-        info!("[pool] shutting down listener '{}'", listen_address);
+    let listen_address2 = listen_address.clone();
+    let wrapped = lazy(move || {
+        info!("[listener] starting listener '{}'...", listen_address);
         ok(())
-    });
-    Box::new(wrapped)
+    }).and_then(|_| handler)
+        .select2(close.into_future())
+        .then(move |_| {
+            info!("[pool] shutting down listener '{}'", listen_address2);
+            ok(())
+        });
+    Ok(Box::new(wrapped))
 }
 
 fn redis_from_config<D, H>(
-    mut config: ListenerConfiguration,
+    config: ListenerConfiguration,
     listener: TcpListener,
     pools: HashMap<String, Arc<BackendPool<D, H>>>,
-) -> Box<Future<Item = (), Error = ()> + Send + 'static>
+) -> Result<GenericRuntimeFuture, Error>
 where
-    D: Distributor,
-    H: Hasher,
+    D: Distributor + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
 {
     // Figure out what sort of routing we're doing so we can grab the right handler.
     let routing_type = config.routing.to_lowercase();
@@ -91,19 +100,25 @@ where
 fn redis_warmup_handler<D, H>(
     listener: TcpListener,
     pools: HashMap<String, Arc<BackendPool<D, H>>>,
-) -> Box<Future<Item = (), Error = ()> + Send + 'static>
+) -> Result<GenericRuntimeFuture, Error>
 where
-    D: Distributor,
-    H: Hasher,
+    D: Distributor + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
 {
     let warm_pool = pools
         .get("warm")
-        .expect("redis warmup handler has no 'warm' pool configured!")
+        .ok_or(Error::new(
+            ErrorKind::Other,
+            "redis warmup handler has no 'warm' pool configured!",
+        ))?
         .clone();
 
     let cold_pool = pools
         .get("cold")
-        .expect("redis warmup handler has no 'cold' pool configured!")
+        .ok_or(Error::new(
+            ErrorKind::Other,
+            "redis warmup handler has no 'cold' pool configured!",
+        ))?
         .clone();
 
     let handler = listener
@@ -137,36 +152,40 @@ where
                             )
                         })
                         .map(|_| ());
-                    tokio::spawn(cold_handler);
 
                     // Now run our normal writes.
-                    join_all(generate_batched_writes(&warm, msgs))
+                    let warm_handler = join_all(generate_batched_writes(&warm, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
                         .and_then(move |items| redis::write_messages(tx, items))
                         .map(|(w, _n)| w)
                         .map_err(|err| {
                             error!("[client] caught error while handling request: {:?}", err)
-                        })
+                        });
+
+                    warm_handler.join(cold_handler).map(|(a, _)| a)
                 })
                 .map(|_| ());
 
             tokio::spawn(client_proto)
         });
 
-    Box::new(handler)
+    Ok(Box::new(handler))
 }
 
 fn redis_normal_handler<D, H>(
     listener: TcpListener,
     pools: HashMap<String, Arc<BackendPool<D, H>>>,
-) -> Box<Future<Item = (), Error = ()> + Send + 'static>
+) -> Result<GenericRuntimeFuture, Error>
 where
-    D: Distributor,
-    H: Hasher,
+    D: Distributor + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
 {
     let default_pool = pools
         .get("default")
-        .expect("redis normal handler has no 'default' pool configured!")
+        .ok_or(Error::new(
+            ErrorKind::Other,
+            "redis normal handler has no 'default' pool configured!",
+        ))?
         .clone();
 
     let handler = listener
@@ -200,7 +219,7 @@ where
             tokio::spawn(client_proto)
         });
 
-    Box::new(handler)
+    Ok(Box::new(handler))
 }
 
 fn get_listener(addr_str: &String, handle: &Handle) -> io::Result<TcpListener> {
