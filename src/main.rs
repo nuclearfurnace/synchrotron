@@ -138,8 +138,6 @@ fn run() -> i32 {
         return 1;
     }
 
-    info!("listeners to launch: {}", listeners.len());
-
     // Launch all these listeners into the runtime.
     runtime.spawn(
         iter_result(listeners)

@@ -1,6 +1,6 @@
 use backend::distributor::Distributor;
 use backend::hasher::Hasher;
-use backend::pool::BackendPool;
+use backend::pool::{BackendPool, run_operation_on_backend};
 use bytes::BytesMut;
 use futures::future::ok;
 use futures::prelude::*;
@@ -56,33 +56,19 @@ where
             split_msgs.push(msg);
         }
 
-        let (conns_tx, conns_rx) = backend.split();
-        let responses = conns_rx
-            .take(1)
-            .into_future()
-            .map_err(|(err, _)| err)
-            .and_then(|(server, _)| {
-                debug!("[redis batch] unwrapped connection to backend");
-                server.unwrap()
-            })
-            .and_then(move |server| {
-                debug!("[redis batch] writing batched messages to server");
-                redis::write_messages(server, split_msgs)
-            })
-            .and_then(move |(server, _n)| {
-                debug!(
-                    "[redis batch] trying to read batch of {} messages from server",
-                    msg_len
-                );
-                redis::read_messages(server, msg_len)
-            })
-            .and_then(|(server, _n, resps)| conns_tx.send(server).map(move |_| resps))
-            .and_then(move |resps| {
-                ok(msg_indexes
+        let responses = run_operation_on_backend(backend, move |server| {
+            ok(server)
+            .and_then(move |server| redis::write_messages(server, split_msgs))
+            .and_then(move |(server, _n)| redis::read_messages(server, msg_len))
+            .and_then(move |(server, _n, resps)| {
+                let result = msg_indexes
                     .into_iter()
                     .zip(resps)
-                    .collect::<OrderedMessages>())
-            });
+                    .collect::<OrderedMessages>();
+
+                ok((server, result))
+            })
+        });
 
         queues.push(responses);
     }

@@ -46,6 +46,5 @@ where
 {
     let mut items = msgs.into_iter().flatten().collect::<Vec<_>>();
     items.sort_by(|(a, _), (b, _)| a.cmp(b));
-
     items.into_iter().map(|(_, item)| item).collect()
 }
