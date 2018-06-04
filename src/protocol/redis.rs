@@ -1,9 +1,9 @@
 use atoi::atoi;
 use bytes::{BufMut, BytesMut};
 use futures::prelude::*;
-use std::io::{Error, ErrorKind};
-use tokio::io;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::error::Error;
+use std::io;
+use tokio::io::{write_all, AsyncRead, AsyncWrite};
 
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
 const REDIS_COMMAND_STATUS: u8 = '+' as u8;
@@ -13,6 +13,8 @@ const REDIS_COMMAND_BULK: u8 = '*' as u8;
 
 const REDIS_NULL_BUF: [u8; 5] = [b'$', b'-', b'1', b'\r', b'\n'];
 const REDIS_OK_BUF: [u8; 5] = [b'+', b'O', b'K', b'\r', b'\n'];
+const REDIS_ERR_BUF: [u8; 5] = [b'-', b'E', b'R', b'R', b' '];
+const REDIS_CRLF: [u8; 2] = [b'\r', b'\n'];
 
 const REDIS_CLIENT_ERROR_PROTOCOL: &str = "protocol error; invalid payload";
 
@@ -74,6 +76,19 @@ impl RedisMessage {
         RedisMessage::Bulk(rd, args)
     }
 
+    pub fn from_error(err: io::Error) -> RedisMessage {
+        let error_str = err.description();
+
+        // Full length is sigil (1) + header (ERR, 3) + space (1) + the message itself (N) + teh
+        // trailing CRLF (2).
+        let mut rd = BytesMut::with_capacity(error_str.len() + 7);
+        rd.put_slice(&REDIS_ERR_BUF[..]);
+        rd.put_slice(&error_str.as_bytes());
+        rd.put_slice(&REDIS_CRLF[..]);
+
+        RedisMessage::Error(rd, 5)
+    }
+
     pub fn as_resp(self) -> BytesMut {
         match self {
             RedisMessage::Null => BytesMut::from(&REDIS_NULL_BUF[..]),
@@ -98,7 +113,7 @@ where
         }
     }
 
-    fn fill_read_buf(&mut self) -> Poll<(), Error> {
+    fn fill_read_buf(&mut self) -> Poll<(), io::Error> {
         loop {
             self.rd.reserve(1024);
 
@@ -115,14 +130,14 @@ where
     R: AsyncRead,
 {
     type Item = RedisMessage;
-    type Error = Error;
+    type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
 
         match read_message(&mut self.rd) {
             Ok(Async::Ready((bytes_read, cmd))) => {
-                debug!("[protocol] got message from client! ({} bytes)", bytes_read);
+                trace!("[protocol] got message from client! ({} bytes)", bytes_read);
                 Ok(Async::Ready(Some(cmd)))
             }
             Err(e) => Err(e),
@@ -149,7 +164,7 @@ where
         }
     }
 
-    fn fill_read_buf(&mut self) -> Poll<(), Error> {
+    fn fill_read_buf(&mut self) -> Poll<(), io::Error> {
         loop {
             self.rd.reserve(1024);
 
@@ -168,7 +183,7 @@ where
     R: AsyncRead,
 {
     type Item = (R, usize, Vec<RedisMessage>);
-    type Error = Error;
+    type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
@@ -187,7 +202,7 @@ where
             match result {
                 Ok(Async::Ready((bytes_read, msg))) => {
                     // We read a message successfully, store it and continue on.
-                    debug!("[protocol] got message from server! ({} bytes)", bytes_read);
+                    trace!("[protocol] got message from server! ({} bytes)", bytes_read);
 
                     let mut msgs = self.msgs.as_mut().unwrap();
                     msgs.push(msg);
@@ -197,8 +212,8 @@ where
                 _ => {
                     return match socket_closed {
                         // If the socket is closed, let's also close up shop.
-                        true => Err(Error::new(
-                            ErrorKind::Other,
+                        true => Err(io::Error::new(
+                            io::ErrorKind::Other,
                             "backend closed before sending response",
                         )),
                         false => Ok(Async::NotReady),
@@ -223,7 +238,7 @@ where
     RedisMultipleMessages::new(rx, msg_count)
 }
 
-fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
+fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // The only command we handle in non-RESP format is PING.  This is for simplicity
     // and compatibility with redis-benchmark, and also allowing health checks that don't need to
     // follow the RESP structure.
@@ -247,7 +262,7 @@ fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
     read_message_internal(rd)
 }
 
-fn read_message_internal(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
+fn read_message_internal(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // Try reading a single byte to see if we have a message.  Match it against known
     // message types, and process accordingly.
     let first = match rd.len() {
@@ -271,7 +286,7 @@ fn read_message_internal(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error
     }
 }
 
-fn read_line(rd: &BytesMut) -> Poll<usize, Error> {
+fn read_line(rd: &BytesMut) -> Poll<usize, io::Error> {
     let result = rd
         .windows(2)
         .enumerate()
@@ -284,7 +299,7 @@ fn read_line(rd: &BytesMut) -> Poll<usize, Error> {
     }
 }
 
-fn read_bulk_count(rd: &mut BytesMut) -> Poll<(usize, usize), Error> {
+fn read_bulk_count(rd: &mut BytesMut) -> Poll<(usize, usize), io::Error> {
     // Make sure there's at least a CRLF-terminated line in the buffer.
     let pos = try_ready!(read_line(rd));
 
@@ -292,17 +307,22 @@ fn read_bulk_count(rd: &mut BytesMut) -> Poll<(usize, usize), Error> {
     let buf = rd.split_to(pos + 2);
     match atoi::<usize>(&buf[1..pos]) {
         Some(count) => Ok(Async::Ready((pos + 2, count))),
-        None => Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL)),
+        None => Err(io::Error::new(
+            io::ErrorKind::Other,
+            REDIS_CLIENT_ERROR_PROTOCOL,
+        )),
     }
 }
 
-fn read_integer(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
+fn read_integer(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // Make sure there's at least a CRLF-terminated line in the buffer.
     let crlf_pos = try_ready!(read_line(rd));
 
     // Try to extract the integer, leaving the rest.
-    let value = atoi::<i64>(&rd[1..crlf_pos])
-        .ok_or(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
+    let value = atoi::<i64>(&rd[1..crlf_pos]).ok_or(io::Error::new(
+        io::ErrorKind::Other,
+        REDIS_CLIENT_ERROR_PROTOCOL,
+    ))?;
 
     // Slice off the entire message.
     let total = crlf_pos + 2;
@@ -311,7 +331,7 @@ fn read_integer(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
     Ok(Async::Ready((total, RedisMessage::Integer(buf, value))))
 }
 
-fn read_status(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
+fn read_status(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // Make sure there's at least a CRLF-terminated line in the buffer.
     let crlf_pos = try_ready!(read_line(rd));
 
@@ -322,7 +342,7 @@ fn read_status(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
     Ok(Async::Ready((total, RedisMessage::Status(buf, 1))))
 }
 
-fn read_error(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
+fn read_error(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // Make sure there's at least a CRLF-terminated line in the buffer.
     let crlf_pos = try_ready!(read_line(rd));
 
@@ -333,13 +353,15 @@ fn read_error(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
     Ok(Async::Ready((total, RedisMessage::Error(buf, 1))))
 }
 
-fn read_data(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
+fn read_data(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // Make sure there's at least a CRLF-terminated line in the buffer.
     let len_crlf_pos = try_ready!(read_line(rd));
 
     // Try to extract the data length integer, leaving the rest.
-    let len = atoi::<usize>(&rd[1..len_crlf_pos])
-        .ok_or(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
+    let len = atoi::<usize>(&rd[1..len_crlf_pos]).ok_or(io::Error::new(
+        io::ErrorKind::Other,
+        REDIS_CLIENT_ERROR_PROTOCOL,
+    ))?;
 
     // See if the actual data is available in the buffer.
     if rd.len() < len_crlf_pos + 2 + len + 2 {
@@ -356,14 +378,17 @@ fn read_data(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
     )))
 }
 
-fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
+fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     let mut total = 0;
     let mut buf = rd.clone();
 
     // Get the number of items in the command.
     let (n, count) = try_ready!(read_bulk_count(&mut buf));
     if count < 1 {
-        return Err(Error::new(ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL));
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            REDIS_CLIENT_ERROR_PROTOCOL,
+        ));
     }
     total = total + n;
 
@@ -385,7 +410,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), Error> {
 pub fn write_messages<T>(
     tx: T,
     mut msgs: Vec<RedisMessage>,
-) -> impl Future<Item = (T, usize), Error = Error>
+) -> impl Future<Item = (T, usize), Error = io::Error>
 where
     T: AsyncWrite,
 {
@@ -400,7 +425,7 @@ where
     };
 
     let buf_len = buf.len();
-    io::write_all(tx, buf).map(move |(tx, _buf)| (tx, buf_len))
+    write_all(tx, buf).map(move |(tx, _buf)| (tx, buf_len))
 }
 
 #[cfg(test)]

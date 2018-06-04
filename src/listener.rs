@@ -138,7 +138,7 @@ where
                 })
                 .batch(128)
                 .fold(client_tx, move |tx, msgs| {
-                    debug!("[client] got batch of {} messages!", msgs.len());
+                    trace!("[client] got batch of {} messages!", msgs.len());
 
                     // Fire off our cold pool operations asynchronously so that we don't influence
                     // the normal client path.
@@ -204,7 +204,7 @@ where
                 })
                 .batch(128)
                 .fold(client_tx, move |tx, msgs| {
-                    debug!("[client] got batch of {} messages!", msgs.len());
+                    trace!("[client] got batch of {} messages!", msgs.len());
 
                     join_all(generate_batched_writes(&default, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))

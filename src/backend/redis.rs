@@ -1,6 +1,6 @@
 use backend::distributor::Distributor;
 use backend::hasher::Hasher;
-use backend::pool::{BackendPool, run_operation_on_backend};
+use backend::pool::{run_operation_on_backend, BackendPool};
 use bytes::BytesMut;
 use futures::future::ok;
 use futures::prelude::*;
@@ -31,7 +31,7 @@ where
         let batched_msgs = assigned_msgs.entry(backend_idx).or_insert(Vec::new());
         batched_msgs.push((i, msg));
 
-        debug!(
+        trace!(
             "[redis batch] message #{} ({:?}) assigned to backend #{}",
             i,
             &msg_key[..],
@@ -56,24 +56,38 @@ where
             split_msgs.push(msg);
         }
 
+        let msg_indexes_inner = msg_indexes.clone();
         let responses = run_operation_on_backend(backend, move |server| {
             ok(server)
-            .and_then(move |server| redis::write_messages(server, split_msgs))
-            .and_then(move |(server, _n)| redis::read_messages(server, msg_len))
-            .and_then(move |(server, _n, resps)| {
-                let result = msg_indexes
-                    .into_iter()
-                    .zip(resps)
-                    .collect::<OrderedMessages>();
+                .and_then(move |server| redis::write_messages(server, split_msgs))
+                .and_then(move |(server, _n)| redis::read_messages(server, msg_len))
+                .and_then(move |(server, _n, resps)| {
+                    let result = msg_indexes_inner
+                        .into_iter()
+                        .zip(resps)
+                        .collect::<OrderedMessages>();
 
-                ok((server, result))
-            })
-        });
+                    ok((server, result))
+                })
+        }).map_err(|err| {
+            error!("caught error when running batched operation: {:?}", err);
+            err
+        })
+            .or_else(move |err| ok(to_vectored_error_response(err, msg_indexes)));
 
         queues.push(responses);
     }
 
     queues
+}
+
+pub fn to_vectored_error_response(err: Error, indexes: Vec<u64>) -> OrderedMessages {
+    let mut msgs = Vec::new();
+    let msg = RedisMessage::from_error(err);
+    for i in indexes {
+        msgs.push((i, msg.clone()));
+    }
+    msgs
 }
 
 fn get_message_key(msg: &RedisMessage) -> BytesMut {

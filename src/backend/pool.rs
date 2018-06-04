@@ -1,8 +1,8 @@
 use super::distributor::{BackendDescriptor, Distributor};
 use super::hasher::Hasher;
 use futures::future::Either;
-use futures::prelude::*;
 use futures::future::{ok, result};
+use futures::prelude::*;
 use std::io::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -118,10 +118,10 @@ impl Sink for BackendParticipant {
             BackendConnection::Alive(stream) => {
                 let mut conns = self.conns.lock().unwrap();
                 conns.push(Either::A(ExistingTcpStream::from_stream(stream)));
-            },
+            }
             BackendConnection::Error => {
                 self.conn_count.fetch_sub(1, Ordering::SeqCst);
-            },
+            }
         };
         Ok(AsyncSink::Ready)
     }
@@ -175,9 +175,13 @@ impl<D: Distributor, H: Hasher> BackendPool<D, H> {
     }
 }
 
-pub fn run_operation_on_backend<F, F2, U>(backend: BackendParticipant, f: F) -> impl Future<Item = U, Error = Error>
-    where F: FnOnce(TcpStream) -> F2,
-          F2: Future<Item = (TcpStream, U), Error = Error> + 'static,
+pub fn run_operation_on_backend<F, F2, U>(
+    backend: BackendParticipant,
+    f: F,
+) -> impl Future<Item = U, Error = Error>
+where
+    F: FnOnce(TcpStream) -> F2,
+    F2: Future<Item = (TcpStream, U), Error = Error> + 'static,
 {
     let (backend_tx, backend_rx) = backend.split();
     backend_rx
@@ -186,14 +190,13 @@ pub fn run_operation_on_backend<F, F2, U>(backend: BackendParticipant, f: F) -> 
         .map_err(|(err, _)| err)
         .and_then(|(server, _)| server.unwrap())
         .and_then(move |server| f(server))
-        .then(|result| {
-            match result {
-                Ok((server, x)) => ok((BackendConnection::Alive(server), Ok(x))),
-                Err(e) => ok((BackendConnection::Error, Err(e))),
-            }
+        .then(|result| match result {
+            Ok((server, x)) => ok((BackendConnection::Alive(server), Ok(x))),
+            Err(e) => ok((BackendConnection::Error, Err(e))),
         })
         .and_then(move |(backend_result, op_result)| {
-            backend_tx.send(backend_result)
+            backend_tx
+                .send(backend_result)
                 .join(result(op_result))
                 .map(|(_, result)| result)
         })
