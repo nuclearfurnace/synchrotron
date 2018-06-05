@@ -1,4 +1,7 @@
 # synchrotron
+
+[![Build Status](https://travis-ci.org/nuclearfurnace/synchrotron.svg?branch=master)](https://travis-ci.org/nuclearfurnace/synchrotron)
+
 Synchrotron is a caching layer load balancer, in the spirit of [Twemproxy](https://github.com/twitter/twemproxy) and [mcrouter](https://github.com/facebook/mcrouter).
 
 # Why another one?
