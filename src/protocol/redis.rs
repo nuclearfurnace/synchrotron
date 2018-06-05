@@ -449,7 +449,7 @@ mod tests {
     static DATA_PING_LOWER: &[u8] = b"ping\r\n";
     static DATA_PING_UPPER: &[u8] = b"PING\r\n";
 
-    fn get_message_from_buf(buf: &[u8]) -> Poll<RedisMessage, Error> {
+    fn get_message_from_buf(buf: &[u8]) -> Poll<RedisMessage, io::Error> {
         let mut rd = BytesMut::with_capacity(buf.len());
         rd.put_slice(&buf[..]);
         read_message(&mut rd).map(|res| res.map(|(_, msg)| msg))
