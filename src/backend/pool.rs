@@ -3,11 +3,29 @@ use super::hasher::Hasher;
 use futures::future::Either;
 use futures::future::{ok, result};
 use futures::prelude::*;
+use futures::task;
+use futures::task::Task;
+use std::collections::VecDeque;
 use std::io::Error;
+use std::mem;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::{ConnectFuture, TcpStream};
+
+pub struct BackendState {
+    conns: Vec<TcpConnection>,
+    waiters: VecDeque<Task>,
+}
+
+impl BackendState {
+    pub fn new() -> BackendState {
+        BackendState {
+            conns: Vec::new(),
+            waiters: VecDeque::new(),
+        }
+    }
+}
 
 pub enum BackendConnection {
     Alive(TcpStream),
@@ -20,7 +38,7 @@ pub enum BackendConnection {
 /// reclaiming them during normal operation.
 pub struct Backend {
     address: SocketAddr,
-    conns: Arc<Mutex<Vec<TcpConnection>>>,
+    state: Arc<Mutex<BackendState>>,
     conn_count: Arc<AtomicUsize>,
     conn_limit: usize,
 }
@@ -29,7 +47,7 @@ impl Backend {
     pub fn new(addr: SocketAddr, conn_limit: usize) -> Backend {
         Backend {
             address: addr,
-            conns: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(Mutex::new(BackendState::new())),
             conn_count: Arc::new(AtomicUsize::new(0)),
             conn_limit: conn_limit,
         }
@@ -38,7 +56,7 @@ impl Backend {
     pub fn subscribe(&self) -> BackendParticipant {
         BackendParticipant {
             address: self.address.clone(),
-            conns: self.conns.clone(),
+            state: self.state.clone(),
             conn_count: self.conn_count.clone(),
             conn_limit: self.conn_limit,
         }
@@ -74,7 +92,7 @@ impl Future for ExistingTcpStream {
 /// getting a connection, and returning it, can be easily composed.
 pub struct BackendParticipant {
     address: SocketAddr,
-    conns: Arc<Mutex<Vec<TcpConnection>>>,
+    state: Arc<Mutex<BackendState>>,
     conn_count: Arc<AtomicUsize>,
     conn_limit: usize,
 }
@@ -84,12 +102,34 @@ impl Stream for BackendParticipant {
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let mut conns = self.conns.lock().unwrap();
-        match conns.pop() {
-            Some(conn) => Ok(Async::Ready(Some(conn))),
+        debug!("[backend] checking queue for existing connections");
+
+        let current_conns = self.conn_count.load(Ordering::SeqCst);
+        if current_conns < self.conn_limit {
+            debug!("[backend] open connection slot, trying to reserve it...");
+            let old = self.conn_count.compare_and_swap(
+                current_conns,
+                current_conns + 1,
+                Ordering::SeqCst,
+            );
+            if old == current_conns {
+                debug!("[backend] creating new connection to {}", &self.address);
+                return Ok(Async::Ready(Some(Either::B(TcpStream::connect(
+                    &self.address,
+                )))));
+            }
+        }
+
+        let mut state = self.state.lock().unwrap();
+        match state.conns.pop() {
+            Some(conn) => {
+                debug!("[backend] got connection from queue directly");
+                Ok(Async::Ready(Some(conn)))
+            }
             None => {
-                let current_conns = self.conn_count.load(Ordering::SeqCst);
+                /*let current_conns = self.conn_count.load(Ordering::SeqCst);
                 if current_conns < self.conn_limit {
+                    debug!("[backend] open connection slot, trying to reserve it...");
                     let old = self.conn_count.compare_and_swap(
                         current_conns,
                         current_conns + 1,
@@ -101,7 +141,13 @@ impl Stream for BackendParticipant {
                             &self.address,
                         )))));
                     }
-                }
+                }*/
+
+                // If we have no connection to give, store the task so we can notify them when we
+                // are given back a connection.
+                debug!("[backend] not ready to give connection");
+                let waiter = task::current();
+                state.waiters.push_back(waiter);
 
                 Ok(Async::NotReady)
             }
@@ -114,15 +160,39 @@ impl Sink for BackendParticipant {
     type SinkError = Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+        let mut state = self.state.lock().unwrap();
+
         match item {
             BackendConnection::Alive(stream) => {
-                let mut conns = self.conns.lock().unwrap();
-                conns.push(Either::A(ExistingTcpStream::from_stream(stream)));
+                debug!("[backend] sending connection back into queue");
+                state
+                    .conns
+                    .push(Either::A(ExistingTcpStream::from_stream(stream)));
             }
             BackendConnection::Error => {
+                debug!("[backend] error with connection; freeing slot in queue");
                 self.conn_count.fetch_sub(1, Ordering::SeqCst);
             }
         };
+
+        /*let waiter_count = state.waiters.len();
+        if waiter_count > 64 {*/
+        if state.waiters.len() > 0 {
+            let waiters = mem::replace(&mut state.waiters, VecDeque::new());
+            drop(state);
+            for waiter in &waiters {
+                waiter.notify();
+            }
+        } /* else {
+
+        while state.waiters.len() > 0 {
+            match state.waiters.pop_front() {
+                Some(waiter) => waiter.notify(),
+                None => {},
+            }
+        }
+        */
+
         Ok(AsyncSink::Ready)
     }
 
@@ -185,7 +255,6 @@ where
 {
     let (backend_tx, backend_rx) = backend.split();
     backend_rx
-        .take(1)
         .into_future()
         .map_err(|(err, _)| err)
         .and_then(|(server, _)| server.unwrap())

@@ -26,8 +26,9 @@ use rs_futures_spmc::channel;
 use std::error::Error;
 use std::process;
 use std::thread;
+use tokio::executor::thread_pool;
 use tokio::prelude::*;
-use tokio::runtime::Runtime;
+use tokio::runtime;
 
 #[macro_use]
 extern crate log;
@@ -92,11 +93,11 @@ fn run() -> i32 {
     // which is also level filtered.  As well, we've replaced the global std logger
     // and pulled in helper macros that correspond to the various logging levels.
     let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog_term::CompactFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
     let logger = slog::Logger::root(
         slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
-        slog_o!("version" => env!("CARGO_PKG_VERSION")),
+        slog_o!(),
     );
 
     let _scope_guard = slog_scope::set_global_logger(logger);
@@ -104,7 +105,15 @@ fn run() -> i32 {
     info!("[core] logging configured");
 
     // Now run.
-    let mut runtime = Runtime::new().expect("failed to create tokio runtime");
+    let mut threadpool_builder = thread_pool::Builder::new();
+    threadpool_builder
+        .name_prefix("my-runtime-worker-")
+        .pool_size(4);
+
+    let mut runtime = runtime::Builder::new()
+        .threadpool_builder(threadpool_builder)
+        .build()
+        .expect("failed to create tokio runtime");
     let reactor = runtime.reactor().clone();
 
     let listeners = configuration

@@ -193,7 +193,7 @@ where
         .map_err(|e| error!("[pool] accept failed: {:?}", e))
         .for_each(move |socket| {
             let client_addr = socket.peer_addr().unwrap();
-            debug!("[client] connection established -> {:?}", client_addr);
+            info!("[client] connection established -> {:?}", client_addr);
 
             let default = default_pool.clone();
 
@@ -203,18 +203,28 @@ where
                     error!("[client] caught error while reading from client: {:?}", e);
                 })
                 .batch(128)
-                .fold(client_tx, move |tx, msgs| {
-                    trace!("[client] got batch of {} messages!", msgs.len());
+                .fold((client_tx, client_addr), move |(tx, addr), msgs| {
+                    trace!(
+                        "[client] [{:?}] got batch of {} messages!",
+                        addr,
+                        msgs.len()
+                    );
 
                     join_all(generate_batched_writes(&default, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
                         .and_then(move |items| redis::write_messages(tx, items))
-                        .map(|(w, _n)| w)
+                        .map(move |(w, _n)| {
+                            trace!("[client] [{:?}] sent batch of responses to client", addr);
+                            (w, addr)
+                        })
                         .map_err(|err| {
                             error!("[client] caught error while handling request: {:?}", err)
                         })
                 })
-                .map(|_| ());
+                .map(|(_, addr)| {
+                    info!("[client] connection complete -> {:?}", addr);
+                    ()
+                });
 
             tokio::spawn(client_proto)
         });
