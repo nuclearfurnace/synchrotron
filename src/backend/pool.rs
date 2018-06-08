@@ -1,34 +1,45 @@
 use super::distributor::{BackendDescriptor, Distributor};
 use super::hasher::Hasher;
-use futures::prelude::*;
+use backend::sync::RequestTransformer;
+use backend::sync::{
+    MutexBackend, MutexBackendConnection, MutexBackendParticipant, TaskBackend,
+    TaskBackendConnection, TaskBackendParticipant,
+};
 use futures::future::{ok, result};
+use futures::prelude::*;
 use std::io::Error;
 use std::net::SocketAddr;
 use tokio;
 use tokio::net::TcpStream;
-use super::sync::{
-    MutexBackend, MutexBackendParticipant, MutexBackendConnection,
-    TaskBackend, TaskBackendParticipant, TaskBackendConnection,
-};
 
-pub struct BackendPool<D, H, R, V> {
+pub struct BackendPool<D, H, T>
+where
+    D: Distributor,
+    H: Hasher,
+    T: RequestTransformer,
+{
     distributor: D,
     hasher: H,
-    backends: Vec<TaskBackend<R, V>>,
+    backends: Vec<TaskBackend<T>>,
 }
 
-impl<D, H, R, R2, V> BackendPool<D, H, R, V>
-    where D: Distributor,
-          H: Hasher,
-          R: FnOnce(TcpStream) -> R2,
-          R2: Future<Item = (TcpStream, V), Error = Error> + 'static
+impl<D, H, T> BackendPool<D, H, T>
+where
+    D: Distributor,
+    H: Hasher,
+    T: RequestTransformer + Clone,
 {
-    pub fn new(addresses: Vec<SocketAddr>, mut dist: D, hasher: H) -> BackendPool<D, H, R, V> {
+    pub fn new(
+        addresses: Vec<SocketAddr>,
+        transformer: T,
+        mut dist: D,
+        hasher: H,
+    ) -> BackendPool<D, H, T> {
         // Assemble the list of backends and backend descriptors.
         let mut backends = vec![];
         let mut descriptors = vec![];
         for address in &addresses {
-            let (backend, runner) = TaskBackend::new(address.clone(), 1);
+            let (backend, runner) = TaskBackend::new(address.clone(), transformer.clone(), 1);
             backends.push(backend);
 
             // eventually, we'll populate this with weight, etc, so that
@@ -55,7 +66,7 @@ impl<D, H, R, R2, V> BackendPool<D, H, R, V>
         self.distributor.choose(key_id)
     }
 
-    pub fn get_backend_by_index(&self, idx: usize) -> TaskBackendParticipant<R, V> {
+    pub fn get_backend_by_index(&self, idx: usize) -> TaskBackendParticipant<T> {
         match self.backends.get(idx) {
             Some(backend) => backend.subscribe(),
             None => unreachable!("incorrect backend idx"),
@@ -89,14 +100,12 @@ where
         })
 }
 
-pub fn run_operation_on_task_backend<R, R2, V>(
-    backend: TaskBackendParticipant<R, V>,
-    f: R,
-) -> impl Future<Item = V, Error = Error>
+pub fn run_operation_on_task_backend<T>(
+    backend: TaskBackendParticipant<T>,
+    request: T::Request,
+) -> impl Future<Item = T::Response, Error = Error>
 where
-    R: FnOnce(TcpStream) -> R2,
-    R2: Future<Item = (TcpStream, V), Error = Error> + 'static,
+    T: RequestTransformer,
 {
-    backend.submit(f)
-        .map(|r| result(r))
+    backend.submit(request).map(|r| result(r))
 }

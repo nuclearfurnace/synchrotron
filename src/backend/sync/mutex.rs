@@ -1,13 +1,13 @@
+use futures::future::Either;
+use futures::prelude::*;
+use futures::task;
+use futures::task::Task;
 use std::collections::VecDeque;
 use std::io::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use futures::future::Either;
-use futures::task;
-use futures::task::Task;
-use futures::prelude::*;
-use tokio::net::{TcpStream, ConnectFuture};
+use std::sync::{Arc, Mutex};
+use tokio::net::{ConnectFuture, TcpStream};
 
 pub struct MutexBackendState {
     conns: Vec<MutexTcpConnection>,
@@ -115,7 +115,10 @@ impl Stream for MutexBackendParticipant {
                         Ordering::SeqCst,
                     );
                     if old == current_conns {
-                        debug!("[mutex backend] creating new connection to {}", &self.address);
+                        debug!(
+                            "[mutex backend] creating new connection to {}",
+                            &self.address
+                        );
                         return Ok(Async::Ready(Some(Either::B(TcpStream::connect(
                             &self.address,
                         )))));
@@ -157,7 +160,7 @@ impl Sink for MutexBackendParticipant {
         if state.waiters.len() > 0 {
             match state.waiters.pop_front() {
                 Some(waiter) => waiter.notify(),
-                None => {},
+                None => {}
             }
         }
 

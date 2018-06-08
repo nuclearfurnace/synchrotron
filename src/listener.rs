@@ -2,6 +2,8 @@ use backend::distributor::Distributor;
 use backend::hasher::Hasher;
 use backend::pool::BackendPool;
 use backend::redis::generate_batched_writes;
+use backend::redis::RedisRequestTransformer;
+use backend::sync::RequestTransformer;
 use backend::{distributor, hasher};
 use conf::ListenerConfiguration;
 use futures::future::{join_all, lazy, ok};
@@ -37,6 +39,31 @@ pub fn from_config(
     let listener =
         get_listener(&listen_address, &reactor).expect("failed to create the TCP listener");
 
+    // Get the correct handler based on protocol.
+    let protocol = config.protocol.to_lowercase();
+    let handler = match protocol.as_str() {
+        "redis" => redis_from_config(config, listener)?,
+        s => panic!("unknown protocol type: {}", s),
+    };
+
+    // Make sure our handlers close out when told.
+    let listen_address2 = listen_address.clone();
+    let wrapped = lazy(move || {
+        info!("[listener] starting listener '{}'...", listen_address);
+        ok(())
+    }).and_then(|_| handler)
+        .select2(close.into_future())
+        .then(move |_| {
+            info!("[pool] shutting down listener '{}'", listen_address2);
+            ok(())
+        });
+    Ok(Box::new(wrapped))
+}
+
+fn redis_from_config(
+    config: ListenerConfiguration,
+    listener: TcpListener,
+) -> Result<GenericRuntimeFuture, Error> {
     // Gather up all of the backend pools.
     let mut pools = HashMap::new();
     let pool_configs = config.pools.clone();
@@ -55,42 +82,17 @@ pub fn from_config(
             .to_lowercase();
         let hasher = hasher::configure_hasher(hash_type);
 
-        let pool = Arc::new(BackendPool::new(pool_config.addresses, distributor, hasher));
+        let transformer = RedisRequestTransformer::new();
+
+        let pool = Arc::new(BackendPool::new(
+            pool_config.addresses,
+            transformer,
+            distributor,
+            hasher,
+        ));
         pools.insert(pool_name, pool);
     }
 
-    // Get the correct handler based on protocol.
-    let protocol = config.protocol.to_lowercase();
-    let handler = match protocol.as_str() {
-        "redis" => redis_from_config(config, listener, pools)?,
-        s => panic!("unknown protocol type: {}", s),
-    };
-
-    // Make sure our handlers close out when told.
-    let listen_address2 = listen_address.clone();
-    let wrapped = lazy(move || {
-        info!("[listener] starting listener '{}'...", listen_address);
-        ok(())
-    }).and_then(|_| handler)
-        .select2(close.into_future())
-        .then(move |_| {
-            info!("[pool] shutting down listener '{}'", listen_address2);
-            ok(())
-        });
-    Ok(Box::new(wrapped))
-}
-
-fn redis_from_config<D, H, R, V>(
-    config: ListenerConfiguration,
-    listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H, R, V>>>,
-) -> Result<GenericRuntimeFuture, Error>
-where
-    D: Distributor + Send + Sync + 'static,
-    H: Hasher + Send + Sync + 'static,
-    R: Send + 'static,
-    V: Send + 'static,
-{
     // Figure out what sort of routing we're doing so we can grab the right handler.
     let routing_type = config.routing.to_lowercase();
     match routing_type.as_str() {
@@ -99,15 +101,14 @@ where
     }
 }
 
-fn redis_warmup_handler<D, H, R, V>(
+fn redis_warmup_handler<D, H, T>(
     listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H, R, V>>>,
+    pools: HashMap<String, Arc<BackendPool<D, H, T>>>,
 ) -> Result<GenericRuntimeFuture, Error>
 where
     D: Distributor + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
-    R: Send + 'static,
-    V: Send + 'static,
+    T: RequestTransformer,
 {
     let warm_pool = pools
         .get("warm")
@@ -176,15 +177,14 @@ where
     Ok(Box::new(handler))
 }
 
-fn redis_normal_handler<D, H, R, V>(
+fn redis_normal_handler<D, H, T>(
     listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H, R, V>>>,
+    pools: HashMap<String, Arc<BackendPool<D, H, T>>>,
 ) -> Result<GenericRuntimeFuture, Error>
 where
     D: Distributor + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
-    R: Send + 'static,
-    V: Send + 'static,
+    T: RequestTransformer,
 {
     let default_pool = pools
         .get("default")

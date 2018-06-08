@@ -1,67 +1,64 @@
-use std::io::Error;
-use std::net::SocketAddr;
+use backend::sync::{ExistingTcpStreamFuture, RequestTransformer, TcpStreamFuture};
 use futures::future::Either;
+use futures::future::{ok, result};
+use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::sync::mpsc;
 use futures::sync::oneshot;
-use futures::prelude::*;
-use futures::future::{ok, result};
-use tokio::net::{TcpStream, ConnectFuture};
+use std::io::Error;
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
 
-type TaskTcpConnection = Either<TaskExistingTcpStream, ConnectFuture>;
-
-pub struct TaskExistingTcpStream {
-    stream: Option<TcpStream>,
+pub enum TaskBackendConnection {
+    Alive(TcpStream),
+    Error,
 }
 
-impl TaskExistingTcpStream {
-    pub fn from_stream(stream: TcpStream) -> TaskExistingTcpStream {
-        TaskExistingTcpStream {
-            stream: Some(stream),
-        }
-    }
-}
-
-impl Future for TaskExistingTcpStream {
-    type Item = TcpStream;
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        Ok(Async::Ready(self.stream.take().unwrap()))
-    }
-}
-
-/// Wraps a request future as a work item so we can statically type the work futures queue.
 struct WorkItemFuture<F>
-    where F: Future,
+where
+    F: Future,
 {
     inner: F,
 }
 
 impl<F> WorkItemFuture<F>
-    where F: Future,
+where
+    F: Future,
 {
-    pub fn new(inner: F) -> WorkItemFuture<F>
-        where F: Future<Item = (), Error = ()>
+    pub fn new<T>(
+        transformer: &T,
+        request: T::Request,
+        sf: TcpStreamFuture,
+        conns_tx: mpsc::Sender<TaskBackendConnection>,
+        result_tx: oneshot::Sender<Result<T::Response, Error>>,
+    ) -> WorkItemFuture<F>
+    where
+        T: RequestTransformer,
     {
-        WorkItemFuture { inner: inner }
+        let inner_work = transformer.transform(request, sf);
+        let work = inner_work
+            .then(|result| match result {
+                Ok((conn, x)) => ok((TaskBackendConnection::Alive(conn), Ok(x))),
+                Err(e) => ok((TaskBackendConnection::Error, Err(e))),
+            })
+            .and_then(move |(backend_result, op_result)| {
+                conns_tx.send(backend_result).map(|_| op_result)
+            })
+            .and_then(move |result| result_tx.send(result))
+            .map_err(|_| ())
+            .map(|_| ());
+
+        WorkItemFuture { inner: work }
     }
 }
 
 impl<F> Future for WorkItemFuture<F>
-    where F: Future
+where
+    F: Future,
 {
-    type Item = F::Item;
-    type Error = F::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(&mut self) -> Poll<F::Item, F::Error> {
         self.inner.poll()
     }
-}
-
-pub enum TaskBackendConnection {
-    Alive(TcpStream),
-    Error,
 }
 
 /// A state machine that drives the pooling of backend connections and the requests that require
@@ -74,8 +71,12 @@ pub enum TaskBackendConnection {
 /// There is an implicit requirement that a backend be created with a sibling state machine, and
 /// each given the appropriate tx/rx sides of a channel that allows them to communicate with each
 /// other.
-pub struct TaskBackendStateMachine<R, V> {
-    requests_rx: mpsc::UnboundedReceiver<(R, oneshot::Sender<Result<V, Error>>)>,
+pub struct TaskBackendStateMachine<T>
+where
+    T: RequestTransformer,
+{
+    transformer: T,
+    requests_rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
 
     address: SocketAddr,
     conns: Vec<TcpStream>,
@@ -87,9 +88,9 @@ pub struct TaskBackendStateMachine<R, V> {
     work: FuturesUnordered<WorkItemFuture<Future<Item = (), Error = ()>>>,
 }
 
-impl<R, R2, V> Future for TaskBackendStateMachine<R, V>
-    where R: FnOnce(TcpStream) -> R2,
-          R2: Future<Item = (TcpStream, V), Error = Error> + 'static
+impl<T> Future for TaskBackendStateMachine<T>
+where
+    T: RequestTransformer,
 {
     type Item = ();
     type Error = ();
@@ -102,7 +103,7 @@ impl<R, R2, V> Future for TaskBackendStateMachine<R, V>
                     TaskBackendConnection::Alive(conn) => self.conns.push(conn),
                     TaskBackendConnection::Error => {
                         self.conn_count -= 1;
-                    },
+                    }
                 },
                 Ok(Async::NotReady) => break,
                 x => return Err(()),
@@ -116,56 +117,58 @@ impl<R, R2, V> Future for TaskBackendStateMachine<R, V>
             return Ok(Async::NotReady);
         }
 
+        // Go through every request we have pending to us, and spin them up.
         loop {
-        match self.requests_rx.poll() {
-            Ok(Async::NotReady) => {
-                // Open connections doesn't mean we don't have work, so do a quick poll and then
-                // bounce out of here.
-                let _ = self.work.poll();
-                return Ok(Async::NotReady);
-            },
-            Ok(Async::Ready(Some((f, tx)))) => {
-                // We have a new request.  Grab a connection and attempt to service it.
-                let connection = match self.conns.len() {
-                    0 => {
-                        self.conn_count += 1;
-                        Either::B(TcpStream::connect(&self.address))
-                    },
-                    _ => self.conns.pop().map(|x| Either::A(TaskExistingTcpStream::from_stream(x))).unwrap(),
-                };
+            match self.requests_rx.poll() {
+                Ok(Async::NotReady) => {
+                    // Open connections doesn't mean we don't have work, so do a quick poll and then
+                    // bounce out of here.
+                    let _ = self.work.poll();
+                    return Ok(Async::NotReady);
+                }
+                Ok(Async::Ready(Some((request, response_tx)))) => {
+                    // We have a new request.  Grab a connection and attempt to service it.
+                    let connection = match self.conns.len() {
+                        0 => {
+                            self.conn_count += 1;
+                            Either::B(TcpStream::connect(&self.address))
+                        }
+                        _ => self
+                            .conns
+                            .pop()
+                            .map(|x| Either::A(ExistingTcpStreamFuture::from_stream(x)))
+                            .unwrap(),
+                    };
 
-                let conns_tx = self.conns_tx.clone();
-                let work = connection
-                    .and_then(move |conn| f(conn))
-                    .then(|result| match result {
-                        Ok((conn, x)) => ok((TaskBackendConnection::Alive(conn), Ok(x))),
-                        Err(e) => ok((TaskBackendConnection::Error, Err(e))),
-                    })
-                    .and_then(move |(backend_result, op_result)| {
-                        conns_tx
-                            .send(backend_result)
-                            .map(|_| op_result)
-                    })
-                    .and_then(move |result| tx.send(result))
-                    .map_err(|_| ())
-                    .map(|_| ());
-
-                self.work.push(work);
-            },
-            _ => Err(()),
-        }
+                    let conns_tx = self.conns_tx.clone();
+                    let work = WorkItemFuture::new(
+                        &self.transformer,
+                        request,
+                        connection,
+                        conns_tx,
+                        response_tx,
+                    );
+                    self.work.push(work);
+                }
+                _ => Err(()),
+            }
         }
     }
 }
 
-fn new_state_machine<R, R2, V>(addr: SocketAddr, rx: mpsc::UnboundedReceiver<(R, oneshot::Sender<V>)>, conn_limit: usize)
-    -> TaskBackendStateMachine<R, V>
-    where R: FnOnce(TcpStream) -> R2,
-          R2: Future<Item = (TcpStream, V), Error = Error>,
+fn new_state_machine<T>(
+    addr: SocketAddr,
+    transformer: T,
+    rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
+    conn_limit: usize,
+) -> TaskBackendStateMachine<T>
+where
+    T: RequestTransformer,
 {
     let (conns_tx, conns_rx) = mpsc::unbounded();
 
     TaskBackendStateMachine {
+        transformer: transformer,
         requests_rx: rx,
 
         address: addr,
@@ -190,17 +193,23 @@ fn new_state_machine<R, R2, V>(addr: SocketAddr, rx: mpsc::UnboundedReceiver<(R,
 ///
 /// Backends maintain a given number of connections to their underlying service, and track error
 /// states, recycling connections and pausing work when required.
-pub struct TaskBackend<R, V> {
+pub struct TaskBackend<T>
+where
+    T: RequestTransformer,
+{
     address: SocketAddr,
-    requests_tx: mpsc::UnboundedSender<(R, oneshot::Sender<Result<V, Error>>)>,
+    requests_tx: mpsc::UnboundedSender<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
 }
 
-impl<R, R2, V> TaskBackend<R, V>
-    where R: FnOnce(TcpStream) -> R2,
-          R2: Future<Item = (TcpStream, V), Error = Error> + 'static
+impl<T> TaskBackend<T>
+where
+    T: RequestTransformer,
 {
-    pub fn new(addr: SocketAddr, conn_limit: usize) -> (TaskBackend<R, V>, TaskBackendStateMachine<R, V>)
-    {
+    pub fn new(
+        addr: SocketAddr,
+        transformer: T,
+        conn_limit: usize,
+    ) -> (TaskBackend<T>, TaskBackendStateMachine<T>) {
         let (tx, rx) = mpsc::unbounded();
 
         let backend = TaskBackend {
@@ -208,12 +217,12 @@ impl<R, R2, V> TaskBackend<R, V>
             requests_tx: tx,
         };
 
-        let runner = new_state_machine(addr, rx, conn_limit);
+        let runner = new_state_machine(addr, transformer, rx, conn_limit);
 
         (backend, runner)
     }
 
-    pub fn subscribe(&self) -> TaskBackendParticipant<R, V> {
+    pub fn subscribe(&self) -> TaskBackendParticipant<T> {
         TaskBackendParticipant {
             requests_tx: self.requests_tx.clone(),
         }
@@ -224,17 +233,22 @@ impl<R, R2, V> TaskBackend<R, V>
 ///
 /// This provides a Stream/Sink interface to the underlying queue of backend connections so that
 /// getting a connection, and returning it, can be easily composed.
-pub struct TaskBackendParticipant<R, V> {
-    requests_tx: mpsc::UnboundedSender<(R, oneshot::Sender<Result<V, Error>>)>,
+pub struct TaskBackendParticipant<T>
+where
+    T: RequestTransformer,
+{
+    requests_tx: mpsc::UnboundedSender<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
 }
 
-impl<R, R2, V> TaskBackendParticipant<R, V>
-    where R: FnOnce(TcpStream) -> R2,
-          R2: Future<Item = (TcpStream, V), Error = Error>
+impl<T> TaskBackendParticipant<T>
+where
+    T: RequestTransformer,
 {
-    pub fn submit(&mut self, f: R) -> oneshot::Receiver<Result<V, Error>> {
+    pub fn submit(&mut self, request: T::Request) -> oneshot::Receiver<Result<T::Response, Error>> {
         let (tx, rx) = oneshot::channel();
-        self.requests_tx.unbounded_send((f, tx)).expect("unbounded task send failed");
+        self.requests_tx
+            .unbounded_send((request, tx))
+            .expect("unbounded task send failed");
         rx
     }
 }
