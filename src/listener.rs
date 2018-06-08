@@ -80,14 +80,16 @@ pub fn from_config(
     Ok(Box::new(wrapped))
 }
 
-fn redis_from_config<D, H>(
+fn redis_from_config<D, H, R, V>(
     config: ListenerConfiguration,
     listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H>>>,
+    pools: HashMap<String, Arc<BackendPool<D, H, R, V>>>,
 ) -> Result<GenericRuntimeFuture, Error>
 where
     D: Distributor + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
+    R: Send + 'static,
+    V: Send + 'static,
 {
     // Figure out what sort of routing we're doing so we can grab the right handler.
     let routing_type = config.routing.to_lowercase();
@@ -97,13 +99,15 @@ where
     }
 }
 
-fn redis_warmup_handler<D, H>(
+fn redis_warmup_handler<D, H, R, V>(
     listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H>>>,
+    pools: HashMap<String, Arc<BackendPool<D, H, R, V>>>,
 ) -> Result<GenericRuntimeFuture, Error>
 where
     D: Distributor + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
+    R: Send + 'static,
+    V: Send + 'static,
 {
     let warm_pool = pools
         .get("warm")
@@ -172,13 +176,15 @@ where
     Ok(Box::new(handler))
 }
 
-fn redis_normal_handler<D, H>(
+fn redis_normal_handler<D, H, R, V>(
     listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H>>>,
+    pools: HashMap<String, Arc<BackendPool<D, H, R, V>>>,
 ) -> Result<GenericRuntimeFuture, Error>
 where
     D: Distributor + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
+    R: Send + 'static,
+    V: Send + 'static,
 {
     let default_pool = pools
         .get("default")

@@ -1,6 +1,6 @@
 use backend::distributor::Distributor;
 use backend::hasher::Hasher;
-use backend::pool::{run_operation_on_backend, BackendPool};
+use backend::pool::{run_operation_on_task_backend, BackendPool};
 use bytes::BytesMut;
 use futures::future::ok;
 use futures::prelude::*;
@@ -11,8 +11,8 @@ use std::io::Error;
 
 type OrderedMessages = Vec<(u64, RedisMessage)>;
 
-pub fn generate_batched_writes<D, H>(
-    pool: &BackendPool<D, H>,
+pub fn generate_batched_writes<D, H, R, V>(
+    pool: &BackendPool<D, H, R, V>,
     mut messages: Vec<RedisMessage>,
 ) -> Vec<impl Future<Item = OrderedMessages, Error = Error>>
 where
@@ -50,7 +50,7 @@ where
         }
 
         let msg_indexes_inner = msg_indexes.clone();
-        let responses = run_operation_on_backend(backend, move |server| {
+        let responses = run_operation_on_task_backend(backend, move |server| {
             ok(server)
                 .and_then(move |server| {
                     debug!("[redis backend] about to write batched messages to backend");
@@ -73,7 +73,7 @@ where
             error!("caught error when running batched operation: {:?}", err);
             err
         })
-            .or_else(move |err| ok(to_vectored_error_response(err, msg_indexes)));
+        .or_else(move |err| ok(to_vectored_error_response(err, msg_indexes)));
 
         queues.push(responses);
     }
