@@ -1,7 +1,7 @@
 use backend::sync::RequestTransformer;
+use futures::future::{ok, Either};
 use futures::prelude::*;
 use futures::sync::{mpsc, oneshot};
-use futures::future::{ok, Either};
 use std::io::Error;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -60,7 +60,7 @@ where
                         self.conn_count -= 1;
                     }
                 },
-                Ok(Async::NotReady) => {},
+                Ok(Async::NotReady) => {}
                 _ => return Err(()),
             }
 
@@ -81,11 +81,7 @@ where
                             self.conn_count += 1;
                             Either::B(TcpStream::connect(&self.address))
                         }
-                        _ => self
-                            .conns
-                            .pop()
-                            .map(|x| Either::A(ok(x)))
-                            .unwrap(),
+                        _ => self.conns.pop().map(|x| Either::A(ok(x))).unwrap(),
                     };
 
                     let conns_tx = self.conns_tx.clone();
@@ -167,9 +163,7 @@ where
     ) -> (TaskBackend<T>, TaskBackendStateMachine<T>) {
         let (tx, rx) = mpsc::unbounded();
 
-        let backend = TaskBackend {
-            requests_tx: tx,
-        };
+        let backend = TaskBackend { requests_tx: tx };
 
         let runner = new_state_machine(executor, addr, transformer, rx, conn_limit);
 

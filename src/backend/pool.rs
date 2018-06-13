@@ -2,11 +2,11 @@ use super::distributor::{BackendDescriptor, Distributor};
 use super::hasher::KeyHasher;
 use backend::sync::RequestTransformer;
 use backend::sync::{TaskBackend, TaskBackendParticipant};
-use std::net::SocketAddr;
-use tokio::runtime::TaskExecutor;
 use futures::prelude::*;
-use tokio::net::TcpStream;
 use std::io::Error;
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
+use tokio::runtime::TaskExecutor;
 
 pub struct BackendPool<T>
 where
@@ -35,7 +35,8 @@ where
         let mut backends = vec![];
         let mut descriptors = vec![];
         for address in &addresses {
-            let (backend, runner) = TaskBackend::new(executor.clone(), address.clone(), transformer.clone(), 1);
+            let (backend, runner) =
+                TaskBackend::new(executor.clone(), address.clone(), transformer.clone(), 1);
             backends.push(backend);
 
             // eventually, we'll populate this with weight, etc, so that

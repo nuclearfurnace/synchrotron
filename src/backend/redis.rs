@@ -1,5 +1,3 @@
-use backend::distributor::Distributor;
-use backend::hasher::KeyHasher;
 use backend::pool::BackendPool;
 use backend::sync::{RequestTransformer, TcpStreamFuture};
 use bytes::BytesMut;
@@ -27,8 +25,7 @@ impl RequestTransformer for RedisRequestTransformer {
     type Response = RedisOrderedMessages;
     type Executor = Box<Future<Item = (TcpStream, Self::Response), Error = Error> + Send>;
 
-    fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor
-    {
+    fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor {
         // Break apart IDs and messages.
         let msg_len = req.len();
         let mut msg_ids = Vec::with_capacity(msg_len);
@@ -63,8 +60,7 @@ impl RequestTransformer for RedisRequestTransformer {
 pub fn generate_batched_redis_writes(
     pool: &BackendPool<RedisRequestTransformer>,
     mut messages: Vec<RedisMessage>,
-) -> Vec<impl Future<Item = RedisOrderedMessages, Error = Error>>
-{
+) -> Vec<impl Future<Item = RedisOrderedMessages, Error = Error>> {
     // Group all of our messages by their target backend index.
     let mut assigned_msgs = HashMap::new();
 
@@ -91,7 +87,8 @@ pub fn generate_batched_redis_writes(
 
         let mut backend = pool.get_backend_by_index(backend_idx);
         let msg_indexes2 = msg_indexes.clone();
-        let response = backend.submit(msgs)
+        let response = backend
+            .submit(msgs)
             .and_then(|r| {
                 result(r).or_else(move |err| ok(to_vectored_error_response(err, msg_indexes2)))
             })

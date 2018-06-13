@@ -1,6 +1,5 @@
-use rand::{thread_rng, Rng};
-
 use super::{BackendDescriptor, Distributor};
+use rand::{thread_rng, Rng};
 
 /// Provides a randomized distribution of requests.
 pub struct RandomDistributor {

@@ -24,8 +24,8 @@ pub trait Distributor {
     fn choose(&self, point: u64) -> usize;
 }
 
-pub fn configure_distributor(dist_type: String) -> Box<Distributor + Send + Sync> {
-    match dist_type.as_str() {
+pub fn configure_distributor(dist_type: &str) -> Box<Distributor + Send + Sync> {
+    match dist_type {
         "random" => Box::new(RandomDistributor::new()),
         s => panic!("unknown distributor type {}", s),
     }

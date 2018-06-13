@@ -1,5 +1,3 @@
-use backend::distributor::Distributor;
-use backend::hasher::KeyHasher;
 use backend::pool::BackendPool;
 use backend::redis::generate_batched_redis_writes;
 use backend::redis::RedisRequestTransformer;
@@ -70,19 +68,27 @@ fn redis_from_config(
     let mut pools = HashMap::new();
     let pool_configs = config.pools.clone();
     for (pool_name, mut pool_config) in pool_configs {
+        debug!(
+            "[listener] configuring backend pool '{}' for address '{}'",
+            &pool_name,
+            config.address.clone()
+        );
+
         let dist_type = pool_config
             .options
             .entry("distribution".to_owned())
             .or_insert("random".to_owned())
             .to_lowercase();
-        let distributor = distributor::configure_distributor(dist_type);
+        let distributor = distributor::configure_distributor(&dist_type);
+        debug!("[listener] using distributor '{}'", dist_type);
 
         let hash_type = pool_config
             .options
             .entry("hash".to_owned())
             .or_insert("fnv1a_64".to_owned())
             .to_lowercase();
-        let hasher = hasher::configure_hasher(hash_type);
+        let hasher = hasher::configure_hasher(&hash_type);
+        debug!("[listener] using hasher '{}'", hash_type);
 
         let transformer = RedisRequestTransformer::new();
 
@@ -108,8 +114,7 @@ fn redis_warmup_handler(
     executor: TaskExecutor,
     listener: TcpListener,
     pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
-) -> Result<GenericRuntimeFuture, Error>
-{
+) -> Result<GenericRuntimeFuture, Error> {
     let warm_pool = pools
         .get("warm")
         .ok_or(Error::new(
@@ -185,8 +190,7 @@ fn redis_normal_handler(
     executor: TaskExecutor,
     listener: TcpListener,
     pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
-) -> Result<GenericRuntimeFuture, Error>
-{
+) -> Result<GenericRuntimeFuture, Error> {
     let default_pool = pools
         .get("default")
         .ok_or(Error::new(
@@ -210,30 +214,40 @@ fn redis_normal_handler(
                     error!("[client] caught error while reading from client: {:?}", e);
                 })
                 .batch(128)
-                .fold((client_tx, client_addr, 0), move |(tx, addr, msg_count), msgs| {
-                    let start = Instant::now();
-                    trace!(
-                        "[client] [{:?}] got batch of {} messages!",
-                        addr,
-                        msgs.len()
-                    );
+                .fold(
+                    (client_tx, client_addr, 0),
+                    move |(tx, addr, msg_count), msgs| {
+                        let start = Instant::now();
+                        trace!(
+                            "[client] [{:?}] got batch of {} messages!",
+                            addr,
+                            msgs.len()
+                        );
 
-                    let new_msg_count = msg_count + msgs.len();
+                        let new_msg_count = msg_count + msgs.len();
 
-                    join_all(generate_batched_redis_writes(&default, msgs))
-                        .and_then(|results| ok(flatten_ordered_messages(results)))
-                        .and_then(move |items| redis::write_messages(tx, items))
-                        .map(move |(w, _n)| {
-                            let delta = start.elapsed().as_micros();
-                            trace!("[client] [{:?}] sent batch of responses to client; took {}μs", addr, delta);
-                            (w, addr, new_msg_count)
-                        })
-                        .map_err(|err| {
-                            error!("[client] caught error while handling request: {:?}", err)
-                        })
-                })
+                        join_all(generate_batched_redis_writes(&default, msgs))
+                            .and_then(|results| ok(flatten_ordered_messages(results)))
+                            .and_then(move |items| redis::write_messages(tx, items))
+                            .map(move |(w, _n)| {
+                                let delta = start.elapsed().as_micros();
+                                trace!(
+                                    "[client] [{:?}] sent batch of responses to client; took {}μs",
+                                    addr,
+                                    delta
+                                );
+                                (w, addr, new_msg_count)
+                            })
+                            .map_err(|err| {
+                                error!("[client] caught error while handling request: {:?}", err)
+                            })
+                    },
+                )
                 .map(|(_, addr, msg_count)| {
-                    info!("[client] connection complete -> {:?}; processed {} messages", addr, msg_count);
+                    info!(
+                        "[client] connection complete -> {:?}; processed {} messages",
+                        addr, msg_count
+                    );
                     ()
                 });
 

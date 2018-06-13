@@ -1,5 +1,5 @@
-use std::hash::Hasher;
 use pruefung::fnv::fnv64::Fnv64a;
+use std::hash::Hasher;
 
 use super::KeyHasher;
 

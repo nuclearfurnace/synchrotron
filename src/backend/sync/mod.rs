@@ -1,5 +1,5 @@
-use std::io::Error;
 use futures::future::{Either, FutureResult};
+use std::io::Error;
 use tokio::net::{ConnectFuture, TcpStream};
 
 mod task;
