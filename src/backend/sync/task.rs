@@ -64,17 +64,18 @@ where
                 _ => return Err(()),
             }
 
+            // If all connections are currently busy, we can't do anything else.
+            if self.conns.len() == 0 && self.conn_count == self.conn_limit {
+                return Ok(Async::NotReady);
+            }
+
+
             // Go through every request we have pending to us, and spin them up.
             match self.requests_rx.poll() {
                 Ok(Async::NotReady) => {
                     return Ok(Async::NotReady);
                 }
                 Ok(Async::Ready(Some((request, response_tx)))) => {
-                    // If all connections are currently busy, we can't do anything else.
-                    if self.conns.len() == 0 && self.conn_count == self.conn_limit {
-                        return Ok(Async::NotReady);
-                    }
-
                     // We have a new request.  Grab a connection and attempt to service it.
                     let connection = match self.conns.len() {
                         0 => {
