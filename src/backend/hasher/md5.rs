@@ -1,7 +1,7 @@
 use crypto::digest::Digest;
 use crypto::md5::Md5;
 
-use super::Hasher;
+use super::KeyHasher;
 
 pub struct MD5Hasher;
 
@@ -11,7 +11,7 @@ impl MD5Hasher {
     }
 }
 
-impl Hasher for MD5Hasher {
+impl KeyHasher for MD5Hasher {
     fn hash(&self, buf: &[u8]) -> u64 {
         let mut hasher = Md5::new();
         hasher.input(buf);

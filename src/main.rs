@@ -1,9 +1,12 @@
 #![feature(test)]
 #![feature(iterator_flatten)]
+#![feature(associated_type_defaults)]
+#![feature(duration_as_u128)]
 #![recursion_limit = "1024"]
 
 extern crate config;
 extern crate crypto;
+extern crate pruefung;
 extern crate serde;
 extern crate serde_json;
 #[macro_use]
@@ -21,7 +24,6 @@ extern crate futures;
 extern crate net2;
 extern crate rs_futures_spmc;
 
-use futures::stream::iter_result;
 use rs_futures_spmc::channel;
 use std::error::Error;
 use std::process;
@@ -114,7 +116,9 @@ fn run() -> i32 {
         .threadpool_builder(threadpool_builder)
         .build()
         .expect("failed to create tokio runtime");
+
     let reactor = runtime.reactor().clone();
+    let executor = runtime.executor().clone();
 
     let listeners = configuration
         .listeners
@@ -122,9 +126,10 @@ fn run() -> i32 {
         .map(|x| {
             let close = close_rx.clone();
             let config = x.clone();
-            let handle = reactor.clone();
+            let reactor2 = reactor.clone();
+            let executor2 = executor.clone();
 
-            listener::from_config(handle, config, close)
+            listener::from_config(reactor2, executor2, config, close)
         })
         .collect::<Vec<_>>();
 
@@ -148,11 +153,9 @@ fn run() -> i32 {
     }
 
     // Launch all these listeners into the runtime.
-    runtime.spawn(
-        iter_result(listeners)
-            .map_err(|_| ())
-            .for_each(|listener| tokio::spawn(listener)),
-    );
+    for listener in listeners {
+        runtime.spawn(listener.unwrap());
+    }
 
     info!("[core] synchrotron running");
 

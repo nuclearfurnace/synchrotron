@@ -1,64 +1,15 @@
-use backend::sync::{ExistingTcpStreamFuture, RequestTransformer, TcpStreamFuture};
-use futures::future::Either;
-use futures::future::{ok, result};
+use backend::sync::RequestTransformer;
 use futures::prelude::*;
-use futures::stream::FuturesUnordered;
-use futures::sync::mpsc;
-use futures::sync::oneshot;
+use futures::sync::{mpsc, oneshot};
+use futures::future::{ok, Either};
 use std::io::Error;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
+use tokio::runtime::TaskExecutor;
 
 pub enum TaskBackendConnection {
     Alive(TcpStream),
     Error,
-}
-
-struct WorkItemFuture<F>
-where
-    F: Future,
-{
-    inner: F,
-}
-
-impl<F> WorkItemFuture<F>
-where
-    F: Future,
-{
-    pub fn new<T>(
-        transformer: &T,
-        request: T::Request,
-        sf: TcpStreamFuture,
-        conns_tx: mpsc::Sender<TaskBackendConnection>,
-        result_tx: oneshot::Sender<Result<T::Response, Error>>,
-    ) -> WorkItemFuture<F>
-    where
-        T: RequestTransformer,
-    {
-        let inner_work = transformer.transform(request, sf);
-        let work = inner_work
-            .then(|result| match result {
-                Ok((conn, x)) => ok((TaskBackendConnection::Alive(conn), Ok(x))),
-                Err(e) => ok((TaskBackendConnection::Error, Err(e))),
-            })
-            .and_then(move |(backend_result, op_result)| {
-                conns_tx.send(backend_result).map(|_| op_result)
-            })
-            .and_then(move |result| result_tx.send(result))
-            .map_err(|_| ())
-            .map(|_| ());
-
-        WorkItemFuture { inner: work }
-    }
-}
-
-impl<F> Future for WorkItemFuture<F>
-where
-    F: Future,
-{
-    fn poll(&mut self) -> Poll<F::Item, F::Error> {
-        self.inner.poll()
-    }
 }
 
 /// A state machine that drives the pooling of backend connections and the requests that require
@@ -75,6 +26,8 @@ pub struct TaskBackendStateMachine<T>
 where
     T: RequestTransformer,
 {
+    executor: TaskExecutor,
+
     transformer: T,
     requests_rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
 
@@ -84,20 +37,22 @@ where
     conns_tx: mpsc::UnboundedSender<TaskBackendConnection>,
     conn_count: usize,
     conn_limit: usize,
-
-    work: FuturesUnordered<WorkItemFuture<Future<Item = (), Error = ()>>>,
 }
 
 impl<T> Future for TaskBackendStateMachine<T>
 where
     T: RequestTransformer,
+    T::Request: Send + 'static,
+    T::Response: Send + 'static,
+    T::Executor: Future<Item = (TcpStream, T::Response), Error = Error> + Send + 'static,
 {
     type Item = ();
     type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        // See if we've had any connections returned to us.
         loop {
+            // See if we have a connection to recover or replace.
+            //
             match self.conns_rx.poll() {
                 Ok(Async::Ready(Some(conn))) => match conn {
                     TaskBackendConnection::Alive(conn) => self.conns.push(conn),
@@ -105,28 +60,21 @@ where
                         self.conn_count -= 1;
                     }
                 },
-                Ok(Async::NotReady) => break,
-                x => return Err(()),
+                Ok(Async::NotReady) => {},
+                _ => return Err(()),
             }
-        }
 
-        // If all connections are currently busy, just poll our in-flight work in the hopes that
-        // something is going to finish and trigger us again.
-        if self.conns.len() == 0 && self.conn_count == self.conn_limit {
-            let _ = self.work.poll();
-            return Ok(Async::NotReady);
-        }
-
-        // Go through every request we have pending to us, and spin them up.
-        loop {
+            // Go through every request we have pending to us, and spin them up.
             match self.requests_rx.poll() {
                 Ok(Async::NotReady) => {
-                    // Open connections doesn't mean we don't have work, so do a quick poll and then
-                    // bounce out of here.
-                    let _ = self.work.poll();
                     return Ok(Async::NotReady);
                 }
                 Ok(Async::Ready(Some((request, response_tx)))) => {
+                    // If all connections are currently busy, we can't do anything else.
+                    if self.conns.len() == 0 && self.conn_count == self.conn_limit {
+                        return Ok(Async::NotReady);
+                    }
+
                     // We have a new request.  Grab a connection and attempt to service it.
                     let connection = match self.conns.len() {
                         0 => {
@@ -136,27 +84,34 @@ where
                         _ => self
                             .conns
                             .pop()
-                            .map(|x| Either::A(ExistingTcpStreamFuture::from_stream(x)))
+                            .map(|x| Either::A(ok(x)))
                             .unwrap(),
                     };
 
                     let conns_tx = self.conns_tx.clone();
-                    let work = WorkItemFuture::new(
-                        &self.transformer,
-                        request,
-                        connection,
-                        conns_tx,
-                        response_tx,
-                    );
-                    self.work.push(work);
+                    let inner_work = self.transformer.transform(request, connection);
+                    let work = inner_work
+                        .then(|result| match result {
+                            Ok((conn, x)) => ok((TaskBackendConnection::Alive(conn), Ok(x))),
+                            Err(e) => ok((TaskBackendConnection::Error, Err(e))),
+                        })
+                        .and_then(move |(backend_result, op_result)| {
+                            conns_tx.send(backend_result).map(|_| op_result)
+                        })
+                        .and_then(move |result| ok(response_tx.send(result)))
+                        .map_err(|_| ())
+                        .map(|_| ());
+
+                    self.executor.spawn(work);
                 }
-                _ => Err(()),
+                _ => return Err(()),
             }
         }
     }
 }
 
 fn new_state_machine<T>(
+    executor: TaskExecutor,
     addr: SocketAddr,
     transformer: T,
     rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
@@ -168,6 +123,8 @@ where
     let (conns_tx, conns_rx) = mpsc::unbounded();
 
     TaskBackendStateMachine {
+        executor: executor,
+
         transformer: transformer,
         requests_rx: rx,
 
@@ -177,8 +134,6 @@ where
         conns_tx: conns_tx,
         conn_count: 0,
         conn_limit: conn_limit,
-
-        work: FuturesUnordered::new(),
     }
 }
 
@@ -197,7 +152,6 @@ pub struct TaskBackend<T>
 where
     T: RequestTransformer,
 {
-    address: SocketAddr,
     requests_tx: mpsc::UnboundedSender<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
 }
 
@@ -206,6 +160,7 @@ where
     T: RequestTransformer,
 {
     pub fn new(
+        executor: TaskExecutor,
         addr: SocketAddr,
         transformer: T,
         conn_limit: usize,
@@ -213,11 +168,10 @@ where
         let (tx, rx) = mpsc::unbounded();
 
         let backend = TaskBackend {
-            address: addr,
             requests_tx: tx,
         };
 
-        let runner = new_state_machine(addr, transformer, rx, conn_limit);
+        let runner = new_state_machine(executor, addr, transformer, rx, conn_limit);
 
         (backend, runner)
     }

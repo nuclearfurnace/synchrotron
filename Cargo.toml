@@ -29,6 +29,7 @@ atoi = "^0.2"
 itoa = "^0.4"
 rand = "^0.5"
 rust-crypto = "^0.2"
+pruefung = "^0.2"
 
 [dependencies.config]
 version = "^0.8"

@@ -1,14 +1,14 @@
 use backend::distributor::Distributor;
-use backend::hasher::Hasher;
-use backend::pool::{run_operation_on_task_backend, BackendPool};
+use backend::hasher::KeyHasher;
+use backend::pool::BackendPool;
 use backend::sync::{RequestTransformer, TcpStreamFuture};
 use bytes::BytesMut;
-use futures::future::ok;
+use futures::future::{ok, result};
 use futures::prelude::*;
 use protocol::redis;
 use protocol::redis::RedisMessage;
 use std::collections::HashMap;
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use tokio::net::TcpStream;
 
 type RedisOrderedMessages = Vec<(u64, RedisMessage)>;
@@ -25,19 +25,20 @@ impl RedisRequestTransformer {
 impl RequestTransformer for RedisRequestTransformer {
     type Request = RedisOrderedMessages;
     type Response = RedisOrderedMessages;
-    type Executor = Future<Item = (TcpStream, Self::Response), Error = Error> + 'static;
+    type Executor = Box<Future<Item = (TcpStream, Self::Response), Error = Error> + Send>;
 
-    fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor {
+    fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor
+    {
         // Break apart IDs and messages.
         let msg_len = req.len();
-        let msg_ids = Vec::with_capacity(msg_len);
-        let msgs = Vec::with_capacity(msg_len);
+        let mut msg_ids = Vec::with_capacity(msg_len);
+        let mut msgs = Vec::with_capacity(msg_len);
         for (msg_id, msg) in req {
             msg_ids.push(msg_id);
             msgs.push(msg);
         }
 
-        stream
+        let inner = stream
             .and_then(move |server| {
                 debug!("[redis backend] about to write batched messages to backend");
                 redis::write_messages(server, msgs)
@@ -54,18 +55,15 @@ impl RequestTransformer for RedisRequestTransformer {
                     .collect::<RedisOrderedMessages>();
 
                 ok((server, result))
-            })
+            });
+        Box::new(inner)
     }
 }
 
-pub fn generate_batched_writes<D, H, T>(
-    pool: &BackendPool<D, H, T>,
+pub fn generate_batched_redis_writes(
+    pool: &BackendPool<RedisRequestTransformer>,
     mut messages: Vec<RedisMessage>,
 ) -> Vec<impl Future<Item = RedisOrderedMessages, Error = Error>>
-where
-    D: Distributor,
-    H: Hasher,
-    T: RequestTransformer + Clone,
 {
     // Group all of our messages by their target backend index.
     let mut assigned_msgs = HashMap::new();
@@ -83,24 +81,24 @@ where
     }
 
     // Now that we have things mapped, create our queues for each backend.
-    let mut responses = Vec::with_capacity(assigned_msgs.len());
+    let mut responses: Vec<_> = Vec::with_capacity(assigned_msgs.len());
 
     for (backend_idx, msgs) in assigned_msgs {
-        let msg_indexes = Vec::with_capacity(msgs.len());
+        let mut msg_indexes = Vec::with_capacity(msgs.len());
         for (id, _) in &msgs {
             msg_indexes.push(*id);
         }
 
-        let backend = pool.get_backend_by_index(backend_idx);
-        let response = backend.submit(msgs);
-        let response2 = response
-            .map_err(|err| {
-                error!("caught error when running batched operation: {:?}", err);
-                err
+        let mut backend = pool.get_backend_by_index(backend_idx);
+        let msg_indexes2 = msg_indexes.clone();
+        let response = backend.submit(msgs)
+            .and_then(|r| {
+                result(r).or_else(move |err| ok(to_vectored_error_response(err, msg_indexes2)))
             })
+            .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (RRCE)"))
             .or_else(move |err| ok(to_vectored_error_response(err, msg_indexes)));
 
-        responses.push(response2);
+        responses.push(response);
     }
 
     responses

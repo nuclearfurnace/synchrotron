@@ -1,9 +1,8 @@
 use backend::distributor::Distributor;
-use backend::hasher::Hasher;
+use backend::hasher::KeyHasher;
 use backend::pool::BackendPool;
-use backend::redis::generate_batched_writes;
+use backend::redis::generate_batched_redis_writes;
 use backend::redis::RedisRequestTransformer;
-use backend::sync::RequestTransformer;
 use backend::{distributor, hasher};
 use conf::ListenerConfiguration;
 use futures::future::{join_all, lazy, ok};
@@ -15,10 +14,11 @@ use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio;
+use std::time::Instant;
 use tokio::io;
 use tokio::net::TcpListener;
 use tokio::reactor::Handle;
+use tokio::runtime::TaskExecutor;
 use tokio_io::AsyncRead;
 use util::{flatten_ordered_messages, StreamExt};
 
@@ -31,6 +31,7 @@ type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 's
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
     reactor: Handle,
+    executor: TaskExecutor,
     config: ListenerConfiguration,
     close: Receiver<()>,
 ) -> Result<GenericRuntimeFuture, Error> {
@@ -42,7 +43,7 @@ pub fn from_config(
     // Get the correct handler based on protocol.
     let protocol = config.protocol.to_lowercase();
     let handler = match protocol.as_str() {
-        "redis" => redis_from_config(config, listener)?,
+        "redis" => redis_from_config(executor, config, listener)?,
         s => panic!("unknown protocol type: {}", s),
     };
 
@@ -61,6 +62,7 @@ pub fn from_config(
 }
 
 fn redis_from_config(
+    executor: TaskExecutor,
     config: ListenerConfiguration,
     listener: TcpListener,
 ) -> Result<GenericRuntimeFuture, Error> {
@@ -78,13 +80,14 @@ fn redis_from_config(
         let hash_type = pool_config
             .options
             .entry("hash".to_owned())
-            .or_insert("md5".to_owned())
+            .or_insert("fnv1a_64".to_owned())
             .to_lowercase();
         let hasher = hasher::configure_hasher(hash_type);
 
         let transformer = RedisRequestTransformer::new();
 
         let pool = Arc::new(BackendPool::new(
+            executor.clone(),
             pool_config.addresses,
             transformer,
             distributor,
@@ -96,19 +99,16 @@ fn redis_from_config(
     // Figure out what sort of routing we're doing so we can grab the right handler.
     let routing_type = config.routing.to_lowercase();
     match routing_type.as_str() {
-        "warmup" => redis_warmup_handler(listener, pools),
-        _ => redis_normal_handler(listener, pools),
+        "warmup" => redis_warmup_handler(executor, listener, pools),
+        _ => redis_normal_handler(executor, listener, pools),
     }
 }
 
-fn redis_warmup_handler<D, H, T>(
+fn redis_warmup_handler(
+    executor: TaskExecutor,
     listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H, T>>>,
+    pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
 ) -> Result<GenericRuntimeFuture, Error>
-where
-    D: Distributor + Send + Sync + 'static,
-    H: Hasher + Send + Sync + 'static,
-    T: RequestTransformer,
 {
     let warm_pool = pools
         .get("warm")
@@ -135,6 +135,7 @@ where
 
             let cold = cold_pool.clone();
             let warm = warm_pool.clone();
+            let executor2 = executor.clone();
 
             let (client_rx, client_tx) = socket.split();
             let client_proto = redis::read_messages_stream(client_rx)
@@ -148,7 +149,7 @@ where
                     // Fire off our cold pool operations asynchronously so that we don't influence
                     // the normal client path.
                     let cold_msgs = msgs.clone();
-                    let cold_batches = generate_batched_writes(&cold, cold_msgs);
+                    let cold_batches = generate_batched_redis_writes(&cold, cold_msgs);
                     let cold_handler = join_all(cold_batches)
                         .map_err(|err| {
                             error!(
@@ -158,8 +159,10 @@ where
                         })
                         .map(|_| ());
 
+                    executor2.spawn(cold_handler);
+
                     // Now run our normal writes.
-                    let warm_handler = join_all(generate_batched_writes(&warm, msgs))
+                    let warm_handler = join_all(generate_batched_redis_writes(&warm, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
                         .and_then(move |items| redis::write_messages(tx, items))
                         .map(|(w, _n)| w)
@@ -167,24 +170,22 @@ where
                             error!("[client] caught error while handling request: {:?}", err)
                         });
 
-                    warm_handler.join(cold_handler).map(|(a, _)| a)
+                    warm_handler
                 })
                 .map(|_| ());
 
-            tokio::spawn(client_proto)
+            executor.spawn(client_proto);
+            ok(())
         });
 
     Ok(Box::new(handler))
 }
 
-fn redis_normal_handler<D, H, T>(
+fn redis_normal_handler(
+    executor: TaskExecutor,
     listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<D, H, T>>>,
+    pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
 ) -> Result<GenericRuntimeFuture, Error>
-where
-    D: Distributor + Send + Sync + 'static,
-    H: Hasher + Send + Sync + 'static,
-    T: RequestTransformer,
 {
     let default_pool = pools
         .get("default")
@@ -209,30 +210,35 @@ where
                     error!("[client] caught error while reading from client: {:?}", e);
                 })
                 .batch(128)
-                .fold((client_tx, client_addr), move |(tx, addr), msgs| {
+                .fold((client_tx, client_addr, 0), move |(tx, addr, msg_count), msgs| {
+                    let start = Instant::now();
                     trace!(
                         "[client] [{:?}] got batch of {} messages!",
                         addr,
                         msgs.len()
                     );
 
-                    join_all(generate_batched_writes(&default, msgs))
+                    let new_msg_count = msg_count + msgs.len();
+
+                    join_all(generate_batched_redis_writes(&default, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
                         .and_then(move |items| redis::write_messages(tx, items))
                         .map(move |(w, _n)| {
-                            trace!("[client] [{:?}] sent batch of responses to client", addr);
-                            (w, addr)
+                            let delta = start.elapsed().as_micros();
+                            trace!("[client] [{:?}] sent batch of responses to client; took {}μs", addr, delta);
+                            (w, addr, new_msg_count)
                         })
                         .map_err(|err| {
                             error!("[client] caught error while handling request: {:?}", err)
                         })
                 })
-                .map(|(_, addr)| {
-                    info!("[client] connection complete -> {:?}", addr);
+                .map(|(_, addr, msg_count)| {
+                    info!("[client] connection complete -> {:?}; processed {} messages", addr, msg_count);
                     ()
                 });
 
-            tokio::spawn(client_proto)
+            executor.spawn(client_proto);
+            ok(())
         });
 
     Ok(Box::new(handler))
