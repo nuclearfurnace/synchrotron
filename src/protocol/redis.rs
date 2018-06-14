@@ -3,6 +3,7 @@ use bytes::{BufMut, BytesMut};
 use futures::prelude::*;
 use std::error::Error;
 use std::io;
+use std::mem;
 use tokio::io::{write_all, AsyncRead, AsyncWrite};
 
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
@@ -17,6 +18,9 @@ const REDIS_ERR_BUF: [u8; 5] = [b'-', b'E', b'R', b'R', b' '];
 const REDIS_CRLF: [u8; 2] = [b'\r', b'\n'];
 
 const REDIS_CLIENT_ERROR_PROTOCOL: &str = "protocol error; invalid payload";
+
+pub type RedisOrderedMessages = Vec<(u64, RedisMessage)>;
+pub type RedisUnorderedMessages = Vec<RedisMessage>;
 
 /// An unbounded stream of Redis messages pulled from an asynchronous reader.
 pub struct RedisMessageStream<R>
@@ -36,7 +40,8 @@ where
     rd: BytesMut,
     bytes_read: usize,
     msg_count: usize,
-    msgs: Option<Vec<RedisMessage>>,
+    msg_idx: usize,
+    msgs: Option<RedisOrderedMessages>,
 }
 
 /// A RESP-based client/server message for Redis.
@@ -154,13 +159,16 @@ impl<R> RedisMultipleMessages<R>
 where
     R: AsyncRead,
 {
-    pub fn new(rx: R, msg_count: usize) -> Self {
+    pub fn new(rx: R, msgs: RedisOrderedMessages) -> Self {
+        let msgs_len = msgs.len();
+
         RedisMultipleMessages {
             rx: Some(rx),
             rd: BytesMut::new(),
             bytes_read: 0,
-            msg_count: msg_count,
-            msgs: Some(Vec::with_capacity(msg_count)),
+            msgs: Some(msgs),
+            msg_count: msgs_len,
+            msg_idx: 0,
         }
     }
 
@@ -182,7 +190,7 @@ impl<R> Future for RedisMultipleMessages<R>
 where
     R: AsyncRead,
 {
-    type Item = (R, usize, Vec<RedisMessage>);
+    type Item = (R, usize, RedisOrderedMessages);
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -190,7 +198,7 @@ where
 
         loop {
             // We've collected all the messages, time to return.
-            if self.msg_count == 0 {
+            if self.msg_count == self.msg_idx {
                 return Ok(Async::Ready((
                     self.rx.take().unwrap(),
                     self.bytes_read,
@@ -205,8 +213,9 @@ where
                     trace!("[protocol] got message from server! ({} bytes)", bytes_read);
 
                     let mut msgs = self.msgs.as_mut().unwrap();
-                    msgs.push(msg);
-                    self.msg_count -= 1;
+                    let (_, msg_slot) = &mut msgs[self.msg_idx];
+                    let _ = mem::replace(msg_slot, msg);
+                    self.msg_idx += 1;
                 }
                 Err(e) => return Err(e),
                 _ => {
@@ -231,11 +240,11 @@ where
     RedisMessageStream::new(rx)
 }
 
-pub fn read_messages<R>(rx: R, msg_count: usize) -> RedisMultipleMessages<R>
+pub fn read_messages<R>(rx: R, msgs: RedisOrderedMessages) -> RedisMultipleMessages<R>
 where
     R: AsyncRead,
 {
-    RedisMultipleMessages::new(rx, msg_count)
+    RedisMultipleMessages::new(rx, msgs)
 }
 
 fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
@@ -409,7 +418,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
 
 pub fn write_messages<T>(
     tx: T,
-    mut msgs: Vec<RedisMessage>,
+    mut msgs: RedisUnorderedMessages,
 ) -> impl Future<Item = (T, usize), Error = io::Error>
 where
     T: AsyncWrite,
@@ -417,15 +426,47 @@ where
     let msgs_len = msgs.len();
     let buf = match msgs_len {
         1 => msgs.remove(0).as_resp(),
-        _ => msgs.into_iter().fold(BytesMut::new(), |mut buf, msg| {
-            let msg_buf = msg.as_resp();
-            buf.extend_from_slice(&msg_buf[..]);
+        _ => {
+            let mut buf = BytesMut::new();
+            for msg in msgs {
+                let msg_buf = msg.as_resp();
+                buf.extend_from_slice(&msg_buf[..]);
+            }
             buf
-        }),
+        }
     };
 
     let buf_len = buf.len();
     write_all(tx, buf).map(move |(tx, _buf)| (tx, buf_len))
+}
+
+pub fn write_ordered_messages<T>(
+    tx: T,
+    mut msgs: RedisOrderedMessages,
+) -> impl Future<Item = (T, RedisOrderedMessages, usize), Error = io::Error>
+where
+    T: AsyncWrite,
+{
+    let msgs_len = msgs.len();
+    let buf = match msgs_len {
+        1 => {
+            let (_, msg) = &mut msgs[0];
+            let msg2 = mem::replace(msg, RedisMessage::Null);
+            msg2.as_resp()
+        }
+        _ => {
+            let mut buf = BytesMut::new();
+            for (_id, msg) in &mut msgs {
+                let msg2 = mem::replace(msg, RedisMessage::Null);
+                let msg_buf = msg2.as_resp();
+                buf.extend_from_slice(&msg_buf[..]);
+            }
+            buf
+        }
+    };
+
+    let buf_len = buf.len();
+    write_all(tx, buf).map(move |(tx, _buf)| (tx, msgs, buf_len))
 }
 
 #[cfg(test)]

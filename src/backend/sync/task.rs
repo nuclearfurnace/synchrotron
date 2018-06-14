@@ -52,7 +52,6 @@ where
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
             // See if we have a connection to recover or replace.
-            //
             match self.conns_rx.poll() {
                 Ok(Async::Ready(Some(conn))) => match conn {
                     TaskBackendConnection::Alive(conn) => self.conns.push(conn),
@@ -69,12 +68,9 @@ where
                 return Ok(Async::NotReady);
             }
 
-
             // Go through every request we have pending to us, and spin them up.
             match self.requests_rx.poll() {
-                Ok(Async::NotReady) => {
-                    return Ok(Async::NotReady);
-                }
+                Ok(Async::NotReady) => return Ok(Async::NotReady),
                 Ok(Async::Ready(Some((request, response_tx)))) => {
                     // We have a new request.  Grab a connection and attempt to service it.
                     let connection = match self.conns.len() {
@@ -163,9 +159,7 @@ where
         conn_limit: usize,
     ) -> (TaskBackend<T>, TaskBackendStateMachine<T>) {
         let (tx, rx) = mpsc::unbounded();
-
         let backend = TaskBackend { requests_tx: tx };
-
         let runner = new_state_machine(executor, addr, transformer, rx, conn_limit);
 
         (backend, runner)

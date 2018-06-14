@@ -4,12 +4,10 @@ use bytes::BytesMut;
 use futures::future::{ok, result};
 use futures::prelude::*;
 use protocol::redis;
-use protocol::redis::RedisMessage;
+use protocol::redis::{RedisMessage, RedisOrderedMessages};
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use tokio::net::TcpStream;
-
-type RedisOrderedMessages = Vec<(u64, RedisMessage)>;
 
 #[derive(Clone)]
 pub struct RedisRequestTransformer;
@@ -26,32 +24,18 @@ impl RequestTransformer for RedisRequestTransformer {
     type Executor = Box<Future<Item = (TcpStream, Self::Response), Error = Error> + Send>;
 
     fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor {
-        // Break apart IDs and messages.
-        let msg_len = req.len();
-        let mut msg_ids = Vec::with_capacity(msg_len);
-        let mut msgs = Vec::with_capacity(msg_len);
-        for (msg_id, msg) in req {
-            msg_ids.push(msg_id);
-            msgs.push(msg);
-        }
-
         let inner = stream
             .and_then(move |server| {
                 debug!("[redis backend] about to write batched messages to backend");
-                redis::write_messages(server, msgs)
+                redis::write_ordered_messages(server, req)
             })
-            .and_then(move |(server, _n)| {
+            .and_then(move |(server, msgs, _n)| {
                 debug!("[redis backend] now reading the responses from the backend");
-                redis::read_messages(server, msg_len)
+                redis::read_messages(server, msgs)
             })
             .and_then(move |(server, _n, resps)| {
                 debug!("[redis backend] assembling backend responses to send to client");
-                let result = msg_ids
-                    .into_iter()
-                    .zip(resps)
-                    .collect::<RedisOrderedMessages>();
-
-                ok((server, result))
+                ok((server, resps))
             });
         Box::new(inner)
     }
@@ -67,8 +51,10 @@ pub fn generate_batched_redis_writes(
     let mut i = 0;
     while messages.len() > 0 {
         let msg = messages.remove(0);
-        let msg_key = get_message_key(&msg);
-        let backend_idx = pool.get_backend_index(&msg_key[..]);
+        let backend_idx = {
+            let msg_key = get_message_key(&msg);
+            pool.get_backend_index(msg_key)
+        };
 
         let batched_msgs = assigned_msgs.entry(backend_idx).or_insert(Vec::new());
         batched_msgs.push((i, msg));
@@ -77,7 +63,7 @@ pub fn generate_batched_redis_writes(
     }
 
     // Now that we have things mapped, create our queues for each backend.
-    let mut responses: Vec<_> = Vec::with_capacity(assigned_msgs.len());
+    let mut responses = Vec::with_capacity(assigned_msgs.len());
 
     for (backend_idx, msgs) in assigned_msgs {
         let mut msg_indexes = Vec::with_capacity(msgs.len());
@@ -110,22 +96,57 @@ pub fn to_vectored_error_response(err: Error, indexes: Vec<u64>) -> RedisOrdered
     msgs
 }
 
-fn get_message_key(msg: &RedisMessage) -> BytesMut {
+fn get_message_key<'a>(msg: &'a RedisMessage) -> &'a [u8] {
     match msg {
         RedisMessage::Bulk(_, ref args) => {
             let arg_pos = if args.len() < 2 { 0 } else { 1 };
 
             match args.get(arg_pos) {
                 Some(RedisMessage::Data(buf, offset)) => {
-                    let mut buf2 = buf.clone();
-                    let _ = buf2.split_to(*offset);
-                    let key_len = buf2.len() - 2;
-                    let _ = buf2.split_off(key_len);
-                    buf2
+                    let end = buf.len() - 2;
+                    &buf[*offset..end]
                 }
                 _ => panic!("command message does not have expected structure"),
             }
         }
         _ => panic!("command message should be multi-bulk!"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test::Bencher;
+
+    static DATA_GET_SIMPLE: &[u8] = b"*2\r\n$3\r\nget\r\n$6\r\nfoobar\r\n";
+    static DATA_GET_SIMPLE_ARG0: &[u8] = b"$3\r\nget\r\n";
+    static DATA_GET_SIMPLE_ARG1: &[u8] = b"$6\r\nfoobar\r\n";
+
+    fn build_simple_get_command() -> RedisMessage {
+        let arg0_data = BytesMut::from(DATA_GET_SIMPLE_ARG0);
+        let arg0 = RedisMessage::Data(arg0_data, 4);
+
+        let arg1_data = BytesMut::from(DATA_GET_SIMPLE_ARG1);
+        let arg1 = RedisMessage::Data(arg1_data, 4);
+
+        let mut args = Vec::new();
+        args.push(arg0);
+        args.push(arg1);
+
+        let cmd_buf = BytesMut::from(DATA_GET_SIMPLE);
+        RedisMessage::Bulk(cmd_buf, args)
+    }
+
+    #[test]
+    fn test_get_message_key_simple_get() {
+        let cmd = build_simple_get_command();
+        let res = get_message_key(&cmd);
+        assert_eq!(res, b"foobar");
+    }
+
+    #[bench]
+    fn bench_get_message_key_simple_get(b: &mut Bencher) {
+        let cmd = build_simple_get_command();
+        b.iter(|| get_message_key(&cmd));
     }
 }
