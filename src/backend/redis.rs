@@ -1,6 +1,5 @@
 use backend::pool::BackendPool;
 use backend::sync::{RequestTransformer, TcpStreamFuture};
-use bytes::BytesMut;
 use futures::future::{ok, result};
 use futures::prelude::*;
 use protocol::redis;
@@ -117,6 +116,7 @@ fn get_message_key<'a>(msg: &'a RedisMessage) -> &'a [u8] {
 mod tests {
     use super::*;
     use test::Bencher;
+    use bytes::BytesMut;
 
     static DATA_GET_SIMPLE: &[u8] = b"*2\r\n$3\r\nget\r\n$6\r\nfoobar\r\n";
     static DATA_GET_SIMPLE_ARG0: &[u8] = b"$3\r\nget\r\n";
