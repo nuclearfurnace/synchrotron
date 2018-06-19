@@ -1,4 +1,4 @@
-use atoi::atoi;
+use btoi::btoi;
 use bytes::{BufMut, BytesMut};
 use futures::prelude::*;
 use std::error::Error;
@@ -65,6 +65,7 @@ pub enum RedisMessage {
     Integer(BytesMut, i64),
     Data(BytesMut, usize),
     Bulk(BytesMut, Vec<RedisMessage>),
+    Raw(BytesMut),
 }
 
 impl RedisMessage {
@@ -103,6 +104,7 @@ impl RedisMessage {
             RedisMessage::Integer(buf, _) => buf,
             RedisMessage::Data(buf, _) => buf,
             RedisMessage::Bulk(buf, _) => buf,
+            RedisMessage::Raw(buf) => buf,
         }
     }
 }
@@ -314,9 +316,9 @@ fn read_bulk_count(rd: &mut BytesMut) -> Poll<(usize, usize), io::Error> {
 
     // Try to extract the bulk count integer, leaving the rest.
     let buf = rd.split_to(pos + 2);
-    match atoi::<usize>(&buf[1..pos]) {
-        Some(count) => Ok(Async::Ready((pos + 2, count))),
-        None => Err(io::Error::new(
+    match btoi::<usize>(&buf[1..pos]) {
+        Ok(count) => Ok(Async::Ready((pos + 2, count))),
+        Err(_) => Err(io::Error::new(
             io::ErrorKind::Other,
             REDIS_CLIENT_ERROR_PROTOCOL,
         )),
@@ -328,10 +330,8 @@ fn read_integer(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     let crlf_pos = try_ready!(read_line(rd));
 
     // Try to extract the integer, leaving the rest.
-    let value = atoi::<i64>(&rd[1..crlf_pos]).ok_or(io::Error::new(
-        io::ErrorKind::Other,
-        REDIS_CLIENT_ERROR_PROTOCOL,
-    ))?;
+    let value = btoi::<i64>(&rd[1..crlf_pos])
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
 
     // Slice off the entire message.
     let total = crlf_pos + 2;
@@ -366,25 +366,41 @@ fn read_data(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // Make sure there's at least a CRLF-terminated line in the buffer.
     let len_crlf_pos = try_ready!(read_line(rd));
 
-    // Try to extract the data length integer, leaving the rest.
-    let len = atoi::<usize>(&rd[1..len_crlf_pos]).ok_or(io::Error::new(
-        io::ErrorKind::Other,
-        REDIS_CLIENT_ERROR_PROTOCOL,
-    ))?;
+    match &rd[1] {
+        b'-' => {
+            // See if this is just a null datum.
+            let null_len = btoi::<i8>(&rd[1..len_crlf_pos])
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
 
-    // See if the actual data is available in the buffer.
-    if rd.len() < len_crlf_pos + 2 + len + 2 {
-        return Ok(Async::NotReady);
+            match null_len {
+                -1 => return Ok(Async::Ready((len_crlf_pos + 2, RedisMessage::Null))),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    REDIS_CLIENT_ERROR_PROTOCOL,
+                )),
+            }
+        }
+        _ => {
+            // Try to extract the data length integer, leaving the rest.
+            let len = btoi::<usize>(&rd[1..len_crlf_pos]).map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL)
+            })?;
+
+            // See if the actual data is available in the buffer.
+            if rd.len() < len_crlf_pos + 2 + len + 2 {
+                return Ok(Async::NotReady);
+            }
+
+            // Slice off the entire message.
+            let total = len_crlf_pos + 2 + len + 2;
+            let buf = rd.split_to(total);
+
+            Ok(Async::Ready((
+                total,
+                RedisMessage::Data(buf, len_crlf_pos + 2),
+            )))
+        }
     }
-
-    // Slice off the entire message.
-    let total = len_crlf_pos + 2 + len + 2;
-    let buf = rd.split_to(total);
-
-    Ok(Async::Ready((
-        total,
-        RedisMessage::Data(buf, len_crlf_pos + 2),
-    )))
 }
 
 fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
@@ -480,13 +496,14 @@ mod tests {
     static DATA_STATUS: &[u8] = b"+LIMITED\r\n";
     static DATA_ERROR: &[u8] = b"-ERR warning limit exceeded\r\n";
     static DATA_NULL: &[u8] = b"$-1\r\n";
+    static DATA_BULK_WITH_NULL: &[u8] = b"*2\r\n$3\r\nboo\r\n$-1\r\n";
     static DATA_INTEGER_1337: &[u8] = b":1337\r\n";
     static DATA_SHORT_CIRCUIT_ZERO_DATA: &[u8] = b"";
     static DATA_SHORT_CIRCUIT_NO_ARRAY_CRLF: &[u8] = b"*2";
     static DATA_SHORT_CIRCUIT_NO_ARG_LEN_CRLF: &[u8] = b"*2\r\n$3";
     static DATA_SHORT_CIRCUIT_PARTIAL_ARG: &[u8] = b"*2\r\n$3\r\n";
     static DATA_SHORT_CIRCUIT_MISSING_ARG: &[u8] = b"*2\r\n$3\r\nget\r\n";
-    static DATA_SHORT_CIRCUIT_ARG_LEN_PAST_END: &[u8] = b"*2\r\n$3\r\nget\r\n$9foobar\r\n";
+    static DATA_SHORT_CIRCUIT_ARG_LEN_PAST_END: &[u8] = b"*2\r\n$3\r\nget\r\n$9\r\nfoobar\r\n";
     static DATA_PING_LOWER: &[u8] = b"ping\r\n";
     static DATA_PING_UPPER: &[u8] = b"PING\r\n";
 
@@ -601,6 +618,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_bulk_with_null() {
+        let res = get_message_from_buf(&DATA_BULK_WITH_NULL);
+        assert_that(&res).is_ok().matches(|val| val.is_ready());
+
+        match res.unwrap() {
+            Async::Ready(mut msg) => match msg {
+                RedisMessage::Bulk(_, ref mut args) => {
+                    assert_that(args).has_length(2);
+                    let arg0 = args.remove(0);
+                    let arg1 = args.remove(0);
+
+                    check_data_matches(arg0, b"boo");
+                    assert_eq!(arg1, RedisMessage::Null);
+                }
+                _ => panic!("message is not bulk"),
+            },
+            _ => panic!("should have had message"),
+        }
+    }
+
+    #[test]
     fn parse_integer() {
         let res = get_message_from_buf(&DATA_INTEGER_1337);
         assert_that(&res).is_ok().matches(|val| val.is_ready());
@@ -614,7 +652,6 @@ mod tests {
     #[test]
     fn parse_short_circuit_zero_data() {
         let res = get_message_from_buf(&DATA_SHORT_CIRCUIT_ZERO_DATA);
-        println!("val: {:?}", res);
         assert_that(&res).is_ok().matches(|val| val.is_not_ready());
     }
 

@@ -169,6 +169,9 @@ fn redis_warmup_handler(
                     // Now run our normal writes.
                     let warm_handler = join_all(generate_batched_redis_writes(&warm, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
+                        .map_err(|err| {
+                            Error::new(ErrorKind::Other, "internal synchrotron error (WRJE)")
+                        })
                         .and_then(move |items| redis::write_messages(tx, items))
                         .map(|(w, _n)| w)
                         .map_err(|err| {
@@ -228,13 +231,15 @@ fn redis_normal_handler(
 
                         join_all(generate_batched_redis_writes(&default, msgs))
                             .and_then(|results| ok(flatten_ordered_messages(results)))
+                            .map_err(|err| {
+                                Error::new(ErrorKind::Other, "internal synchrotron error (NRJE)")
+                            })
                             .and_then(move |items| redis::write_messages(tx, items))
                             .map(move |(w, _n)| {
                                 let delta = start.elapsed().as_micros();
-                                trace!(
+                                debug!(
                                     "[client] [{:?}] sent batch of responses to client; took {}μs",
-                                    addr,
-                                    delta
+                                    addr, delta
                                 );
                                 (w, addr, new_msg_count)
                             })

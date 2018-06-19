@@ -43,7 +43,7 @@ extern crate slog_term;
 
 use slog::Drain;
 
-extern crate atoi;
+extern crate btoi;
 extern crate bytes;
 extern crate itoa;
 extern crate rand;
