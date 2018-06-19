@@ -6,10 +6,15 @@ authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
 [profile.release]
 debug = true
 lto = true
+opt-level = 3
+
+[profile.bench]
+debug = true
+lto = true
+opt-level = 3
 
 [dependencies]
 log = "^0.4"
-slog = "^2.2"
 slog-async = "^2.2"
 slog-scope = "^4.0"
 slog-stdlog = "^3.0"
@@ -30,6 +35,10 @@ itoa = "^0.4"
 rand = "^0.5"
 rust-crypto = "^0.2"
 pruefung = "^0.2"
+
+[dependencies.slog]
+version = "^2.2"
+features = ["max_level_trace", "release_max_level_info"]
 
 [dependencies.config]
 version = "^0.8"
