@@ -63,8 +63,8 @@ where
     T::Response: Send + 'static,
     T::Executor: Future<Item = (TcpStream, T::Response), Error = Error> + Send + 'static,
 {
-    type Item = ();
     type Error = ();
+    type Item = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {

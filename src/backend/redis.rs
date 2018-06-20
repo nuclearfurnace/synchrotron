@@ -39,9 +39,9 @@ impl RedisRequestTransformer {
 }
 
 impl RequestTransformer for RedisRequestTransformer {
-    type Request = RedisOrderedMessages;
-    type Response = RedisOrderedMessages;
     type Executor = Box<Future<Item = (TcpStream, Self::Response), Error = Error> + Send>;
+    type Response = RedisOrderedMessages;
+    type Request = RedisOrderedMessages;
 
     fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor {
         let inner = stream
