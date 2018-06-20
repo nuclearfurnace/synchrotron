@@ -1,22 +1,36 @@
-use backend::pool::BackendPool;
-use backend::redis::generate_batched_redis_writes;
-use backend::redis::RedisRequestTransformer;
-use backend::{distributor, hasher};
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+use backend::{
+    distributor, hasher, pool::BackendPool, redis::{generate_batched_redis_writes, RedisRequestTransformer},
+};
 use conf::ListenerConfiguration;
-use futures::future::{join_all, lazy, ok};
-use futures::prelude::*;
+use futures::{
+    future::{join_all, lazy, ok}, prelude::*,
+};
 use net2::TcpBuilder;
 use protocol::redis;
 use rs_futures_spmc::Receiver;
-use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::io;
-use tokio::net::TcpListener;
-use tokio::reactor::Handle;
-use tokio::runtime::TaskExecutor;
+use std::{
+    collections::HashMap, io::{Error, ErrorKind}, net::SocketAddr, sync::Arc, time::Instant,
+};
+use tokio::{io, net::TcpListener, reactor::Handle, runtime::TaskExecutor};
 use tokio_io::AsyncRead;
 use util::{flatten_ordered_messages, StreamExt};
 
@@ -28,15 +42,11 @@ type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 's
 /// spawn a task to process all of the messages from that client until the client disconnects or
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
-    reactor: Handle,
-    executor: TaskExecutor,
-    config: ListenerConfiguration,
-    close: Receiver<()>,
+    reactor: Handle, executor: TaskExecutor, config: ListenerConfiguration, close: Receiver<()>,
 ) -> Result<GenericRuntimeFuture, Error> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
-    let listener =
-        get_listener(&listen_address, &reactor).expect("failed to create the TCP listener");
+    let listener = get_listener(&listen_address, &reactor).expect("failed to create the TCP listener");
 
     // Get the correct handler based on protocol.
     let protocol = config.protocol.to_lowercase();
@@ -60,9 +70,7 @@ pub fn from_config(
 }
 
 fn redis_from_config(
-    executor: TaskExecutor,
-    config: ListenerConfiguration,
-    listener: TcpListener,
+    executor: TaskExecutor, config: ListenerConfiguration, listener: TcpListener,
 ) -> Result<GenericRuntimeFuture, Error> {
     // Gather up all of the backend pools.
     let mut pools = HashMap::new();
@@ -74,16 +82,16 @@ fn redis_from_config(
             config.address.clone()
         );
 
-        let dist_type = pool_config
-            .options
+        let mut opts = pool_config.options.unwrap_or(HashMap::new());
+
+        let dist_type = opts
             .entry("distribution".to_owned())
             .or_insert("random".to_owned())
             .to_lowercase();
         let distributor = distributor::configure_distributor(&dist_type);
         debug!("[listener] using distributor '{}'", dist_type);
 
-        let hash_type = pool_config
-            .options
+        let hash_type = opts
             .entry("hash".to_owned())
             .or_insert("fnv1a_64".to_owned())
             .to_lowercase();
@@ -111,9 +119,7 @@ fn redis_from_config(
 }
 
 fn redis_warmup_handler(
-    executor: TaskExecutor,
-    listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
+    executor: TaskExecutor, listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
 ) -> Result<GenericRuntimeFuture, Error> {
     let warm_pool = pools
         .get("warm")
@@ -156,12 +162,7 @@ fn redis_warmup_handler(
                     let cold_msgs = msgs.clone();
                     let cold_batches = generate_batched_redis_writes(&cold, cold_msgs);
                     let cold_handler = join_all(cold_batches)
-                        .map_err(|err| {
-                            error!(
-                                "[client] error while sending warming ops to cold pool: {:?}",
-                                err
-                            )
-                        })
+                        .map_err(|err| error!("[client] error while sending warming ops to cold pool: {:?}", err))
                         .map(|_| ());
 
                     executor2.spawn(cold_handler);
@@ -169,14 +170,10 @@ fn redis_warmup_handler(
                     // Now run our normal writes.
                     let warm_handler = join_all(generate_batched_redis_writes(&warm, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
-                        .map_err(|err| {
-                            Error::new(ErrorKind::Other, "internal synchrotron error (WRJE)")
-                        })
+                        .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron error (WRJE)"))
                         .and_then(move |items| redis::write_messages(tx, items))
                         .map(|(w, _n)| w)
-                        .map_err(|err| {
-                            error!("[client] caught error while handling request: {:?}", err)
-                        });
+                        .map_err(|err| error!("[client] caught error while handling request: {:?}", err));
 
                     warm_handler
                 })
@@ -190,9 +187,7 @@ fn redis_warmup_handler(
 }
 
 fn redis_normal_handler(
-    executor: TaskExecutor,
-    listener: TcpListener,
-    pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
+    executor: TaskExecutor, listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
 ) -> Result<GenericRuntimeFuture, Error> {
     let default_pool = pools
         .get("default")
@@ -217,37 +212,26 @@ fn redis_normal_handler(
                     error!("[client] caught error while reading from client: {:?}", e);
                 })
                 .batch(128)
-                .fold(
-                    (client_tx, client_addr, 0),
-                    move |(tx, addr, msg_count), msgs| {
-                        let start = Instant::now();
-                        trace!(
-                            "[client] [{:?}] got batch of {} messages!",
-                            addr,
-                            msgs.len()
-                        );
+                .fold((client_tx, client_addr, 0), move |(tx, addr, msg_count), msgs| {
+                    let start = Instant::now();
+                    trace!("[client] [{:?}] got batch of {} messages!", addr, msgs.len());
 
-                        let new_msg_count = msg_count + msgs.len();
+                    let new_msg_count = msg_count + msgs.len();
 
-                        join_all(generate_batched_redis_writes(&default, msgs))
-                            .and_then(|results| ok(flatten_ordered_messages(results)))
-                            .map_err(|err| {
-                                Error::new(ErrorKind::Other, "internal synchrotron error (NRJE)")
-                            })
-                            .and_then(move |items| redis::write_messages(tx, items))
-                            .map(move |(w, _n)| {
-                                let delta = start.elapsed().as_micros();
-                                debug!(
-                                    "[client] [{:?}] sent batch of responses to client; took {}μs",
-                                    addr, delta
-                                );
-                                (w, addr, new_msg_count)
-                            })
-                            .map_err(|err| {
-                                error!("[client] caught error while handling request: {:?}", err)
-                            })
-                    },
-                )
+                    join_all(generate_batched_redis_writes(&default, msgs))
+                        .and_then(|results| ok(flatten_ordered_messages(results)))
+                        .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron error (NRJE)"))
+                        .and_then(move |items| redis::write_messages(tx, items))
+                        .map(move |(w, _n)| {
+                            let delta = start.elapsed().as_micros();
+                            debug!(
+                                "[client] [{:?}] sent batch of responses to client; took {}μs",
+                                addr, delta
+                            );
+                            (w, addr, new_msg_count)
+                        })
+                        .map_err(|err| error!("[client] caught error while handling request: {:?}", err))
+                })
                 .map(|(_, addr, msg_count)| {
                     info!(
                         "[client] connection complete -> {:?}; processed {} messages",
@@ -272,9 +256,7 @@ fn get_listener(addr_str: &String, handle: &Handle) -> io::Result<TcpListener> {
     configure_builder(&builder)?;
     builder.reuse_address(true)?;
     builder.bind(addr)?;
-    builder
-        .listen(1024)
-        .and_then(|l| TcpListener::from_std(l, handle))
+    builder.listen(1024).and_then(|l| TcpListener::from_std(l, handle))
 }
 
 #[cfg(unix)]
@@ -286,6 +268,4 @@ fn configure_builder(builder: &TcpBuilder) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn configure_builder(_builder: &TcpBuilder) -> io::Result<()> {
-    Ok(())
-}
+fn configure_builder(_builder: &TcpBuilder) -> io::Result<()> { Ok(()) }

@@ -1,9 +1,26 @@
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 use btoi::btoi;
 use bytes::{BufMut, BytesMut};
 use futures::prelude::*;
-use std::error::Error;
-use std::io;
-use std::mem;
+use std::{error::Error, io, mem};
 use tokio::io::{write_all, AsyncRead, AsyncWrite};
 
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
@@ -115,7 +132,7 @@ where
 {
     pub fn new(rx: R) -> Self {
         RedisMessageStream {
-            rx: rx,
+            rx,
             rd: BytesMut::new(),
         }
     }
@@ -146,12 +163,14 @@ where
             Ok(Async::Ready((bytes_read, cmd))) => {
                 trace!("[protocol] got message from client! ({} bytes)", bytes_read);
                 Ok(Async::Ready(Some(cmd)))
-            }
+            },
             Err(e) => Err(e),
-            _ => match socket_closed {
-                // If the socket is closed, let's also close up shop.
-                true => Ok(Async::Ready(None)),
-                false => Ok(Async::NotReady),
+            _ => {
+                match socket_closed {
+                    // If the socket is closed, let's also close up shop.
+                    true => Ok(Async::Ready(None)),
+                    false => Ok(Async::NotReady),
+                }
             },
         }
     }
@@ -218,18 +237,20 @@ where
                     let (_, msg_slot) = &mut msgs[self.msg_idx];
                     let _ = mem::replace(msg_slot, msg);
                     self.msg_idx += 1;
-                }
+                },
                 Err(e) => return Err(e),
                 _ => {
                     return match socket_closed {
                         // If the socket is closed, let's also close up shop.
-                        true => Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "backend closed before sending response",
-                        )),
+                        true => {
+                            Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "backend closed before sending response",
+                            ))
+                        },
                         false => Ok(Async::NotReady),
                     };
-                }
+                },
             }
         }
     }
@@ -283,15 +304,17 @@ fn read_message_internal(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::E
 
     match first {
         None => Ok(Async::NotReady),
-        Some(t) => match &t {
-            &REDIS_COMMAND_BULK => read_bulk(rd),
-            &REDIS_COMMAND_DATA => read_data(rd),
-            &REDIS_COMMAND_STATUS => read_status(rd),
-            &REDIS_COMMAND_ERROR => read_error(rd),
-            &REDIS_COMMAND_INTEGER => read_integer(rd),
-            x => {
-                debug!("got unknown type sigil: {:?}", x);
-                Ok(Async::NotReady)
+        Some(t) => {
+            match &t {
+                &REDIS_COMMAND_BULK => read_bulk(rd),
+                &REDIS_COMMAND_DATA => read_data(rd),
+                &REDIS_COMMAND_STATUS => read_status(rd),
+                &REDIS_COMMAND_ERROR => read_error(rd),
+                &REDIS_COMMAND_INTEGER => read_integer(rd),
+                x => {
+                    debug!("got unknown type sigil: {:?}", x);
+                    Ok(Async::NotReady)
+                },
             }
         },
     }
@@ -318,10 +341,7 @@ fn read_bulk_count(rd: &mut BytesMut) -> Poll<(usize, usize), io::Error> {
     let buf = rd.split_to(pos + 2);
     match btoi::<usize>(&buf[1..pos]) {
         Ok(count) => Ok(Async::Ready((pos + 2, count))),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::Other,
-            REDIS_CLIENT_ERROR_PROTOCOL,
-        )),
+        Err(_) => Err(io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL)),
     }
 }
 
@@ -330,8 +350,8 @@ fn read_integer(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     let crlf_pos = try_ready!(read_line(rd));
 
     // Try to extract the integer, leaving the rest.
-    let value = btoi::<i64>(&rd[1..crlf_pos])
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
+    let value =
+        btoi::<i64>(&rd[1..crlf_pos]).map_err(|_| io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
 
     // Slice off the entire message.
     let total = crlf_pos + 2;
@@ -374,17 +394,13 @@ fn read_data(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
 
             match null_len {
                 -1 => return Ok(Async::Ready((len_crlf_pos + 2, RedisMessage::Null))),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    REDIS_CLIENT_ERROR_PROTOCOL,
-                )),
+                _ => Err(io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL)),
             }
-        }
+        },
         _ => {
             // Try to extract the data length integer, leaving the rest.
-            let len = btoi::<usize>(&rd[1..len_crlf_pos]).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL)
-            })?;
+            let len = btoi::<usize>(&rd[1..len_crlf_pos])
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL))?;
 
             // See if the actual data is available in the buffer.
             if rd.len() < len_crlf_pos + 2 + len + 2 {
@@ -395,11 +411,8 @@ fn read_data(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
             let total = len_crlf_pos + 2 + len + 2;
             let buf = rd.split_to(total);
 
-            Ok(Async::Ready((
-                total,
-                RedisMessage::Data(buf, len_crlf_pos + 2),
-            )))
-        }
+            Ok(Async::Ready((total, RedisMessage::Data(buf, len_crlf_pos + 2))))
+        },
     }
 }
 
@@ -410,10 +423,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // Get the number of items in the command.
     let (n, count) = try_ready!(read_bulk_count(&mut buf));
     if count < 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            REDIS_CLIENT_ERROR_PROTOCOL,
-        ));
+        return Err(io::Error::new(io::ErrorKind::Other, REDIS_CLIENT_ERROR_PROTOCOL));
     }
     total = total + n;
 
@@ -432,10 +442,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     Ok(Async::Ready((total, RedisMessage::Bulk(buf, args))))
 }
 
-pub fn write_messages<T>(
-    tx: T,
-    mut msgs: RedisUnorderedMessages,
-) -> impl Future<Item = (T, usize), Error = io::Error>
+pub fn write_messages<T>(tx: T, mut msgs: RedisUnorderedMessages) -> impl Future<Item = (T, usize), Error = io::Error>
 where
     T: AsyncWrite,
 {
@@ -449,7 +456,7 @@ where
                 buf.extend_from_slice(&msg_buf[..]);
             }
             buf
-        }
+        },
     };
 
     let buf_len = buf.len();
@@ -457,8 +464,7 @@ where
 }
 
 pub fn write_ordered_messages<T>(
-    tx: T,
-    mut msgs: RedisOrderedMessages,
+    tx: T, mut msgs: RedisOrderedMessages,
 ) -> impl Future<Item = (T, RedisOrderedMessages, usize), Error = io::Error>
 where
     T: AsyncWrite,
@@ -469,7 +475,7 @@ where
             let (_, msg) = &mut msgs[0];
             let msg2 = mem::replace(msg, RedisMessage::Null);
             msg2.as_resp()
-        }
+        },
         _ => {
             let mut buf = BytesMut::new();
             for (_id, msg) in &mut msgs {
@@ -478,7 +484,7 @@ where
                 buf.extend_from_slice(&msg_buf[..]);
             }
             buf
-        }
+        },
     };
 
     let buf_len = buf.len();
@@ -518,7 +524,7 @@ mod tests {
             RedisMessage::Data(ref buf, offset) => {
                 let data_len = buf.len() - 2;
                 assert_eq!(&buf[offset..data_len], data);
-            }
+            },
             _ => panic!("message is not data"),
         }
     }
@@ -535,7 +541,7 @@ mod tests {
             RedisMessage::Status(ref buf, offset) => {
                 let data_len = buf.len() - 2;
                 assert_eq!(&buf[offset..data_len], data);
-            }
+            },
             _ => panic!("message is not status"),
         }
     }
@@ -545,7 +551,7 @@ mod tests {
             RedisMessage::Error(ref buf, offset) => {
                 let data_len = buf.len() - 2;
                 assert_eq!(&buf[offset..data_len], data);
-            }
+            },
             _ => panic!("message is not error"),
         }
     }
@@ -557,7 +563,7 @@ mod tests {
                 for value in &values {
                     check_data_matches(args.remove(0), value);
                 }
-            }
+            },
             _ => panic!("message is not bulk"),
         }
     }
@@ -623,16 +629,18 @@ mod tests {
         assert_that(&res).is_ok().matches(|val| val.is_ready());
 
         match res.unwrap() {
-            Async::Ready(mut msg) => match msg {
-                RedisMessage::Bulk(_, ref mut args) => {
-                    assert_that(args).has_length(2);
-                    let arg0 = args.remove(0);
-                    let arg1 = args.remove(0);
+            Async::Ready(mut msg) => {
+                match msg {
+                    RedisMessage::Bulk(_, ref mut args) => {
+                        assert_that(args).has_length(2);
+                        let arg0 = args.remove(0);
+                        let arg1 = args.remove(0);
 
-                    check_data_matches(arg0, b"boo");
-                    assert_eq!(arg1, RedisMessage::Null);
+                        check_data_matches(arg0, b"boo");
+                        assert_eq!(arg1, RedisMessage::Null);
+                    },
+                    _ => panic!("message is not bulk"),
                 }
-                _ => panic!("message is not bulk"),
             },
             _ => panic!("should have had message"),
         }
@@ -708,9 +716,7 @@ mod tests {
     }
 
     #[bench]
-    fn bench_parse_get_simple(b: &mut Bencher) {
-        b.iter(|| get_message_from_buf(&DATA_GET_SIMPLE));
-    }
+    fn bench_parse_get_simple(b: &mut Bencher) { b.iter(|| get_message_from_buf(&DATA_GET_SIMPLE)); }
 
     #[bench]
     fn bench_short_circuit_0_zero_data(b: &mut Bencher) {
@@ -743,12 +749,8 @@ mod tests {
     }
 
     #[bench]
-    fn bench_ping_lower(b: &mut Bencher) {
-        b.iter(|| get_message_from_buf(&DATA_PING_LOWER));
-    }
+    fn bench_ping_lower(b: &mut Bencher) { b.iter(|| get_message_from_buf(&DATA_PING_LOWER)); }
 
     #[bench]
-    fn bench_ping_upper(b: &mut Bencher) {
-        b.iter(|| get_message_from_buf(&DATA_PING_UPPER));
-    }
+    fn bench_ping_upper(b: &mut Bencher) { b.iter(|| get_message_from_buf(&DATA_PING_UPPER)); }
 }

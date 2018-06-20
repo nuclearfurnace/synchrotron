@@ -1,12 +1,29 @@
-use super::distributor::{BackendDescriptor, Distributor};
-use super::hasher::KeyHasher;
-use backend::sync::RequestTransformer;
-use backend::sync::{TaskBackend, TaskBackendParticipant};
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+use super::{
+    distributor::{BackendDescriptor, Distributor}, hasher::KeyHasher,
+};
+use backend::sync::{RequestTransformer, TaskBackend, TaskBackendParticipant};
 use futures::prelude::*;
-use std::io::Error;
-use std::net::SocketAddr;
-use tokio::net::TcpStream;
-use tokio::runtime::TaskExecutor;
+use std::{io::Error, net::SocketAddr};
+use tokio::{net::TcpStream, runtime::TaskExecutor};
 
 pub struct BackendPool<T>
 where
@@ -25,18 +42,14 @@ where
     T::Executor: Future<Item = (TcpStream, T::Response), Error = Error> + Send + 'static,
 {
     pub fn new(
-        executor: TaskExecutor,
-        addresses: Vec<SocketAddr>,
-        transformer: T,
-        mut dist: Box<Distributor + Send + Sync>,
+        executor: TaskExecutor, addresses: Vec<SocketAddr>, transformer: T, mut dist: Box<Distributor + Send + Sync>,
         hasher: Box<KeyHasher + Send + Sync>,
     ) -> BackendPool<T> {
         // Assemble the list of backends and backend descriptors.
         let mut backends = vec![];
         let mut descriptors = vec![];
         for address in &addresses {
-            let (backend, runner) =
-                TaskBackend::new(executor.clone(), address.clone(), transformer.clone(), 1);
+            let (backend, runner) = TaskBackend::new(executor.clone(), address.clone(), transformer.clone(), 1);
             backends.push(backend);
 
             // eventually, we'll populate this with weight, etc, so that
@@ -52,9 +65,9 @@ where
         dist.seed(descriptors);
 
         BackendPool {
-            backends: backends,
+            backends,
             distributor: dist,
-            hasher: hasher,
+            hasher,
         }
     }
 

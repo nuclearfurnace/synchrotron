@@ -1,24 +1,41 @@
-use backend::pool::BackendPool;
-use backend::sync::{RequestTransformer, TcpStreamFuture};
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+use backend::{
+    pool::BackendPool, sync::{RequestTransformer, TcpStreamFuture},
+};
 use bytes::BytesMut;
-use futures::future::{ok, result};
-use futures::prelude::*;
-use futures::sync::{mpsc, oneshot};
+use futures::{
+    future::{ok, result}, prelude::*, sync::{mpsc, oneshot},
+};
 use itoa;
-use protocol::redis;
-use protocol::redis::{RedisMessage, RedisOrderedMessages};
-use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
-use tokio;
-use tokio::net::TcpStream;
+use protocol::redis::{self, RedisMessage, RedisOrderedMessages};
+use std::{
+    collections::HashMap, io::{Error, ErrorKind},
+};
+use tokio::{self, net::TcpStream};
 
 #[derive(Clone)]
 pub struct RedisRequestTransformer;
 
 impl RedisRequestTransformer {
-    pub fn new() -> RedisRequestTransformer {
-        RedisRequestTransformer {}
-    }
+    pub fn new() -> RedisRequestTransformer { RedisRequestTransformer {} }
 }
 
 impl RequestTransformer for RedisRequestTransformer {
@@ -45,8 +62,7 @@ impl RequestTransformer for RedisRequestTransformer {
 }
 
 pub fn generate_batched_redis_writes(
-    pool: &BackendPool<RedisRequestTransformer>,
-    mut messages: Vec<RedisMessage>,
+    pool: &BackendPool<RedisRequestTransformer>, mut messages: Vec<RedisMessage>,
 ) -> Vec<oneshot::Receiver<RedisOrderedMessages>> {
     // Group all of our messages by their target backend index.
     let mut assigned_msgs = HashMap::new();
@@ -84,9 +100,7 @@ pub fn generate_batched_redis_writes(
         let (response_tx, response_rx) = oneshot::channel();
         let response = backend
             .submit(msgs)
-            .and_then(|r| {
-                result(r).or_else(move |err| ok(to_vectored_error_response(err, msg_indexes2)))
-            })
+            .and_then(|r| result(r).or_else(move |err| ok(to_vectored_error_response(err, msg_indexes2))))
             .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (RRCE)"))
             .or_else(move |err| ok(to_vectored_error_response(err, msg_indexes)))
             .and_then(|r| response_tx.send(r))
@@ -103,20 +117,22 @@ pub fn generate_batched_redis_writes(
 
 fn redis_is_multi_message(msg: &RedisMessage) -> bool {
     match msg {
-        RedisMessage::Bulk(_, args) => match args.len() {
-            0 => false,
-            _ => {
-                let arg = &args[0];
-                match arg {
-                    RedisMessage::Data(buf, offset) => {
-                        let cmd_key = redis_clean_data(&buf, *offset);
-                        match cmd_key {
-                            b"mget" | b"mset" | b"del" => true,
-                            _ => false,
-                        }
+        RedisMessage::Bulk(_, args) => {
+            match args.len() {
+                0 => false,
+                _ => {
+                    let arg = &args[0];
+                    match arg {
+                        RedisMessage::Data(buf, offset) => {
+                            let cmd_key = redis_clean_data(&buf, *offset);
+                            match cmd_key {
+                                b"mget" | b"mset" | b"del" => true,
+                                _ => false,
+                            }
+                        },
+                        _ => false,
                     }
-                    _ => false,
-                }
+                },
             }
         },
         _ => false,
@@ -124,9 +140,7 @@ fn redis_is_multi_message(msg: &RedisMessage) -> bool {
 }
 
 fn redis_fragment_multi_message(
-    pool: &BackendPool<RedisRequestTransformer>,
-    id: u64,
-    msg: RedisMessage,
+    pool: &BackendPool<RedisRequestTransformer>, id: u64, msg: RedisMessage,
 ) -> oneshot::Receiver<RedisOrderedMessages> {
     match msg {
         RedisMessage::Bulk(_, mut args) => {
@@ -150,8 +164,7 @@ fn redis_fragment_multi_message(
                                     pool.get_backend_index(msg_key)
                                 };
 
-                                let mut batched_msgs =
-                                    batches.entry(backend_idx).or_insert(Vec::new());
+                                let mut batched_msgs = batches.entry(backend_idx).or_insert(Vec::new());
                                 batched_msgs.push((i, arg));
 
                                 i += 1;
@@ -173,9 +186,7 @@ fn redis_fragment_multi_message(
 
                                 for (id, msg) in msgs {
                                     indexes.push(id);
-                                    let ids = backend_order_map
-                                        .entry(backend_idx as u64)
-                                        .or_insert(Vec::new());
+                                    let ids = backend_order_map.entry(backend_idx as u64).or_insert(Vec::new());
                                     ids.push(id);
 
                                     new_buf.unsplit(msg.as_resp());
@@ -192,19 +203,10 @@ fn redis_fragment_multi_message(
                                 let work = backend
                                     .submit(wrapped_msg)
                                     .and_then(|r| {
-                                        result(r).or_else(move |err| {
-                                            ok(to_vectored_error_response(err, indexes))
-                                        })
+                                        result(r).or_else(move |err| ok(to_vectored_error_response(err, indexes)))
                                     })
-                                    .map_err(|_| {
-                                        Error::new(
-                                            ErrorKind::Other,
-                                            "internal synchrotron failure (RRCE)",
-                                        )
-                                    })
-                                    .or_else(move |err| {
-                                        ok(to_vectored_error_response(err, indexes2))
-                                    })
+                                    .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (RRCE)"))
+                                    .or_else(move |err| ok(to_vectored_error_response(err, indexes2)))
                                     .and_then(move |r| tx.send(r))
                                     .map(|_| ())
                                     .map_err(|_| ());
@@ -224,8 +226,7 @@ fn redis_fragment_multi_message(
                                     let mut unfragmented = Vec::new();
                                     for batch in batches {
                                         for (backend_idx, msg) in batch {
-                                            let mut batch_order =
-                                                backend_order_map.remove(&backend_idx).unwrap();
+                                            let mut batch_order = backend_order_map.remove(&backend_idx).unwrap();
                                             match msg {
                                                 RedisMessage::Bulk(_, mut results) => {
                                                     while results.len() > 0 {
@@ -233,7 +234,7 @@ fn redis_fragment_multi_message(
                                                         let result_id = batch_order.remove(0);
                                                         unfragmented.push((result_id, result));
                                                     }
-                                                }
+                                                },
                                                 x => panic!("expected bulk response: {:?}", x),
                                             }
                                         }
@@ -257,13 +258,13 @@ fn redis_fragment_multi_message(
                             tokio::spawn(collector);
 
                             result_rx
-                        }
+                        },
                         _ => panic!("mset not implemented yet"),
                     }
-                }
+                },
                 _ => panic!("can't fragment bulk message with non-data arguments"),
             }
-        }
+        },
         _ => panic!("can't fragment non-multi message"),
     }
 }
@@ -303,14 +304,14 @@ fn get_message_key<'a>(msg: &'a RedisMessage) -> &'a [u8] {
                 Some(RedisMessage::Data(buf, offset)) => {
                     let end = buf.len() - 2;
                     &buf[*offset..end]
-                }
+                },
                 _ => panic!("command message does not have expected structure"),
             }
-        }
+        },
         RedisMessage::Data(buf, offset) => {
             let end = buf.len() - 2;
             &buf[*offset..end]
-        }
+        },
         _ => panic!("command message should be multi-bulk or data !"),
     }
 }

@@ -1,5 +1,25 @@
-use futures::stream::{Fuse, Stream};
-use futures::{Async, Poll};
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+use futures::{
+    stream::{Fuse, Stream}, Async, Poll,
+};
 use std::mem;
 
 /// An adapter for batching up items in a stream opportunistically.
@@ -62,7 +82,7 @@ where
                         0 => Ok(Async::NotReady),
                         _ => Ok(Some(self.take()).into()),
                     }
-                }
+                },
 
                 // If the underlying stream is ready and has items, buffer them until we hit our
                 // capacity.
@@ -75,7 +95,7 @@ where
                     if self.items.len() >= cap {
                         return Ok(Some(self.take()).into());
                     }
-                }
+                },
 
                 // Since the underlying stream ran out of values, return what we have buffered, if
                 // we have anything at all.
@@ -85,7 +105,7 @@ where
                     } else {
                         Ok(Async::Ready(None))
                     }
-                }
+                },
 
                 // If we've got buffered items be sure to return them first, we'll defer our error
                 // for later.
@@ -96,7 +116,7 @@ where
                         self.err = Some(e);
                         return Ok(Some(self.take()).into());
                     }
-                }
+                },
             }
         }
     }

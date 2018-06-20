@@ -1,6 +1,6 @@
 {
   "logging": {
-    "level": "info"
+    "level": "debug"
   },
   "listeners": [
     {
@@ -8,8 +8,7 @@
       "address": "127.0.0.1:6380",
       "pools": {
         "default": {
-          "addresses": ["127.0.0.1:6379"],
-          "options": {}
+          "addresses": ["127.0.0.1:6379"]
         }
       },
       "routing": "normal"
@@ -19,15 +18,23 @@
       "address": "127.0.0.1:6381",
       "pools": {
         "warm": {
-          "addresses": ["127.0.0.1:6379"],
-          "options": {}
+          "addresses": ["127.0.0.1:6379"]
         },
         "cold": {
-          "addresses": ["127.0.0.1:6378"],
-          "options": {}
+          "addresses": ["127.0.0.1:6378"]
         }
       },
       "routing": "warmup"
+    },
+    {
+      "protocol": "redis",
+      "address": "127.0.0.1:6381",
+      "pools": {
+        "default": {
+          "addresses": ["127.0.0.1:8881", "127.0.0.1:8882"]
+        }
+      },
+      "routing": "normal"
     }
   ]
 }

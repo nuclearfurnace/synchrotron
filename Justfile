@@ -1,6 +1,12 @@
 clean:
     cargo clean
 
+fmt:
+    cargo fmt --all
+
+lint:
+    cargo fmt --all -- --check
+
 build:
     cargo build
 

@@ -1,11 +1,28 @@
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 use backend::sync::RequestTransformer;
-use futures::future::{ok, Either};
-use futures::prelude::*;
-use futures::sync::{mpsc, oneshot};
-use std::io::Error;
-use std::net::SocketAddr;
-use tokio::net::TcpStream;
-use tokio::runtime::TaskExecutor;
+use futures::{
+    future::{ok, Either}, prelude::*, sync::{mpsc, oneshot},
+};
+use std::{io::Error, net::SocketAddr};
+use tokio::{net::TcpStream, runtime::TaskExecutor};
 
 pub enum TaskBackendConnection {
     Alive(TcpStream),
@@ -53,13 +70,15 @@ where
         loop {
             // See if we have a connection to recover or replace.
             match self.conns_rx.poll() {
-                Ok(Async::Ready(Some(conn))) => match conn {
-                    TaskBackendConnection::Alive(conn) => self.conns.push(conn),
-                    TaskBackendConnection::Error => {
-                        self.conn_count -= 1;
+                Ok(Async::Ready(Some(conn))) => {
+                    match conn {
+                        TaskBackendConnection::Alive(conn) => self.conns.push(conn),
+                        TaskBackendConnection::Error => {
+                            self.conn_count -= 1;
+                        },
                     }
                 },
-                Ok(Async::NotReady) => {}
+                Ok(Async::NotReady) => {},
                 _ => return Err(()),
             }
 
@@ -77,26 +96,26 @@ where
                         0 => {
                             self.conn_count += 1;
                             Either::B(TcpStream::connect(&self.address))
-                        }
+                        },
                         _ => self.conns.pop().map(|x| Either::A(ok(x))).unwrap(),
                     };
 
                     let conns_tx = self.conns_tx.clone();
                     let inner_work = self.transformer.transform(request, connection);
                     let work = inner_work
-                        .then(|result| match result {
-                            Ok((conn, x)) => ok((TaskBackendConnection::Alive(conn), Ok(x))),
-                            Err(e) => ok((TaskBackendConnection::Error, Err(e))),
+                        .then(|result| {
+                            match result {
+                                Ok((conn, x)) => ok((TaskBackendConnection::Alive(conn), Ok(x))),
+                                Err(e) => ok((TaskBackendConnection::Error, Err(e))),
+                            }
                         })
-                        .and_then(move |(backend_result, op_result)| {
-                            conns_tx.send(backend_result).map(|_| op_result)
-                        })
+                        .and_then(move |(backend_result, op_result)| conns_tx.send(backend_result).map(|_| op_result))
                         .and_then(move |result| ok(response_tx.send(result)))
                         .map_err(|_| ())
                         .map(|_| ());
 
                     self.executor.spawn(work);
-                }
+                },
                 _ => return Err(()),
             }
         }
@@ -104,11 +123,8 @@ where
 }
 
 fn new_state_machine<T>(
-    executor: TaskExecutor,
-    addr: SocketAddr,
-    transformer: T,
-    rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
-    conn_limit: usize,
+    executor: TaskExecutor, addr: SocketAddr, transformer: T,
+    rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>, conn_limit: usize,
 ) -> TaskBackendStateMachine<T>
 where
     T: RequestTransformer,
@@ -116,17 +132,17 @@ where
     let (conns_tx, conns_rx) = mpsc::unbounded();
 
     TaskBackendStateMachine {
-        executor: executor,
+        executor,
 
-        transformer: transformer,
+        transformer,
         requests_rx: rx,
 
         address: addr,
         conns: Vec::new(),
-        conns_rx: conns_rx,
-        conns_tx: conns_tx,
+        conns_rx,
+        conns_tx,
         conn_count: 0,
-        conn_limit: conn_limit,
+        conn_limit,
     }
 }
 
@@ -153,10 +169,7 @@ where
     T: RequestTransformer,
 {
     pub fn new(
-        executor: TaskExecutor,
-        addr: SocketAddr,
-        transformer: T,
-        conn_limit: usize,
+        executor: TaskExecutor, addr: SocketAddr, transformer: T, conn_limit: usize,
     ) -> (TaskBackend<T>, TaskBackendStateMachine<T>) {
         let (tx, rx) = mpsc::unbounded();
         let backend = TaskBackend { requests_tx: tx };

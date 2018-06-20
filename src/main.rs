@@ -1,3 +1,22 @@
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #![feature(test)]
 #![feature(iterator_flatten)]
 #![feature(associated_type_defaults)]
@@ -25,12 +44,8 @@ extern crate net2;
 extern crate rs_futures_spmc;
 
 use rs_futures_spmc::channel;
-use std::error::Error;
-use std::process;
-use std::thread;
-use tokio::executor::thread_pool;
-use tokio::prelude::*;
-use tokio::runtime;
+use std::{error::Error, process, thread};
+use tokio::{executor::thread_pool, prelude::*, runtime};
 
 #[macro_use]
 extern crate log;
@@ -60,8 +75,7 @@ mod listener;
 mod protocol;
 mod util;
 
-use conf::Configuration;
-use conf::LevelExt;
+use conf::{Configuration, LevelExt};
 
 fn run() -> i32 {
     // Due to the way signal masking apparently works, or works with this library, we
@@ -78,13 +92,13 @@ fn run() -> i32 {
             info!("[core] signal received: {:?}", signal);
 
             match signal {
-                Signal::USR1 => {} // signal to spawn new process
+                Signal::USR1 => {}, // signal to spawn new process
                 Signal::INT => {
                     // signal to close this process
                     let _ = close_tx.send(()).wait();
                     break;
-                }
-                _ => {} // we don't care about the rest
+                },
+                _ => {}, // we don't care about the rest
             }
         }
     });
@@ -108,9 +122,7 @@ fn run() -> i32 {
 
     // Now run.
     let mut threadpool_builder = thread_pool::Builder::new();
-    threadpool_builder
-        .name_prefix("my-runtime-worker-")
-        .pool_size(4);
+    threadpool_builder.name_prefix("my-runtime-worker-").pool_size(4);
 
     let mut runtime = runtime::Builder::new()
         .threadpool_builder(threadpool_builder)
