@@ -39,9 +39,9 @@ impl RedisRequestTransformer {
 }
 
 impl RequestTransformer for RedisRequestTransformer {
-    type Executor = Box<Future<Item = (TcpStream, Self::Response), Error = Error> + Send>;
-    type Response = RedisOrderedMessages;
     type Request = RedisOrderedMessages;
+    type Response = RedisOrderedMessages;
+    type Executor = Box<Future<Item = (TcpStream, Self::Response), Error = Error> + Send>;
 
     fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor {
         let inner = stream
@@ -205,7 +205,7 @@ fn redis_fragment_multi_message(
                                     .and_then(|r| {
                                         result(r).or_else(move |err| ok(to_vectored_error_response(err, indexes)))
                                     })
-                                    .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (RRCE)"))
+                                    .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (MGDBE)"))
                                     .or_else(move |err| ok(to_vectored_error_response(err, indexes2)))
                                     .and_then(move |r| tx.send(r))
                                     .map(|_| ())
@@ -259,7 +259,97 @@ fn redis_fragment_multi_message(
 
                             result_rx
                         },
-                        _ => panic!("mset not implemented yet"),
+                        b"mset" => {
+                            // Group all of the arguments by the backend (specifically the backend
+                            // ID) that the key belongs to.  Here we're taking the key and the
+                            // value each iteration.
+                            let mut batches = HashMap::new();
+
+                            let mut i = 0;
+                            while args.len() > 1 {
+                                let karg = args.remove(0);
+                                let varg = args.remove(0);
+                                let backend_idx = {
+                                    let msg_key = get_message_key(&karg);
+                                    pool.get_backend_index(msg_key)
+                                };
+
+                                let mut batched_msgs = batches.entry(backend_idx).or_insert(Vec::new());
+                                batched_msgs.push((i, karg, varg));
+
+                                i += 1;
+                            }
+
+                            // Now transform these into a single command per backend.
+                            let batches_len = batches.len();
+                            let (batch_tx, batch_rx) = mpsc::channel(batches_len);
+                            let mut backend_order_map = HashMap::new();
+
+                            for (backend_idx, msgs) in batches {
+                                let mut indexes = Vec::new();
+
+                                // Create a new redis message, using the same command name, and
+                                // append all the backend-related keys to it.
+                                let arg_count = msgs.len() * 2 + 1;
+                                let mut new_buf = redis_new_bulk_buffer(arg_count);
+                                new_buf.extend_from_slice(&buf);
+
+                                for (id, kmsg, vmsg) in msgs {
+                                    indexes.push(id);
+                                    let ids = backend_order_map.entry(backend_idx as u64).or_insert(Vec::new());
+                                    ids.push(id);
+
+                                    new_buf.unsplit(kmsg.as_resp());
+                                    new_buf.unsplit(vmsg.as_resp());
+                                }
+
+                                let msg = RedisMessage::Raw(new_buf);
+                                let wrapped_msg = vec![(backend_idx as u64, msg)];
+                                let tx = batch_tx.clone();
+
+                                // Send this aggregated message to be processed, and forward the
+                                // results to the accumulator channel.
+                                let mut backend = pool.get_backend_by_index(backend_idx);
+                                let indexes2 = indexes.clone();
+                                let work = backend
+                                    .submit(wrapped_msg)
+                                    .and_then(|r| {
+                                        result(r).or_else(move |err| ok(to_vectored_error_response(err, indexes)))
+                                    })
+                                    .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (MSBE)"))
+                                    .or_else(move |err| ok(to_vectored_error_response(err, indexes2)))
+                                    .and_then(move |r| tx.send(r))
+                                    .map(|_| ())
+                                    .map_err(|_| ());
+
+                                tokio::spawn(work);
+                            }
+
+                            // Now we have a map of backend ID/aggregated message, as well as
+                            // backend ID/intramessage index, which lets us know which order the
+                            // results from a given backend should be sorted to when we assemble
+                            // the final message back to the client.
+                            let (result_tx, result_rx) = oneshot::channel();
+                            let collector = batch_rx
+                                .take(batches_len as u64)
+                                .collect()
+                                .map(move |_| {
+                                    // MSET is different in that it always returns "OK", so really
+                                    // what we care about here is the notion of making sure all our
+                                    // backends have responded with "OK" so we can tell the client
+                                    // that the operation has in fact concluded.  If we've made it
+                                    // far enough that we're here, we've gotten our N responses
+                                    // back, so just map a static "OK" message to the client.
+                                    result_tx.send(vec![(id, RedisMessage::OK)])
+                                })
+                                .map(|_| ())
+                                .map_err(|e| error!("multi frag err: {:?}", e));
+
+                            tokio::spawn(collector);
+
+                            result_rx
+                        },
+                        _ => panic!("unknown message type!"),
                     }
                 },
                 _ => panic!("can't fragment bulk message with non-data arguments"),
@@ -281,7 +371,6 @@ fn redis_new_bulk_buffer(arg_count: usize) -> BytesMut {
     let mut cnt_buf = [b'\0'; 20];
     let n = itoa::write(&mut cnt_buf[..], arg_count).unwrap();
     buf.extend_from_slice(&cnt_buf[..n]);
-
     buf.extend_from_slice(b"\r\n");
     buf
 }

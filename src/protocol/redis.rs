@@ -153,8 +153,8 @@ impl<R> Stream for RedisMessageStream<R>
 where
     R: AsyncRead,
 {
-    type Error = io::Error;
     type Item = RedisMessage;
+    type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
@@ -211,8 +211,8 @@ impl<R> Future for RedisMultipleMessages<R>
 where
     R: AsyncRead,
 {
-    type Error = io::Error;
     type Item = (R, usize, RedisOrderedMessages);
+    type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();

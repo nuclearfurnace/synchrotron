@@ -63,8 +63,8 @@ impl<S> Stream for Batch<S>
 where
     S: Stream,
 {
-    type Error = <S as Stream>::Error;
     type Item = Vec<<S as Stream>::Item>;
+    type Error = <S as Stream>::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         if let Some(err) = self.err.take() {
