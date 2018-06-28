@@ -1,11 +1,11 @@
 # synchrotron
 
-[![conduct-badge][]] [![travis-badge][]][travis] [![release-badge][]] [![license-badge][]](#license)
+[![conduct-badge]] [![travis-badge][]][travis] [![release-badge]] [![license-badge][]](#license)
 
 [conduct-badge]: https://img.shields.io/badge/%E2%9D%A4-code%20of%20conduct-blue.svg
 [travis-badge]: https://img.shields.io/travis/nuclearfurnace/synchrotron/master.svg
 [release-badge]: https://img.shields.io/github/release-date/nuclearfurnace/synchrotron.svg
-[license-badge]: https://img.shields.io/github/license/nuclearfurnace/clocksource.svg
+[license-badge]: https://img.shields.io/github/license/nuclearfurnace/synchrotron.svg
 [travis]: https://travis-ci.org/nuclearfurnace/synchrotron
 
 Synchrotron is a caching layer load balancer, in the spirit of [Twemproxy](https://github.com/twitter/twemproxy) and [mcrouter](https://github.com/facebook/mcrouter).
