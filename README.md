@@ -1,6 +1,12 @@
 # synchrotron
 
-[![Build Status](https://travis-ci.org/nuclearfurnace/synchrotron.svg?branch=master)](https://travis-ci.org/nuclearfurnace/synchrotron)
+[![conduct-badge][]][] [![travis-badge][]][travis] [![release-badge][]][] [![license-badge][]](#license)
+
+[conduct-badge]: https://img.shields.io/badge/%E2%9D%A4-code%20of%20conduct-blue.svg
+[travis-badge]: https://img.shields.io/travis/nuclearfurnace/synchrotron/master.svg
+[release-badge]: https://img.shields.io/github/release-date/nuclearfurnace/synchrotron.svg
+[license-badge]: https://img.shields.io/github/license/nuclearfurnace/clocksource.svg
+[travis]: https://travis-ci.org/nuclearfurnace/synchrotron
 
 Synchrotron is a caching layer load balancer, in the spirit of [Twemproxy](https://github.com/twitter/twemproxy) and [mcrouter](https://github.com/facebook/mcrouter).
 
@@ -28,3 +34,7 @@ Here is a non-exhaustive checklist of what's done and what is a serious target:
 - [ ] online reconfiguration
 - [ ] metrics collection
 - [ ] TLS support
+
+## License
+
+Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
