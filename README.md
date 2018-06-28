@@ -5,7 +5,7 @@
 [conduct-badge]: https://img.shields.io/badge/%E2%9D%A4-code%20of%20conduct-blue.svg
 [travis-badge]: https://img.shields.io/travis/nuclearfurnace/synchrotron/master.svg
 [release-badge]: https://img.shields.io/github/release-date/nuclearfurnace/synchrotron.svg
-[license-badge]: https://img.shields.io/github/license/nuclearfurnace/synchrotron.svg
+[license-badge]: https://img.shields.io/badge/License-MIT-green.svg
 [conduct]: https://github.com/nuclearfurnace/synchrotron/blob/master/CODE_OF_CONDUCT.md
 [releases]: https://github.com/nuclearfurnace/synchrotron/releases
 [travis]: https://travis-ci.org/nuclearfurnace/synchrotron
