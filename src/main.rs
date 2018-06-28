@@ -46,6 +46,7 @@ extern crate rs_futures_spmc;
 use rs_futures_spmc::channel;
 use std::{error::Error, process, thread};
 use tokio::{executor::thread_pool, prelude::*, runtime};
+use tokio::runtime::TaskExecutor;
 
 #[macro_use]
 extern crate log;
@@ -122,7 +123,7 @@ fn run() -> i32 {
 
     // Now run.
     let mut threadpool_builder = thread_pool::Builder::new();
-    threadpool_builder.name_prefix("my-runtime-worker-").pool_size(4);
+    threadpool_builder.name_prefix("synchrotron-worker-").pool_size(4);
 
     let mut runtime = runtime::Builder::new()
         .threadpool_builder(threadpool_builder)
@@ -166,13 +167,20 @@ fn run() -> i32 {
 
     // Launch all these listeners into the runtime.
     for listener in listeners {
-        runtime.spawn(listener.unwrap());
+        executor.spawn(listener.unwrap());
     }
+
+    // Launch our stats port.
+    launch_stats(executor);
 
     info!("[core] synchrotron running");
 
     runtime.shutdown_on_idle().wait().unwrap();
     return 0;
+}
+
+fn launch_stats(runtime: TaskExecutor) {
+    // Touch the global registry for the first time to initialize it.
 }
 
 fn main() {

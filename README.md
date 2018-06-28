@@ -1,6 +1,6 @@
 # synchrotron
 
-[![conduct-badge][]][] [![travis-badge][]][travis] [![release-badge][]][] [![license-badge][]](#license)
+[![conduct-badge][]] [![travis-badge][]][travis] [![release-badge][]] [![license-badge][]](#license)
 
 [conduct-badge]: https://img.shields.io/badge/%E2%9D%A4-code%20of%20conduct-blue.svg
 [travis-badge]: https://img.shields.io/travis/nuclearfurnace/synchrotron/master.svg
@@ -37,4 +37,4 @@ Here is a non-exhaustive checklist of what's done and what is a serious target:
 
 ## License
 
-Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+Licensed under the MIT license ([LICENSE](LICENSE) or http://opensource.org/licenses/MIT)

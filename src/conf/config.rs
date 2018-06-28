@@ -20,18 +20,19 @@
 use config::{Config, ConfigError, File};
 use std::{collections::HashMap, env, net::SocketAddr};
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct Configuration {
+    pub stats_port: u16,
     pub logging: LoggingConfiguration,
     pub listeners: Vec<ListenerConfiguration>,
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct LoggingConfiguration {
     pub level: String,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct ListenerConfiguration {
     pub protocol: String,
     pub address: String,
@@ -39,7 +40,7 @@ pub struct ListenerConfiguration {
     pub routing: String,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct PoolConfiguration {
     pub addresses: Vec<SocketAddr>,
     pub options: Option<HashMap<String, String>>,
@@ -49,11 +50,22 @@ impl Configuration {
     pub fn new() -> Result<Self, ConfigError> {
         let mut s = Config::new();
 
-        s.merge(File::with_name("config/synchrotron"))?;
+        // Set some defaults.
+        s.set_default("logging.level", "info")?;
+        // how tf do we make this work?
+        //s.set_default("listeners", Vec::<ListenerConfiguration>::new())?;
+
+        // Now load in any configuration files we can find.
+        s.merge(File::with_name("config/synchrotron").required(false))?;
 
         let env = env::var("ENV").unwrap_or("development".into());
         s.merge(File::with_name(&format!("config/synchrotron.{}", env)).required(false))?;
         s.merge(File::with_name("config/synchrotron.local").required(false))?;
+
+        let conf_override = env::var("SYNC_CONFIG").ok();
+        if let Some(path) = conf_override {
+            s.merge(File::with_name(path.as_str()).required(false))?;
+        }
 
         s.try_into()
     }
