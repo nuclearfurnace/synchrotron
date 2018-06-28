@@ -1,0 +1,8 @@
+[package]
+name = "synchrotron-test"
+version = "0.1.0"
+authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
+
+[dependencies]
+tempfile = "3.0.2"
+redis = "0.8.0"
