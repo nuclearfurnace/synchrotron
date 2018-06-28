@@ -18,7 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 mod random;
+mod modulo;
 pub use self::random::RandomDistributor;
+pub use self::modulo::ModuloDistributor;
 
 /// A placeholder for backends.  This lets us avoid holding references to the actual backends.
 pub struct BackendDescriptor;
@@ -44,6 +46,7 @@ pub trait Distributor {
 pub fn configure_distributor(dist_type: &str) -> Box<Distributor + Send + Sync> {
     match dist_type {
         "random" => Box::new(RandomDistributor::new()),
+        "modulo" => Box::new(ModuloDistributor::new()),
         s => panic!("unknown distributor type {}", s),
     }
 }

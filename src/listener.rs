@@ -86,7 +86,7 @@ fn redis_from_config(
 
         let dist_type = opts
             .entry("distribution".to_owned())
-            .or_insert("random".to_owned())
+            .or_insert("modulo".to_owned())
             .to_lowercase();
         let distributor = distributor::configure_distributor(&dist_type);
         debug!("[listener] using distributor '{}'", dist_type);
