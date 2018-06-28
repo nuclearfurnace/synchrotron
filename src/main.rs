@@ -45,8 +45,9 @@ extern crate rs_futures_spmc;
 
 use rs_futures_spmc::channel;
 use std::{error::Error, process, thread};
-use tokio::{executor::thread_pool, prelude::*, runtime};
-use tokio::runtime::TaskExecutor;
+use tokio::{
+    executor::thread_pool, prelude::*, runtime::{self, TaskExecutor},
+};
 
 #[macro_use]
 extern crate log;

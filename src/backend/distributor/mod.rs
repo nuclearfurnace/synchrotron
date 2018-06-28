@@ -17,10 +17,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-mod random;
 mod modulo;
-pub use self::random::RandomDistributor;
-pub use self::modulo::ModuloDistributor;
+mod random;
+pub use self::{modulo::ModuloDistributor, random::RandomDistributor};
 
 /// A placeholder for backends.  This lets us avoid holding references to the actual backends.
 pub struct BackendDescriptor;

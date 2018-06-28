@@ -40,7 +40,5 @@ impl Distributor for ModuloDistributor {
         self.backend_count = self.backends.len();
     }
 
-    fn choose(&self, point: u64) -> usize {
-        (point % self.backend_count as u64) as usize
-    }
+    fn choose(&self, point: u64) -> usize { (point % self.backend_count as u64) as usize }
 }
