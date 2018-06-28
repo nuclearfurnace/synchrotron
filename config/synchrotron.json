@@ -1,0 +1,17 @@
+{
+  "logging": {
+    "level": "info"
+  },
+  "listeners": [
+    {
+      "protocol": "redis",
+      "address": "127.0.0.1:6380",
+      "pools": {
+        "default": {
+          "addresses": ["127.0.0.1:6379"]
+        }
+      },
+      "routing": "normal"
+    }
+  ]
+}

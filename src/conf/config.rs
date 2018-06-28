@@ -58,7 +58,7 @@ impl Configuration {
         // Now load in any configuration files we can find.
         s.merge(File::with_name("config/synchrotron").required(false))?;
 
-        let env = env::var("ENV").unwrap_or("development".into());
+        let env = env::var("ENV").unwrap_or("dev".into());
         s.merge(File::with_name(&format!("config/synchrotron.{}", env)).required(false))?;
         s.merge(File::with_name("config/synchrotron.local").required(false))?;
 

@@ -7,3 +7,7 @@ profile.svg
 /target/
 synchrotron-test/target
 **/*.rs.bk
+
+# Config stuff.
+config/synchrotron.dev*
+config/synchrotron.local*
