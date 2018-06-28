@@ -5,4 +5,5 @@ profile.svg
 
 # Normal Rust-y stuff.
 /target/
+synchrotron-test/target
 **/*.rs.bk
