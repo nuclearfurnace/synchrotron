@@ -41,9 +41,9 @@ extern crate tokio_io;
 #[macro_use]
 extern crate futures;
 extern crate net2;
-extern crate rs_futures_spmc;
+extern crate futures_turnstyle;
 
-use rs_futures_spmc::channel;
+use futures_turnstyle::Turnstyle;
 use std::{error::Error, process, thread};
 use tokio::{
     executor::thread_pool, prelude::*, runtime::{self, TaskExecutor},
@@ -87,7 +87,8 @@ fn run() -> i32 {
     // We also have this accessory thread because trying to wrap the channel as a stream
     // was fraught with pain and this is much simpler.  C'est la vie.
     let signals = chan_signal::notify(&[Signal::USR1, Signal::INT]);
-    let (close_tx, close_rx) = channel::<()>(1);
+    let turnstyle = Turnstyle::new();
+    let closer = turnstyle.join().shared();
     thread::spawn(move || {
         loop {
             let signal = signals.recv().unwrap();
@@ -97,7 +98,7 @@ fn run() -> i32 {
                 Signal::USR1 => {}, // signal to spawn new process
                 Signal::INT => {
                     // signal to close this process
-                    let _ = close_tx.send(()).wait();
+                    turnstyle.turn();
                     break;
                 },
                 _ => {}, // we don't care about the rest
@@ -126,7 +127,7 @@ fn run() -> i32 {
     let mut threadpool_builder = thread_pool::Builder::new();
     threadpool_builder.name_prefix("synchrotron-worker-").pool_size(4);
 
-    let mut runtime = runtime::Builder::new()
+    let runtime = runtime::Builder::new()
         .threadpool_builder(threadpool_builder)
         .build()
         .expect("failed to create tokio runtime");
@@ -138,7 +139,7 @@ fn run() -> i32 {
         .listeners
         .into_iter()
         .map(|x| {
-            let close = close_rx.clone();
+            let close = closer.clone();
             let config = x.clone();
             let reactor2 = reactor.clone();
             let executor2 = executor.clone();
@@ -180,7 +181,7 @@ fn run() -> i32 {
     return 0;
 }
 
-fn launch_stats(runtime: TaskExecutor) {
+fn launch_stats(_runtime: TaskExecutor) {
     // Touch the global registry for the first time to initialize it.
 }
 

@@ -22,11 +22,11 @@ use backend::{
 };
 use conf::ListenerConfiguration;
 use futures::{
-    future::{join_all, lazy, ok}, prelude::*,
+    future::{join_all, lazy, ok, Shared}, prelude::*,
 };
+use futures_turnstyle::Waiter;
 use net2::TcpBuilder;
 use protocol::redis;
-use rs_futures_spmc::Receiver;
 use std::{
     collections::HashMap, io::{Error, ErrorKind}, net::SocketAddr, sync::Arc, time::Instant,
 };
@@ -42,7 +42,7 @@ type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 's
 /// spawn a task to process all of the messages from that client until the client disconnects or
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
-    reactor: Handle, executor: TaskExecutor, config: ListenerConfiguration, close: Receiver<()>,
+    reactor: Handle, executor: TaskExecutor, config: ListenerConfiguration, close: Shared<Waiter>,
 ) -> Result<GenericRuntimeFuture, Error> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
@@ -61,7 +61,7 @@ pub fn from_config(
         info!("[listener] starting listener '{}'...", listen_address);
         ok(())
     }).and_then(|_| handler)
-        .select2(close.into_future())
+        .select2(close)
         .then(move |_| {
             info!("[pool] shutting down listener '{}'", listen_address2);
             ok(())

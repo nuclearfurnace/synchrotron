@@ -54,6 +54,7 @@ impl Configuration {
         s.set_default("logging.level", "info")?;
         // how tf do we make this work?
         // s.set_default("listeners", Vec::<ListenerConfiguration>::new())?;
+        s.set_default("stats_port", 16161)?;
 
         // Now load in any configuration files we can find.
         s.merge(File::with_name("config/synchrotron").required(false))?;
