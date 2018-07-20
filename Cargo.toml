@@ -14,6 +14,7 @@ lto = true
 opt-level = 3
 
 [dependencies]
+lazy_static = "^1.0"
 log = "^0.4"
 slog-async = "^2.2"
 slog-scope = "^4.0"
@@ -35,6 +36,7 @@ itoa = "^0.4"
 rand = "^0.5"
 rust-crypto = "^0.2"
 pruefung = "^0.2"
+hotmic = { path = "../hotmic" }
 
 [dependencies.slog]
 version = "^2.2"

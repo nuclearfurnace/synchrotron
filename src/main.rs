@@ -23,6 +23,9 @@
 #![feature(duration_as_u128)]
 #![recursion_limit = "1024"]
 
+#[macro_use]
+extern crate lazy_static;
+
 extern crate config;
 extern crate crypto;
 extern crate pruefung;
@@ -43,11 +46,14 @@ extern crate futures;
 extern crate net2;
 extern crate futures_turnstyle;
 
-use futures_turnstyle::Turnstyle;
+use futures_turnstyle::{Turnstyle, Waiter};
 use std::{error::Error, process, thread};
+use std::net::Shutdown;
 use tokio::{
     executor::thread_pool, prelude::*, runtime::{self, TaskExecutor},
+    net::TcpListener, io
 };
+use futures::future::{ok, Shared};
 
 #[macro_use]
 extern crate log;
@@ -64,6 +70,7 @@ extern crate btoi;
 extern crate bytes;
 extern crate itoa;
 extern crate rand;
+extern crate hotmic;
 
 #[cfg(test)]
 extern crate test;
@@ -76,6 +83,7 @@ mod conf;
 mod listener;
 mod protocol;
 mod util;
+mod metrics;
 
 use conf::{Configuration, LevelExt};
 
@@ -173,7 +181,7 @@ fn run() -> i32 {
     }
 
     // Launch our stats port.
-    launch_stats(executor);
+    launch_stats(&executor, closer.clone());
 
     info!("[core] synchrotron running");
 
@@ -181,8 +189,45 @@ fn run() -> i32 {
     return 0;
 }
 
-fn launch_stats(_runtime: TaskExecutor) {
+fn launch_stats(executor: &TaskExecutor, close: Shared<Waiter>) {
     // Touch the global registry for the first time to initialize it.
+    let facade = metrics::get_facade();
+
+    let addr = "127.0.0.1:9999".parse().unwrap();
+    let listener = TcpListener::bind(&addr).unwrap();
+    let processor = listener.incoming()
+        .map_err(|e| eprintln!("failed to accept stats connection: {:?}", e))
+        .inspect(|_| debug!("got new stats connection"))
+        .for_each(move |socket| {
+            facade.get_snapshot().into_future()
+                .map_err(|e| eprintln!("failed to get metrics snapshot: {:?}", e))
+                .and_then(|snapshot| {
+                    let mut output = "{".to_owned();
+
+                    for (stat, value) in snapshot.signed_data {
+                        output = output + &format!("\"{}\":{},", stat, value);
+                    }
+                    for (stat, value) in snapshot.unsigned_data {
+                        output = output + &format!("\"{}\":{},", stat, value);
+                    }
+                    if output.len() > 1 {
+                        output.pop();
+                    }
+                    output += "}";
+
+                    ok(output)
+                })
+                .and_then(|buf| io::write_all(socket, buf.into_bytes()).map_err(|_| ()))
+                .and_then(|(c, _)| {
+                    c.shutdown(Shutdown::Both).unwrap();
+                    ok(())
+                })
+        })
+        .select2(close)
+        .map(|_| ())
+        .map_err(|_| ());
+
+    executor.spawn(processor);
 }
 
 fn main() {

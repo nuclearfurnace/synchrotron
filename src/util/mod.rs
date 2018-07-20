@@ -51,6 +51,13 @@ pub trait StreamExt: Stream {
     }
 }
 
+/// Calculates the size of bytes for all items in a batch.
+pub fn get_batch_size<T>(batch: &Vec<T>) -> usize
+    where T: Sizable
+{
+    batch.into_iter().fold(0, |acc, x| acc + x.size())
+}
+
 /// Flattens and orders a list of messages.
 ///
 /// Results for pipelined requests come back in the form of Vec<(u64, T)>, where each tuple
@@ -66,4 +73,9 @@ where
     let mut items = msgs.into_iter().flatten().collect::<Vec<_>>();
     items.sort_by(|(a, _), (b, _)| a.cmp(b));
     items.into_iter().map(|(_, item)| item).collect()
+}
+
+/// A type that can report back its own size in bytes.
+pub trait Sizable {
+    fn size(&self) -> usize;
 }

@@ -95,13 +95,12 @@ pub fn generate_batched_redis_writes(
         }
 
         let mut backend = pool.get_backend_by_index(backend_idx);
-        let msg_indexes2 = msg_indexes.clone();
 
         let (response_tx, response_rx) = oneshot::channel();
         let response = backend
             .submit(msgs)
-            .and_then(|r| result(r).or_else(move |err| ok(to_vectored_error_response(err, msg_indexes2))))
             .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (RRCE)"))
+            .and_then(|r| result(r))
             .or_else(move |err| ok(to_vectored_error_response(err, msg_indexes)))
             .and_then(|r| response_tx.send(r))
             .map(|_| ())

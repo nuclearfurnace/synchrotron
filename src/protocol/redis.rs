@@ -22,6 +22,7 @@ use bytes::{BufMut, BytesMut};
 use futures::prelude::*;
 use std::{error::Error, io, mem};
 use tokio::io::{write_all, AsyncRead, AsyncWrite};
+use util::Sizable;
 
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
 const REDIS_COMMAND_STATUS: u8 = '+' as u8;
@@ -122,6 +123,21 @@ impl RedisMessage {
             RedisMessage::Data(buf, _) => buf,
             RedisMessage::Bulk(buf, _) => buf,
             RedisMessage::Raw(buf) => buf,
+        }
+    }
+}
+
+impl Sizable for RedisMessage {
+    fn size(&self) -> usize {
+        match self {
+            RedisMessage::Null => *&REDIS_NULL_BUF[..].len(),
+            RedisMessage::OK => *&REDIS_OK_BUF[..].len(),
+            RedisMessage::Status(buf, _) => buf.len(),
+            RedisMessage::Error(buf, _) => buf.len(),
+            RedisMessage::Integer(buf, _) => buf.len(),
+            RedisMessage::Data(buf, _) => buf.len(),
+            RedisMessage::Bulk(buf, _) => buf.len(),
+            RedisMessage::Raw(buf) => buf.len(),
         }
     }
 }

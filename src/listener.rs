@@ -25,14 +25,17 @@ use futures::{
     future::{join_all, lazy, ok, Shared}, prelude::*,
 };
 use futures_turnstyle::Waiter;
+use metrics;
+use metrics::Metrics;
 use net2::TcpBuilder;
 use protocol::redis;
 use std::{
-    collections::HashMap, io::{Error, ErrorKind}, net::SocketAddr, sync::Arc, time::Instant,
+    collections::HashMap, io::{Error, ErrorKind}, net::SocketAddr, sync::Arc,
+    time::Instant,
 };
 use tokio::{io, net::TcpListener, reactor::Handle, runtime::TaskExecutor};
 use tokio_io::AsyncRead;
-use util::{flatten_ordered_messages, StreamExt};
+use util::{flatten_ordered_messages, get_batch_size, StreamExt};
 
 type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 'static>;
 
@@ -201,42 +204,59 @@ fn redis_normal_handler(
         .incoming()
         .map_err(|e| error!("[pool] accept failed: {:?}", e))
         .for_each(move |socket| {
+            let mut metrics = metrics::get_sink();
+
             let client_addr = socket.peer_addr().unwrap();
-            info!("[client] connection established -> {:?}", client_addr);
+            debug!("[client] connection established -> {:?}", client_addr);
+            metrics.increment(Metrics::ClientsConnected);
 
             let default = default_pool.clone();
 
             let (client_rx, client_tx) = socket.split();
             let client_proto = redis::read_messages_stream(client_rx)
                 .map_err(|e| {
+                    let mut ms = metrics::get_sink();
+                    ms.decrement(Metrics::ClientsConnected);
                     error!("[client] caught error while reading from client: {:?}", e);
                 })
                 .batch(128)
-                .fold((client_tx, client_addr, 0), move |(tx, addr, msg_count), msgs| {
-                    let start = Instant::now();
+                .fold((client_tx, client_addr, metrics, 0), move |(tx, addr, mut ms, msg_count), msgs| {
+                    let batch_start = Instant::now();
                     trace!("[client] [{:?}] got batch of {} messages!", addr, msgs.len());
 
+                    let batch_size_bytes = get_batch_size(&msgs);
+                    ms.update_count(Metrics::ServerBytesReceived, batch_size_bytes as i64);
+
                     let new_msg_count = msg_count + msgs.len();
+                    ms.update_count(Metrics::ServerMessagesReceived, msgs.len() as i64);
 
                     join_all(generate_batched_redis_writes(&default, msgs))
                         .and_then(|results| ok(flatten_ordered_messages(results)))
                         .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron error (NRJE)"))
-                        .and_then(move |items| redis::write_messages(tx, items))
-                        .map(move |(w, _n)| {
-                            let delta = start.elapsed().as_micros();
+                        .and_then(move |items| {
+                            ms.update_count(Metrics::ServerMessagesSent, items.len() as i64);
+
+                            redis::write_messages(tx, items)
+                                .map(|(w, n)| (w, n, ms))
+                        })
+                        .map(move |(w, n, mut ms)| {
+                            let batch_finished = Instant::now();
+
                             debug!(
-                                "[client] [{:?}] sent batch of responses to client; took {}μs",
-                                addr, delta
+                                "[client] [{:?}] sent batch of responses to client",
+                                addr,
                             );
-                            (w, addr, new_msg_count)
+
+                            ms.update_count(Metrics::ServerBytesSent, n as i64);
+                            ms.update_latency(Metrics::ClientMessageBatchServiced, batch_start, batch_finished);
+
+                            (w, addr, ms, new_msg_count)
                         })
                         .map_err(|err| error!("[client] caught error while handling request: {:?}", err))
                 })
-                .map(|(_, addr, msg_count)| {
-                    info!(
-                        "[client] connection complete -> {:?}; processed {} messages",
-                        addr, msg_count
-                    );
+                .map(|(_, addr, mut ms, msg_count)| {
+                    ms.decrement(Metrics::ClientsConnected);
+                    debug!("[client] connection complete -> {:?}; processed {} messages", addr, msg_count);
                     ()
                 });
 
