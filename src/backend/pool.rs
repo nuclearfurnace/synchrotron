@@ -20,10 +20,10 @@
 use super::{
     distributor::{BackendDescriptor, Distributor}, hasher::KeyHasher,
 };
-use backend::sync::{RequestTransformer, TaskBackend, TaskBackendParticipant};
+use backend::sync::{RequestTransformer, TaskBackend};
 use futures::prelude::*;
 use std::{io::Error, net::SocketAddr};
-use tokio::{net::TcpStream, runtime::TaskExecutor};
+use tokio::{net::TcpStream};
 
 pub struct BackendPool<T>
 where
@@ -42,14 +42,14 @@ where
     T::Executor: Future<Item = (TcpStream, T::Response), Error = Error> + Send + 'static,
 {
     pub fn new(
-        executor: TaskExecutor, addresses: Vec<SocketAddr>, transformer: T, mut dist: Box<Distributor + Send + Sync>,
+        addresses: Vec<SocketAddr>, transformer: T, mut dist: Box<Distributor + Send + Sync>,
         hasher: Box<KeyHasher + Send + Sync>,
     ) -> BackendPool<T> {
         // Assemble the list of backends and backend descriptors.
         let mut backends = vec![];
         let mut descriptors = vec![];
         for address in &addresses {
-            let (backend, runner) = TaskBackend::new(executor.clone(), address.clone(), transformer.clone(), 1);
+            let (backend, runner) = TaskBackend::new(address.clone(), transformer.clone(), 16);
             backends.push(backend);
 
             // eventually, we'll populate this with weight, etc, so that
@@ -58,7 +58,7 @@ where
             descriptors.push(descriptor);
 
             // Spawn our backend runner.
-            executor.spawn(runner);
+            tokio::spawn(runner);
         }
 
         // Seed the distributor.
@@ -76,9 +76,9 @@ where
         self.distributor.choose(key_id)
     }
 
-    pub fn get_backend_by_index(&self, idx: usize) -> TaskBackendParticipant<T> {
+    pub fn get_backend_by_index(&self, idx: usize) -> &TaskBackend<T> {
         match self.backends.get(idx) {
-            Some(backend) => backend.subscribe(),
+            Some(backend) => backend,
             None => unreachable!("incorrect backend idx"),
         }
     }

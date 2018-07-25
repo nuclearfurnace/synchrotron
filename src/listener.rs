@@ -33,7 +33,7 @@ use std::{
     collections::HashMap, io::{Error, ErrorKind}, net::SocketAddr, sync::Arc,
     time::Instant,
 };
-use tokio::{io, net::TcpListener, reactor::Handle, runtime::TaskExecutor};
+use tokio::{io, net::TcpListener, reactor};
 use tokio_io::AsyncRead;
 use util::{flatten_ordered_messages, get_batch_size, StreamExt};
 
@@ -45,16 +45,16 @@ type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 's
 /// spawn a task to process all of the messages from that client until the client disconnects or
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
-    reactor: Handle, executor: TaskExecutor, config: ListenerConfiguration, close: Shared<Waiter>,
+    config: ListenerConfiguration, close: Shared<Waiter>,
 ) -> Result<GenericRuntimeFuture, Error> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
-    let listener = get_listener(&listen_address, &reactor).expect("failed to create the TCP listener");
+    let listener = get_listener(&listen_address).expect("failed to create the TCP listener");
 
     // Get the correct handler based on protocol.
     let protocol = config.protocol.to_lowercase();
     let handler = match protocol.as_str() {
-        "redis" => redis_from_config(executor, config, listener)?,
+        "redis" => redis_from_config(config, listener)?,
         s => panic!("unknown protocol type: {}", s),
     };
 
@@ -73,7 +73,7 @@ pub fn from_config(
 }
 
 fn redis_from_config(
-    executor: TaskExecutor, config: ListenerConfiguration, listener: TcpListener,
+    config: ListenerConfiguration, listener: TcpListener,
 ) -> Result<GenericRuntimeFuture, Error> {
     // Gather up all of the backend pools.
     let mut pools = HashMap::new();
@@ -104,7 +104,6 @@ fn redis_from_config(
         let transformer = RedisRequestTransformer::new();
 
         let pool = Arc::new(BackendPool::new(
-            executor.clone(),
             pool_config.addresses,
             transformer,
             distributor,
@@ -116,13 +115,13 @@ fn redis_from_config(
     // Figure out what sort of routing we're doing so we can grab the right handler.
     let routing_type = config.routing.to_lowercase();
     match routing_type.as_str() {
-        "warmup" => redis_warmup_handler(executor, listener, pools),
-        _ => redis_normal_handler(executor, listener, pools),
+        "warmup" => redis_warmup_handler(listener, pools),
+        _ => redis_normal_handler(listener, pools),
     }
 }
 
 fn redis_warmup_handler(
-    executor: TaskExecutor, listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
+    listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
 ) -> Result<GenericRuntimeFuture, Error> {
     let warm_pool = pools
         .get("warm")
@@ -149,7 +148,6 @@ fn redis_warmup_handler(
 
             let cold = cold_pool.clone();
             let warm = warm_pool.clone();
-            let executor2 = executor.clone();
 
             let (client_rx, client_tx) = socket.split();
             let client_proto = redis::read_messages_stream(client_rx)
@@ -168,7 +166,7 @@ fn redis_warmup_handler(
                         .map_err(|err| error!("[client] error while sending warming ops to cold pool: {:?}", err))
                         .map(|_| ());
 
-                    executor2.spawn(cold_handler);
+                    tokio::spawn(cold_handler);
 
                     // Now run our normal writes.
                     let warm_handler = join_all(generate_batched_redis_writes(&warm, msgs))
@@ -182,7 +180,7 @@ fn redis_warmup_handler(
                 })
                 .map(|_| ());
 
-            executor.spawn(client_proto);
+            tokio::spawn(client_proto);
             ok(())
         });
 
@@ -190,7 +188,7 @@ fn redis_warmup_handler(
 }
 
 fn redis_normal_handler(
-    executor: TaskExecutor, listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
+    listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
 ) -> Result<GenericRuntimeFuture, Error> {
     let default_pool = pools
         .get("default")
@@ -260,14 +258,14 @@ fn redis_normal_handler(
                     ()
                 });
 
-            executor.spawn(client_proto);
+            tokio::spawn(client_proto);
             ok(())
         });
 
     Ok(Box::new(handler))
 }
 
-fn get_listener(addr_str: &String, handle: &Handle) -> io::Result<TcpListener> {
+fn get_listener(addr_str: &String) -> io::Result<TcpListener> {
     let addr = addr_str.parse().unwrap();
     let builder = match addr {
         SocketAddr::V4(_) => TcpBuilder::new_v4()?,
@@ -276,7 +274,7 @@ fn get_listener(addr_str: &String, handle: &Handle) -> io::Result<TcpListener> {
     configure_builder(&builder)?;
     builder.reuse_address(true)?;
     builder.bind(addr)?;
-    builder.listen(1024).and_then(|l| TcpListener::from_std(l, handle))
+    builder.listen(1024).and_then(|l| TcpListener::from_std(l, &reactor::Handle::current()))
 }
 
 #[cfg(unix)]

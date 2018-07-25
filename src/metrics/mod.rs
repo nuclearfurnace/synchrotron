@@ -10,6 +10,8 @@ pub enum Metrics {
     ServerMessagesReceived,
     ServerMessagesSent,
     ClientMessageBatchServiced,
+    GenerateBatchedRedisWrite,
+    BackendNewConnections,
 }
 
 impl fmt::Display for Metrics {
@@ -21,6 +23,8 @@ impl fmt::Display for Metrics {
             Metrics::ServerMessagesReceived => write!(f, "server_msgs_recv"),
             Metrics::ServerMessagesSent => write!(f, "server_msgs_sent"),
             Metrics::ClientMessageBatchServiced => write!(f, "client_msg_batch_serviced"),
+            Metrics::GenerateBatchedRedisWrite => write!(f, "generate_batched_redis_write"),
+            Metrics::BackendNewConnections => write!(f, "backend_new_connections"),
         }
     }
 }
@@ -105,6 +109,9 @@ fn run_metrics_loop(mut receiver: Receiver<Metrics>) {
     receiver.add_facet(Facet::Count(Metrics::ServerBytesReceived));
     receiver.add_facet(Facet::TimingPercentile(Metrics::ClientMessageBatchServiced));
     receiver.add_facet(Facet::Count(Metrics::ClientMessageBatchServiced));
+    receiver.add_facet(Facet::TimingPercentile(Metrics::GenerateBatchedRedisWrite));
+    receiver.add_facet(Facet::Count(Metrics::GenerateBatchedRedisWrite));
+    receiver.add_facet(Facet::Count(Metrics::BackendNewConnections));
 
     receiver.run();
 }

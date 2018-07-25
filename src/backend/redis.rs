@@ -26,10 +26,12 @@ use futures::{
 };
 use itoa;
 use protocol::redis::{self, RedisMessage, RedisOrderedMessages};
-use std::{
-    collections::HashMap, io::{Error, ErrorKind},
-};
+use std::io::{Error, ErrorKind};
 use tokio::{self, net::TcpStream};
+use fnv::FnvHashMap;
+use std::time::Instant;
+use metrics;
+use metrics::Metrics;
 
 #[derive(Clone)]
 pub struct RedisRequestTransformer;
@@ -45,18 +47,9 @@ impl RequestTransformer for RedisRequestTransformer {
 
     fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor {
         let inner = stream
-            .and_then(move |server| {
-                debug!("[redis backend] about to write batched messages to backend");
-                redis::write_ordered_messages(server, req)
-            })
-            .and_then(move |(server, msgs, _n)| {
-                debug!("[redis backend] now reading the responses from the backend");
-                redis::read_messages(server, msgs)
-            })
-            .and_then(move |(server, _n, resps)| {
-                debug!("[redis backend] assembling backend responses to send to client");
-                ok((server, resps))
-            });
+            .and_then(move |server| redis::write_ordered_messages(server, req))
+            .and_then(move |(server, msgs, _n)| redis::read_messages(server, msgs))
+            .and_then(move |(server, _n, resps)| ok((server, resps)));
         Box::new(inner)
     }
 }
@@ -64,8 +57,10 @@ impl RequestTransformer for RedisRequestTransformer {
 pub fn generate_batched_redis_writes(
     pool: &BackendPool<RedisRequestTransformer>, mut messages: Vec<RedisMessage>,
 ) -> Vec<oneshot::Receiver<RedisOrderedMessages>> {
+    let start = Instant::now();
+
     // Group all of our messages by their target backend index.
-    let mut assigned_msgs = HashMap::new();
+    let mut assigned_msgs = FnvHashMap::default();
     let mut responses = Vec::with_capacity(messages.len());
 
     let mut i = 0;
@@ -94,7 +89,7 @@ pub fn generate_batched_redis_writes(
             msg_indexes.push(*id);
         }
 
-        let mut backend = pool.get_backend_by_index(backend_idx);
+        let backend = pool.get_backend_by_index(backend_idx);
 
         let (response_tx, response_rx) = oneshot::channel();
         let response = backend
@@ -110,6 +105,10 @@ pub fn generate_batched_redis_writes(
 
         responses.push(response_rx);
     }
+
+    let end = Instant::now();
+    let mut ms = metrics::get_sink();
+    ms.update_latency(Metrics::GenerateBatchedRedisWrite, start, end);
 
     responses
 }
@@ -153,7 +152,7 @@ fn redis_fragment_multi_message(
                             // assigning it to a backend and keeping track of its internal order.
                             //
                             // backend ID -> vector<(intramessage index, message)>
-                            let mut batches = HashMap::new();
+                            let mut batches = FnvHashMap::default();
 
                             let mut i = 0;
                             while args.len() > 0 {
@@ -172,7 +171,7 @@ fn redis_fragment_multi_message(
                             // Now transform these into a single command per backend.
                             let batches_len = batches.len();
                             let (batch_tx, batch_rx) = mpsc::channel(batches_len);
-                            let mut backend_order_map = HashMap::new();
+                            let mut backend_order_map = FnvHashMap::default();
 
                             for (backend_idx, msgs) in batches {
                                 let mut indexes = Vec::new();
@@ -262,7 +261,7 @@ fn redis_fragment_multi_message(
                             // Group all of the arguments by the backend (specifically the backend
                             // ID) that the key belongs to.  Here we're taking the key and the
                             // value each iteration.
-                            let mut batches = HashMap::new();
+                            let mut batches = FnvHashMap::default();
 
                             let mut i = 0;
                             while args.len() > 1 {
@@ -282,7 +281,7 @@ fn redis_fragment_multi_message(
                             // Now transform these into a single command per backend.
                             let batches_len = batches.len();
                             let (batch_tx, batch_rx) = mpsc::channel(batches_len);
-                            let mut backend_order_map = HashMap::new();
+                            let mut backend_order_map = FnvHashMap::default();
 
                             for (backend_idx, msgs) in batches {
                                 let mut indexes = Vec::new();

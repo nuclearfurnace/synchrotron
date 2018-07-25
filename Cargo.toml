@@ -36,7 +36,8 @@ itoa = "^0.4"
 rand = "^0.5"
 rust-crypto = "^0.2"
 pruefung = "^0.2"
-hotmic = { path = "../hotmic" }
+fnv = "^1.0"
+hotmic = "^0.2"
 
 [dependencies.slog]
 version = "^2.2"

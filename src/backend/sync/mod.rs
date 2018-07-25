@@ -23,7 +23,7 @@ use tokio::net::{ConnectFuture, TcpStream};
 
 mod task;
 
-pub use self::task::{TaskBackend, TaskBackendConnection, TaskBackendParticipant};
+pub use self::task::{TaskBackend, TaskBackendConnection};
 
 /// An existing or pending TcpStream.
 pub type TcpStreamFuture = Either<FutureResult<TcpStream, Error>, ConnectFuture>;

@@ -21,6 +21,7 @@
 #![feature(iterator_flatten)]
 #![feature(associated_type_defaults)]
 #![feature(duration_as_u128)]
+#![feature(extern_prelude)]
 #![recursion_limit = "1024"]
 
 #[macro_use]
@@ -29,6 +30,7 @@ extern crate lazy_static;
 extern crate config;
 extern crate crypto;
 extern crate pruefung;
+extern crate fnv;
 extern crate serde;
 extern crate serde_json;
 #[macro_use]
@@ -50,10 +52,10 @@ use futures_turnstyle::{Turnstyle, Waiter};
 use std::{error::Error, process, thread};
 use std::net::Shutdown;
 use tokio::{
-    executor::thread_pool, prelude::*, runtime::{self, TaskExecutor},
+    executor::thread_pool, prelude::*, runtime::self,
     net::TcpListener, io
 };
-use futures::future::{ok, Shared};
+use futures::future::{lazy, ok, Shared};
 
 #[macro_use]
 extern crate log;
@@ -120,11 +122,11 @@ fn run() -> i32 {
     // which is also level filtered.  As well, we've replaced the global std logger
     // and pulled in helper macros that correspond to the various logging levels.
     let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::CompactFormat::new(decorator).build().fuse();
+    let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
     let logger = slog::Logger::root(
         slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
-        slog_o!(),
+        slog_o!("version" => env!("GIT_HASH")),
     );
 
     let _scope_guard = slog_scope::set_global_logger(logger);
@@ -135,53 +137,54 @@ fn run() -> i32 {
     let mut threadpool_builder = thread_pool::Builder::new();
     threadpool_builder.name_prefix("synchrotron-worker-").pool_size(4);
 
-    let runtime = runtime::Builder::new()
+    let mut runtime = runtime::Builder::new()
         .threadpool_builder(threadpool_builder)
         .build()
         .expect("failed to create tokio runtime");
 
-    let reactor = runtime.reactor().clone();
-    let executor = runtime.executor().clone();
+    let initial = lazy(move || {
+        let listeners = configuration
+            .listeners
+            .into_iter()
+            .map(|x| {
+                let close = closer.clone();
+                let config = x.clone();
 
-    let listeners = configuration
-        .listeners
-        .into_iter()
-        .map(|x| {
-            let close = closer.clone();
-            let config = x.clone();
-            let reactor2 = reactor.clone();
-            let executor2 = executor.clone();
+                listener::from_config(config, close)
+            })
+            .collect::<Vec<_>>();
 
-            listener::from_config(reactor2, executor2, config, close)
-        })
-        .collect::<Vec<_>>();
-
-    let mut errors = Vec::new();
-    for listener in &listeners {
-        let result = listener.as_ref();
-        if result.is_err() {
-            let error = result.err().unwrap();
-            errors.push(error.description().to_owned());
-        }
-    }
-
-    if errors.len() > 0 {
-        error!("[core] encountered errors while spawning listeners:");
-
-        for error in errors {
-            error!("[core] - {}", error);
+        let mut errors = Vec::new();
+        for listener in &listeners {
+            let result = listener.as_ref();
+            if result.is_err() {
+                let error = result.err().unwrap();
+                errors.push(error.description().to_owned());
+            }
         }
 
-        return 1;
-    }
+        if errors.len() > 0 {
+            error!("[core] encountered errors while spawning listeners:");
 
-    // Launch all these listeners into the runtime.
-    for listener in listeners {
-        executor.spawn(listener.unwrap());
-    }
+            for error in errors {
+                error!("[core] - {}", error);
+            }
 
-    // Launch our stats port.
-    launch_stats(&executor, closer.clone());
+            return Err(());
+        }
+
+        // Launch all these listeners into the runtime.
+        for listener in listeners {
+            tokio::spawn(listener.unwrap());
+        }
+
+        // Launch our stats port.
+        launch_stats(closer.clone());
+
+        Ok(())
+    });
+
+    runtime.spawn(initial);
 
     info!("[core] synchrotron running");
 
@@ -189,7 +192,7 @@ fn run() -> i32 {
     return 0;
 }
 
-fn launch_stats(executor: &TaskExecutor, close: Shared<Waiter>) {
+fn launch_stats(close: Shared<Waiter>) {
     // Touch the global registry for the first time to initialize it.
     let facade = metrics::get_facade();
 
@@ -227,7 +230,7 @@ fn launch_stats(executor: &TaskExecutor, close: Shared<Waiter>) {
         .map(|_| ())
         .map_err(|_| ());
 
-    executor.spawn(processor);
+    tokio::spawn(processor);
 }
 
 fn main() {
