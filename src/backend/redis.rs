@@ -17,35 +17,58 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use backend::{
-    pool::BackendPool, sync::{RequestTransformer, TcpStreamFuture},
-};
+use backend::processor::{ProcessorError, RequestProcessor, TcpStreamFuture};
 use bytes::BytesMut;
-use futures::{
-    future::{ok, result}, prelude::*, sync::{mpsc, oneshot},
-};
+use common::OrderedMessages;
+use futures::{future::ok, prelude::*};
 use itoa;
-use protocol::redis::{self, RedisMessage, RedisOrderedMessages};
-use std::io::{Error, ErrorKind};
-use tokio::{self, net::TcpStream};
-use fnv::FnvHashMap;
-use std::time::Instant;
-use metrics;
-use metrics::Metrics;
+use protocol::{
+    self,
+    redis::{self, RedisMessage, RedisMessageSink, RedisMessageStream},
+};
+use std::{collections::HashMap, error::Error, io};
+use tokio::{
+    io::{AsyncRead, ReadHalf, WriteHalf},
+    net::TcpStream,
+};
 
 #[derive(Clone)]
-pub struct RedisRequestTransformer;
+pub struct RedisRequestProcessor;
 
-impl RedisRequestTransformer {
-    pub fn new() -> RedisRequestTransformer { RedisRequestTransformer {} }
+impl RedisRequestProcessor {
+    pub fn new() -> RedisRequestProcessor { RedisRequestProcessor {} }
 }
 
-impl RequestTransformer for RedisRequestTransformer {
-    type Executor = Box<Future<Item = (TcpStream, Self::Response), Error = Error> + Send>;
-    type Response = RedisOrderedMessages;
-    type Request = RedisOrderedMessages;
+impl RequestProcessor for RedisRequestProcessor {
+    type ClientReader = RedisMessageStream<ReadHalf<TcpStream>>;
+    type ClientWriter = RedisMessageSink<WriteHalf<TcpStream>>;
+    type Future = Box<Future<Item = (TcpStream, OrderedMessages<Self::Message>), Error = io::Error> + Send>;
+    type Message = RedisMessage;
 
-    fn transform(&self, req: Self::Request, stream: TcpStreamFuture) -> Self::Executor {
+    fn is_fragmented(&self, msg: &Self::Message) -> bool { redis_is_multi_message(msg) }
+
+    fn get_fragments(&self, msg: Self::Message) -> Result<Vec<Self::Message>, ProcessorError> {
+        redis_fragment_message(msg)
+    }
+
+    fn defragment_messages(
+        &self, msgs: OrderedMessages<Self::Message>, ops: HashMap<u64, Self::Message>,
+    ) -> Result<OrderedMessages<Self::Message>, ProcessorError> {
+        redis_defragment_messages(msgs, ops)
+    }
+
+    fn get_error_message(&self, e: Box<Error>) -> Self::Message { RedisMessage::from_error(e) }
+
+    fn get_client_streams(&self, client: TcpStream) -> (Self::ClientReader, Self::ClientWriter) {
+        let (client_rx, client_tx) = client.split();
+
+        let rd = protocol::redis::read_messages_stream(client_rx);
+        let wr = protocol::redis::write_messages_sink(client_tx);
+
+        (rd, wr)
+    }
+
+    fn process(&self, req: OrderedMessages<Self::Message>, stream: TcpStreamFuture) -> Self::Future {
         let inner = stream
             .and_then(move |server| redis::write_ordered_messages(server, req))
             .and_then(move |(server, msgs, _n)| redis::read_messages(server, msgs))
@@ -54,63 +77,155 @@ impl RequestTransformer for RedisRequestTransformer {
     }
 }
 
-pub fn generate_batched_redis_writes(
-    pool: &BackendPool<RedisRequestTransformer>, mut messages: Vec<RedisMessage>,
-) -> Vec<oneshot::Receiver<RedisOrderedMessages>> {
-    let start = Instant::now();
-
-    // Group all of our messages by their target backend index.
-    let mut assigned_msgs = FnvHashMap::default();
-    let mut responses = Vec::with_capacity(messages.len());
-
-    let mut i = 0;
-    while messages.len() > 0 {
-        let msg = messages.remove(0);
-        if redis_is_multi_message(&msg) {
-            let response = redis_fragment_multi_message(pool, i, msg);
-            responses.push(response);
-        } else {
-            let backend_idx = {
-                let msg_key = get_message_key(&msg);
-                pool.get_backend_index(msg_key)
+fn redis_fragment_message(msg: RedisMessage) -> Result<Vec<RedisMessage>, ProcessorError> {
+    match msg {
+        RedisMessage::Bulk(_, mut args) => {
+            // Split off the actual command string and figure out what the new command string
+            // will be for our fragments.
+            let cmd = args.remove(0);
+            let cmd_buf = redis_get_data_buffer(&cmd);
+            let new_cmd_buf = match cmd_buf {
+                Some(buf) => {
+                    match buf {
+                        b"mget" => b"get",
+                        b"del" => b"del",
+                        b"mset" => b"set",
+                        x => {
+                            return Err(ProcessorError::FragmentError(format!(
+                                "tried to fragment command '{:?}' but command is not fragmentable!",
+                                x
+                            )))
+                        },
+                    }
+                },
+                None => {
+                    return Err(ProcessorError::FragmentError(format!(
+                        "tried to fragment bulk message with non-data argument in position 0!"
+                    )))
+                },
             };
 
-            let batched_msgs = assigned_msgs.entry(backend_idx).or_insert(Vec::new());
-            batched_msgs.push((i, msg));
-        }
+            let cmd_arg = redis_new_data_buffer(&new_cmd_buf[..]);
 
-        i += 1;
+            // Now do the actual spliting.  Depending on the command, we may take one or two
+            // items.  We build a new bulk message based on the replacement command plus the args
+            // that we peel off.
+            let arg_take_cnt = if new_cmd_buf == b"set" { 2 } else { 1 };
+
+            let mut fragments = Vec::new();
+            fragments.push(cmd);
+            while args.len() > 0 {
+                if args.len() < arg_take_cnt {
+                    return Err(ProcessorError::FragmentError(format!(
+                        "tried to take {} arguments, only {} left!",
+                        arg_take_cnt,
+                        args.len()
+                    )));
+                }
+
+                // This is contorted but we split off the first N arguments, which leaves `args`
+                // with those N and `new_args` with the rest.  We feed those to a function which
+                // builds us our new message, and then finally we replace `args` with `new_args`
+                // so that we can continue on.
+                let new_args = args.split_off(arg_take_cnt);
+                args.insert(0, cmd_arg.clone());
+                let new_bulk = redis_new_bulk_from_args(args);
+                fragments.push(new_bulk);
+
+                args = new_args;
+            }
+
+            Ok(fragments)
+        },
+        x => Ok(vec![x]),
+    }
+}
+
+fn redis_defragment_messages(
+    msgs: OrderedMessages<RedisMessage>, ops: HashMap<u64, RedisMessage>,
+) -> Result<OrderedMessages<RedisMessage>, ProcessorError> {
+    let mut new_msgs = Vec::with_capacity(msgs.len());
+    let mut fragmented_parts = HashMap::new();
+
+    // For each message, if it has a fragment ID of -1, it's standalone, so just store it.  If it
+    // has anything else, it's a fragment, and we need to track it so we can compress it down at
+    // the end.
+    for (id, fragment_id, msg) in msgs {
+        if fragment_id < 0 {
+            new_msgs.push((id, fragment_id, msg));
+        } else {
+            let fragment_batch = fragmented_parts.entry(id).or_insert(Vec::new());
+            fragment_batch.insert(fragment_id as usize, msg);
+        }
     }
 
-    // Now that we have things mapped, create our queues for each backend.
-    for (backend_idx, msgs) in assigned_msgs {
-        let mut msg_indexes = Vec::with_capacity(msgs.len());
-        for (id, _) in &msgs {
-            msg_indexes.push(*id);
+    // Now we build new messages from the fragments.  Go through our ops map to figure out what
+    // sort of message we should be building.
+    for (id, op) in ops {
+        match redis_get_data_buffer(&op) {
+            Some(cmd) => {
+                match cmd {
+                    b"mget" => {
+                        // MGET is straight-forward.  Take all the fragments we got, and create a bulk message.
+                        let fragments = fragmented_parts
+                            .remove(&id)
+                            .ok_or(ProcessorError::DefragmentError(format!("no fragment batch for MGET")))?;
+                        let mut new_buf = redis_new_bulk_buffer(fragments.len());
+                        for fragment in &fragments {
+                            new_buf.unsplit(fragment.get_buf());
+                        }
+
+                        new_msgs.push((id, -1, RedisMessage::Bulk(new_buf, fragments)));
+                    },
+                    b"del" => {
+                        // DEL returns the number of keys it deleted, so we have to tally up the
+                        // integer responses.
+                        let mut keys_deleted = 0;
+                        let fragments = fragmented_parts
+                            .remove(&id)
+                            .ok_or(ProcessorError::DefragmentError(format!("no fragment batch for DEL")))?;
+                        for fragment in &fragments {
+                            match fragment {
+                                RedisMessage::Integer(_, value) => keys_deleted += value,
+                                _ => {
+                                    return Err(ProcessorError::DefragmentError(format!(
+                                        "non-integer response for DEL!"
+                                    )))
+                                },
+                            }
+                        }
+
+                        new_msgs.push((id, -1, RedisMessage::from_integer(keys_deleted)));
+                    },
+                    b"mset" => {
+                        // MSET apparently "can't fail", and supposedly only ever returns OK, so just
+                        // blindly push in an OK message.
+                        new_msgs.push((id, -1, RedisMessage::OK));
+                    },
+                    x => {
+                        return Err(ProcessorError::DefragmentError(format!(
+                            "unaccounted for fragment op: {:?}",
+                            x
+                        )))
+                    },
+                }
+            },
+            None => {
+                return Err(ProcessorError::DefragmentError(format!(
+                    "fragment op was not data message"
+                )))
+            },
         }
-
-        let backend = pool.get_backend_by_index(backend_idx);
-
-        let (response_tx, response_rx) = oneshot::channel();
-        let response = backend
-            .submit(msgs)
-            .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (RRCE)"))
-            .and_then(|r| result(r))
-            .or_else(move |err| ok(to_vectored_error_response(err, msg_indexes)))
-            .and_then(|r| response_tx.send(r))
-            .map(|_| ())
-            .map_err(|_| ());
-
-        tokio::spawn(response);
-
-        responses.push(response_rx);
     }
 
-    let end = Instant::now();
-    let mut ms = metrics::get_sink();
-    ms.update_latency(Metrics::GenerateBatchedRedisWrite, start, end);
+    Ok(new_msgs)
+}
 
-    responses
+fn redis_get_data_buffer(msg: &RedisMessage) -> Option<&[u8]> {
+    match msg {
+        RedisMessage::Data(buf, offset) => Some(redis_clean_data(buf, *offset)),
+        _ => None,
+    }
 }
 
 fn redis_is_multi_message(msg: &RedisMessage) -> bool {
@@ -120,15 +235,14 @@ fn redis_is_multi_message(msg: &RedisMessage) -> bool {
                 0 => false,
                 _ => {
                     let arg = &args[0];
-                    match arg {
-                        RedisMessage::Data(buf, offset) => {
-                            let cmd_key = redis_clean_data(&buf, *offset);
-                            match cmd_key {
+                    match redis_get_data_buffer(arg) {
+                        Some(buf) => {
+                            match buf {
                                 b"mget" | b"mset" | b"del" => true,
                                 _ => false,
                             }
                         },
-                        _ => false,
+                        None => false,
                     }
                 },
             }
@@ -137,229 +251,24 @@ fn redis_is_multi_message(msg: &RedisMessage) -> bool {
     }
 }
 
-fn redis_fragment_multi_message(
-    pool: &BackendPool<RedisRequestTransformer>, id: u64, msg: RedisMessage,
-) -> oneshot::Receiver<RedisOrderedMessages> {
-    match msg {
-        RedisMessage::Bulk(_, mut args) => {
-            let command = args.remove(0);
-            match command {
-                RedisMessage::Data(buf, offset) => {
-                    let cmd_str = redis_clean_data(&buf, offset);
-                    match cmd_str {
-                        b"mget" | b"del" => {
-                            // We pull out one argument at a time for each possible fragment,
-                            // assigning it to a backend and keeping track of its internal order.
-                            //
-                            // backend ID -> vector<(intramessage index, message)>
-                            let mut batches = FnvHashMap::default();
-
-                            let mut i = 0;
-                            while args.len() > 0 {
-                                let arg = args.remove(0);
-                                let backend_idx = {
-                                    let msg_key = get_message_key(&arg);
-                                    pool.get_backend_index(msg_key)
-                                };
-
-                                let mut batched_msgs = batches.entry(backend_idx).or_insert(Vec::new());
-                                batched_msgs.push((i, arg));
-
-                                i += 1;
-                            }
-
-                            // Now transform these into a single command per backend.
-                            let batches_len = batches.len();
-                            let (batch_tx, batch_rx) = mpsc::channel(batches_len);
-                            let mut backend_order_map = FnvHashMap::default();
-
-                            for (backend_idx, msgs) in batches {
-                                let mut indexes = Vec::new();
-
-                                // Create a new redis message, using the same command name, and
-                                // append all the backend-related keys to it.
-                                let arg_count = msgs.len() + 1;
-                                let mut new_buf = redis_new_bulk_buffer(arg_count);
-                                new_buf.extend_from_slice(&buf);
-
-                                for (id, msg) in msgs {
-                                    indexes.push(id);
-                                    let ids = backend_order_map.entry(backend_idx as u64).or_insert(Vec::new());
-                                    ids.push(id);
-
-                                    new_buf.unsplit(msg.as_resp());
-                                }
-
-                                let msg = RedisMessage::Raw(new_buf);
-                                let wrapped_msg = vec![(backend_idx as u64, msg)];
-                                let tx = batch_tx.clone();
-
-                                // Send this aggregated message to be processed, and forward the
-                                // results to the accumulator channel.
-                                let mut backend = pool.get_backend_by_index(backend_idx);
-                                let indexes2 = indexes.clone();
-                                let work = backend
-                                    .submit(wrapped_msg)
-                                    .and_then(|r| {
-                                        result(r).or_else(move |err| ok(to_vectored_error_response(err, indexes)))
-                                    })
-                                    .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (MGDBE)"))
-                                    .or_else(move |err| ok(to_vectored_error_response(err, indexes2)))
-                                    .and_then(move |r| tx.send(r))
-                                    .map(|_| ())
-                                    .map_err(|_| ());
-
-                                tokio::spawn(work);
-                            }
-
-                            // Now we have a map of backend ID/aggregated message, as well as
-                            // backend ID/intramessage index, which lets us know which order the
-                            // results from a given backend should be sorted to when we assemble
-                            // the final message back to the client.
-                            let (result_tx, result_rx) = oneshot::channel();
-                            let collector = batch_rx
-                                .take(batches_len as u64)
-                                .collect()
-                                .map(move |batches| {
-                                    let mut unfragmented = Vec::new();
-                                    for batch in batches {
-                                        for (backend_idx, msg) in batch {
-                                            let mut batch_order = backend_order_map.remove(&backend_idx).unwrap();
-                                            match msg {
-                                                RedisMessage::Bulk(_, mut results) => {
-                                                    while results.len() > 0 {
-                                                        let result = results.remove(0);
-                                                        let result_id = batch_order.remove(0);
-                                                        unfragmented.push((result_id, result));
-                                                    }
-                                                },
-                                                x => panic!("expected bulk response: {:?}", x),
-                                            }
-                                        }
-                                    }
-
-                                    unfragmented.sort_by(|(a_id, _), (b_id, _)| a_id.cmp(b_id));
-
-                                    let result_count = unfragmented.len();
-                                    let mut new_buf = redis_new_bulk_buffer(result_count);
-
-                                    for (_, fragment) in unfragmented {
-                                        new_buf.unsplit(fragment.as_resp());
-                                    }
-
-                                    let wrapped = vec![(id, RedisMessage::Raw(new_buf))];
-                                    result_tx.send(wrapped)
-                                })
-                                .map(|_| ())
-                                .map_err(|e| error!("multi frag err: {:?}", e));
-
-                            tokio::spawn(collector);
-
-                            result_rx
-                        },
-                        b"mset" => {
-                            // Group all of the arguments by the backend (specifically the backend
-                            // ID) that the key belongs to.  Here we're taking the key and the
-                            // value each iteration.
-                            let mut batches = FnvHashMap::default();
-
-                            let mut i = 0;
-                            while args.len() > 1 {
-                                let karg = args.remove(0);
-                                let varg = args.remove(0);
-                                let backend_idx = {
-                                    let msg_key = get_message_key(&karg);
-                                    pool.get_backend_index(msg_key)
-                                };
-
-                                let mut batched_msgs = batches.entry(backend_idx).or_insert(Vec::new());
-                                batched_msgs.push((i, karg, varg));
-
-                                i += 1;
-                            }
-
-                            // Now transform these into a single command per backend.
-                            let batches_len = batches.len();
-                            let (batch_tx, batch_rx) = mpsc::channel(batches_len);
-                            let mut backend_order_map = FnvHashMap::default();
-
-                            for (backend_idx, msgs) in batches {
-                                let mut indexes = Vec::new();
-
-                                // Create a new redis message, using the same command name, and
-                                // append all the backend-related keys to it.
-                                let arg_count = msgs.len() * 2 + 1;
-                                let mut new_buf = redis_new_bulk_buffer(arg_count);
-                                new_buf.extend_from_slice(&buf);
-
-                                for (id, kmsg, vmsg) in msgs {
-                                    indexes.push(id);
-                                    let ids = backend_order_map.entry(backend_idx as u64).or_insert(Vec::new());
-                                    ids.push(id);
-
-                                    new_buf.unsplit(kmsg.as_resp());
-                                    new_buf.unsplit(vmsg.as_resp());
-                                }
-
-                                let msg = RedisMessage::Raw(new_buf);
-                                let wrapped_msg = vec![(backend_idx as u64, msg)];
-                                let tx = batch_tx.clone();
-
-                                // Send this aggregated message to be processed, and forward the
-                                // results to the accumulator channel.
-                                let mut backend = pool.get_backend_by_index(backend_idx);
-                                let indexes2 = indexes.clone();
-                                let work = backend
-                                    .submit(wrapped_msg)
-                                    .and_then(|r| {
-                                        result(r).or_else(move |err| ok(to_vectored_error_response(err, indexes)))
-                                    })
-                                    .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron failure (MSBE)"))
-                                    .or_else(move |err| ok(to_vectored_error_response(err, indexes2)))
-                                    .and_then(move |r| tx.send(r))
-                                    .map(|_| ())
-                                    .map_err(|_| ());
-
-                                tokio::spawn(work);
-                            }
-
-                            // Now we have a map of backend ID/aggregated message, as well as
-                            // backend ID/intramessage index, which lets us know which order the
-                            // results from a given backend should be sorted to when we assemble
-                            // the final message back to the client.
-                            let (result_tx, result_rx) = oneshot::channel();
-                            let collector = batch_rx
-                                .take(batches_len as u64)
-                                .collect()
-                                .map(move |_| {
-                                    // MSET is different in that it always returns "OK", so really
-                                    // what we care about here is the notion of making sure all our
-                                    // backends have responded with "OK" so we can tell the client
-                                    // that the operation has in fact concluded.  If we've made it
-                                    // far enough that we're here, we've gotten our N responses
-                                    // back, so just map a static "OK" message to the client.
-                                    result_tx.send(vec![(id, RedisMessage::OK)])
-                                })
-                                .map(|_| ())
-                                .map_err(|e| error!("multi frag err: {:?}", e));
-
-                            tokio::spawn(collector);
-
-                            result_rx
-                        },
-                        _ => panic!("unknown message type!"),
-                    }
-                },
-                _ => panic!("can't fragment bulk message with non-data arguments"),
-            }
-        },
-        _ => panic!("can't fragment non-multi message"),
-    }
-}
-
 fn redis_clean_data<'a>(buf: &'a BytesMut, offset: usize) -> &'a [u8] {
+    assert!(buf.len() > 2);
     let val_len = buf.len() - 2;
     &buf[offset..val_len]
+}
+
+fn redis_new_data_buffer(buf: &[u8]) -> RedisMessage {
+    let mut new_buf = BytesMut::new();
+    new_buf.extend_from_slice(b"$");
+
+    let mut cnt_buf = [b'\0'; 20];
+    let n = itoa::write(&mut cnt_buf[..], buf.len()).unwrap();
+    new_buf.extend_from_slice(&cnt_buf[..n]);
+    new_buf.extend_from_slice(b"\r\n");
+    new_buf.extend_from_slice(buf);
+    new_buf.extend_from_slice(b"\r\n");
+
+    RedisMessage::Data(new_buf, 1 + n + 2)
 }
 
 fn redis_new_bulk_buffer(arg_count: usize) -> BytesMut {
@@ -373,70 +282,74 @@ fn redis_new_bulk_buffer(arg_count: usize) -> BytesMut {
     buf
 }
 
-pub fn to_vectored_error_response(err: Error, indexes: Vec<u64>) -> RedisOrderedMessages {
-    let mut msgs = Vec::new();
-    let msg = RedisMessage::from_error(err);
-    for i in indexes {
-        msgs.push((i, msg.clone()));
-    }
-    msgs
-}
+fn redis_new_bulk_from_args(args: Vec<RedisMessage>) -> RedisMessage {
+    let mut buf = redis_new_bulk_buffer(args.len());
+    let mut new_args = Vec::new();
+    for arg in args {
+        let arg_buf = arg.get_buf();
+        buf.unsplit(arg_buf);
 
-fn get_message_key<'a>(msg: &'a RedisMessage) -> &'a [u8] {
-    match msg {
-        RedisMessage::Bulk(_, ref args) => {
-            let arg_pos = if args.len() < 2 { 0 } else { 1 };
-
-            match args.get(arg_pos) {
-                Some(RedisMessage::Data(buf, offset)) => {
-                    let end = buf.len() - 2;
-                    &buf[*offset..end]
-                },
-                _ => panic!("command message does not have expected structure"),
-            }
-        },
-        RedisMessage::Data(buf, offset) => {
-            let end = buf.len() - 2;
-            &buf[*offset..end]
-        },
-        _ => panic!("command message should be multi-bulk or data !"),
+        new_args.push(arg);
     }
+
+    RedisMessage::Bulk(buf, new_args)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test::Bencher;
+    use std::io::{Error, ErrorKind};
 
-    static DATA_GET_SIMPLE: &[u8] = b"*2\r\n$3\r\nget\r\n$6\r\nfoobar\r\n";
-    static DATA_GET_SIMPLE_ARG0: &[u8] = b"$3\r\nget\r\n";
-    static DATA_GET_SIMPLE_ARG1: &[u8] = b"$6\r\nfoobar\r\n";
+    const STATUS_BUF: &str = "StAtUs_BuF";
+    const DATA_BUF: &[u8; 8] = b"DaTa_BuF";
+    const DATA_BUF_2: &[u8; 10] = b"DaTa_BuF_2";
+    const DATA_BUF_3: &[u8; 4] = b"mget";
 
-    fn build_simple_get_command() -> RedisMessage {
-        let arg0_data = BytesMut::from(DATA_GET_SIMPLE_ARG0);
-        let arg0 = RedisMessage::Data(arg0_data, 4);
-
-        let arg1_data = BytesMut::from(DATA_GET_SIMPLE_ARG1);
-        let arg1 = RedisMessage::Data(arg1_data, 4);
-
-        let mut args = Vec::new();
-        args.push(arg0);
-        args.push(arg1);
-
-        let cmd_buf = BytesMut::from(DATA_GET_SIMPLE);
-        RedisMessage::Bulk(cmd_buf, args)
+    lazy_static! {
+        static ref NULL_MSG: RedisMessage = RedisMessage::Null;
+        static ref OK_MSG: RedisMessage = RedisMessage::OK;
+        static ref STATUS_MSG: RedisMessage = RedisMessage::from_status(&STATUS_BUF[..]);
+        static ref ERR_MSG: RedisMessage =
+            RedisMessage::from_error(Box::new(Error::new(ErrorKind::Other, "fake error message")));
+        static ref INT_MSG: RedisMessage = RedisMessage::from_integer(-42);
+        static ref DATA_MSG: RedisMessage = redis_new_data_buffer(&DATA_BUF[..]);
+        static ref DATA_MSG_2: RedisMessage = redis_new_data_buffer(&DATA_BUF_2[..]);
+        static ref DATA_MSG_3: RedisMessage = redis_new_data_buffer(&DATA_BUF_3[..]);
+        static ref BULK_MSG: RedisMessage =
+            redis_new_bulk_from_args(vec![DATA_MSG.clone(), DATA_MSG_2.clone(), DATA_MSG_3.clone()]);
+        static ref BULK_MULTI_MSG: RedisMessage =
+            redis_new_bulk_from_args(vec![DATA_MSG_3.clone(), DATA_MSG_2.clone(), DATA_MSG.clone()]);
     }
 
     #[test]
-    fn test_get_message_key_simple_get() {
-        let cmd = build_simple_get_command();
-        let res = get_message_key(&cmd);
-        assert_eq!(res, b"foobar");
+    fn test_is_multi_message() {
+        assert!(!redis_is_multi_message(&NULL_MSG));
+        assert!(!redis_is_multi_message(&OK_MSG));
+        assert!(!redis_is_multi_message(&STATUS_MSG));
+        assert!(!redis_is_multi_message(&ERR_MSG));
+        assert!(!redis_is_multi_message(&INT_MSG));
+        assert!(!redis_is_multi_message(&DATA_MSG));
+        assert!(!redis_is_multi_message(&BULK_MSG));
+        assert!(redis_is_multi_message(&BULK_MULTI_MSG));
     }
 
-    #[bench]
-    fn bench_get_message_key_simple_get(b: &mut Bencher) {
-        let cmd = build_simple_get_command();
-        b.iter(|| get_message_key(&cmd));
+    #[test]
+    fn test_get_data_buffer() {
+        let nm_buf = redis_get_data_buffer(&NULL_MSG);
+        let om_buf = redis_get_data_buffer(&OK_MSG);
+        let sm_buf = redis_get_data_buffer(&STATUS_MSG);
+        let em_buf = redis_get_data_buffer(&ERR_MSG);
+        let im_buf = redis_get_data_buffer(&INT_MSG);
+        let dm_buf = redis_get_data_buffer(&DATA_MSG);
+        let bm_buf = redis_get_data_buffer(&BULK_MSG);
+
+        assert!(nm_buf.is_none());
+        assert!(om_buf.is_none());
+        assert!(sm_buf.is_none());
+        assert!(em_buf.is_none());
+        assert!(im_buf.is_none());
+        assert!(dm_buf.is_some());
+        assert_eq!(dm_buf, Some(&DATA_BUF[..]));
+        assert!(bm_buf.is_none());
     }
 }

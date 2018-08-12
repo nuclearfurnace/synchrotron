@@ -18,7 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use futures::{
-    stream::{Fuse, Stream}, Async, Poll,
+    stream::{Fuse, Stream},
+    Async, Poll,
 };
 use std::mem;
 
@@ -28,43 +29,45 @@ use std::mem;
 /// underlying stream reports that it is not ready.  Any items returned during this loop will be
 /// stored and forwarded on either when the batch capacity is met or when the underlying stream
 /// signals that it has no available items.
+///
+/// Batches items to match the `OrderedMessages` type.
 #[derive(Debug)]
 #[must_use = "streams do nothing unless polled"]
-pub struct Batch<S>
+pub struct OrderedBatch<S>
 where
     S: Stream,
 {
-    items: Vec<S::Item>,
+    items: Vec<(u64, i64, S::Item)>,
     err: Option<S::Error>,
     stream: Fuse<S>,
 }
 
-pub fn new<S>(s: S, capacity: usize) -> Batch<S>
+pub fn new<S>(s: S, capacity: usize) -> OrderedBatch<S>
 where
     S: Stream,
 {
     assert!(capacity > 0);
 
-    Batch {
+    OrderedBatch {
         items: Vec::with_capacity(capacity),
         err: None,
         stream: s.fuse(),
     }
 }
 
-impl<S: Stream> Batch<S> {
-    fn take(&mut self) -> Vec<S::Item> {
+impl<S: Stream> OrderedBatch<S> {
+    fn take(&mut self) -> Vec<(u64, i64, S::Item)> {
         let cap = self.items.capacity();
         mem::replace(&mut self.items, Vec::with_capacity(cap))
     }
 }
 
-impl<S> Stream for Batch<S>
+impl<S> Stream for OrderedBatch<S>
 where
     S: Stream,
 {
     type Error = <S as Stream>::Error;
-    type Item = Vec<<S as Stream>::Item>;
+    type Item = Vec<(u64, i64, <S as Stream>::Item)>;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         if let Some(err) = self.err.take() {
@@ -91,7 +94,8 @@ where
                 // possible item available to us at the time of a given `poll`, maximixing the
                 // batching effect.
                 Ok(Async::Ready(Some(item))) => {
-                    self.items.push(item);
+                    let index = self.items.len() as u64;
+                    self.items.push((index, -1, item));
                     if self.items.len() >= cap {
                         return Ok(Some(self.take()).into());
                     }

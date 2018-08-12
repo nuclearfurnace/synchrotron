@@ -17,15 +17,18 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use backend::sync::RequestTransformer;
+use backend::{processor::RequestProcessor, BackendError};
+use common::{Keyed, OrderedMessages};
 use futures::{
-    future::{ok, Either}, prelude::*, sync::{mpsc, oneshot},
+    future::{ok, Either},
+    prelude::*,
+    sync::{mpsc, oneshot},
 };
-use std::{io::Error, net::SocketAddr};
-use tokio::{net::TcpStream};
-use metrics::{Metrics, MetricSink, get_sink};
+use metrics::{get_sink, MetricSink, Metrics};
+use std::{io, net::SocketAddr};
+use tokio::net::TcpStream;
 
-pub enum TaskBackendConnection {
+pub enum BackendConnection {
     Alive(TcpStream),
     Error,
 }
@@ -40,29 +43,31 @@ pub enum TaskBackendConnection {
 /// There is an implicit requirement that a backend be created with a sibling state machine, and
 /// each given the appropriate tx/rx sides of a channel that allows them to communicate with each
 /// other.
-pub struct TaskBackendStateMachine<T>
+pub struct BackendStateMachine<T>
 where
-    T: RequestTransformer,
+    T: RequestProcessor,
 {
     sink: MetricSink,
 
-    transformer: T,
-    requests_rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
+    processor: T,
+    requests_rx: mpsc::UnboundedReceiver<(
+        OrderedMessages<T::Message>,
+        oneshot::Sender<Result<OrderedMessages<T::Message>, BackendError>>,
+    )>,
 
     address: SocketAddr,
     conns: Vec<TcpStream>,
-    conns_rx: mpsc::UnboundedReceiver<TaskBackendConnection>,
-    conns_tx: mpsc::UnboundedSender<TaskBackendConnection>,
+    conns_rx: mpsc::UnboundedReceiver<BackendConnection>,
+    conns_tx: mpsc::UnboundedSender<BackendConnection>,
     conn_count: usize,
     conn_limit: usize,
 }
 
-impl<T> Future for TaskBackendStateMachine<T>
+impl<T> Future for BackendStateMachine<T>
 where
-    T: RequestTransformer,
-    T::Request: Send + 'static,
-    T::Response: Send + 'static,
-    T::Executor: Future<Item = (TcpStream, T::Response), Error = Error> + Send + 'static,
+    T: RequestProcessor,
+    T::Message: Keyed + Send + 'static,
+    T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = io::Error> + Send + 'static,
 {
     type Error = ();
     type Item = ();
@@ -73,8 +78,8 @@ where
             match self.conns_rx.poll() {
                 Ok(Async::Ready(Some(conn))) => {
                     match conn {
-                        TaskBackendConnection::Alive(conn) => self.conns.push(conn),
-                        TaskBackendConnection::Error => {
+                        BackendConnection::Alive(conn) => self.conns.push(conn),
+                        BackendConnection::Error => {
                             self.conn_count -= 1;
                         },
                     }
@@ -105,15 +110,14 @@ where
                     };
 
                     let conns_tx = self.conns_tx.clone();
-                    let inner_work = self.transformer.transform(request, connection);
+                    let inner_work = self.processor.process(request, connection);
                     let work = inner_work
                         .then(|result| {
                             match result {
-                                Ok((conn, x)) => ok((TaskBackendConnection::Alive(conn), Ok(x))),
-                                Err(e) => ok((TaskBackendConnection::Error, Err(e))),
+                                Ok((conn, x)) => ok((BackendConnection::Alive(conn), Ok(x))),
+                                Err(e) => ok((BackendConnection::Error, Err(e.into()))),
                             }
-                        })
-                        .and_then(move |(br, or)| conns_tx.send(br).map(|_| or))
+                        }).and_then(move |(br, or)| conns_tx.send(br).map(|_| or))
                         .and_then(move |result| ok(response_tx.send(result)))
                         .map_err(|_| ())
                         .map(|_| ());
@@ -127,18 +131,22 @@ where
 }
 
 fn new_state_machine<T>(
-    addr: SocketAddr, transformer: T,
-    rx: mpsc::UnboundedReceiver<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>, conn_limit: usize,
-) -> TaskBackendStateMachine<T>
+    addr: SocketAddr, processor: T,
+    rx: mpsc::UnboundedReceiver<(
+        OrderedMessages<T::Message>,
+        oneshot::Sender<Result<OrderedMessages<T::Message>, BackendError>>,
+    )>,
+    conn_limit: usize,
+) -> BackendStateMachine<T>
 where
-    T: RequestTransformer,
+    T: RequestProcessor,
 {
     let (conns_tx, conns_rx) = mpsc::unbounded();
 
-    TaskBackendStateMachine {
+    BackendStateMachine {
         sink: get_sink(),
 
-        transformer,
+        processor,
         requests_rx: rx,
 
         address: addr,
@@ -161,28 +169,31 @@ where
 ///
 /// Backends maintain a given number of connections to their underlying service, and track error
 /// states, recycling connections and pausing work when required.
-pub struct TaskBackend<T>
+pub struct Backend<T>
 where
-    T: RequestTransformer,
+    T: RequestProcessor,
 {
-    requests_tx: mpsc::UnboundedSender<(T::Request, oneshot::Sender<Result<T::Response, Error>>)>,
+    requests_tx: mpsc::UnboundedSender<(
+        OrderedMessages<T::Message>,
+        oneshot::Sender<Result<OrderedMessages<T::Message>, BackendError>>,
+    )>,
 }
 
-impl<T> TaskBackend<T>
+impl<T> Backend<T>
 where
-    T: RequestTransformer,
+    T: RequestProcessor,
 {
-    pub fn new(
-        addr: SocketAddr, transformer: T, conn_limit: usize,
-    ) -> (TaskBackend<T>, TaskBackendStateMachine<T>) {
+    pub fn new(addr: SocketAddr, processor: T, conn_limit: usize) -> (Backend<T>, BackendStateMachine<T>) {
         let (tx, rx) = mpsc::unbounded();
-        let backend = TaskBackend { requests_tx: tx };
-        let runner = new_state_machine(addr, transformer, rx, conn_limit);
+        let backend = Backend { requests_tx: tx };
+        let runner = new_state_machine(addr, processor, rx, conn_limit);
 
         (backend, runner)
     }
 
-    pub fn submit(&self, request: T::Request) -> oneshot::Receiver<Result<T::Response, Error>> {
+    pub fn submit(
+        &self, request: OrderedMessages<T::Message>,
+    ) -> oneshot::Receiver<Result<OrderedMessages<T::Message>, BackendError>> {
         let (tx, rx) = oneshot::channel();
         self.requests_tx
             .unbounded_send((request, tx))

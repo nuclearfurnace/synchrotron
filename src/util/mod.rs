@@ -20,13 +20,9 @@
 use futures::stream::Stream;
 
 mod batch;
-pub use self::batch::Batch;
+pub use self::batch::OrderedBatch;
 
-impl<T: ?Sized> StreamExt for T
-where
-    T: Stream,
-{
-}
+impl<T: ?Sized> StreamExt for T where T: Stream {}
 
 /// An extension trait for `Stream`s that provides necessary combinators specific to synchrotron.
 pub trait StreamExt: Stream {
@@ -43,7 +39,7 @@ pub trait StreamExt: Stream {
     ///
     /// If the underlying stream signals that it is not ready, and no items have been batched, then
     /// the stream will emit nothing.
-    fn batch(self, capacity: usize) -> batch::Batch<Self>
+    fn ordered_batch(self, capacity: usize) -> batch::OrderedBatch<Self>
     where
         Self: Sized,
     {
@@ -52,27 +48,11 @@ pub trait StreamExt: Stream {
 }
 
 /// Calculates the size of bytes for all items in a batch.
-pub fn get_batch_size<T>(batch: &Vec<T>) -> usize
-    where T: Sizable
-{
-    batch.into_iter().fold(0, |acc, x| acc + x.size())
-}
-
-/// Flattens and orders a list of messages.
-///
-/// Results for pipelined requests come back in the form of Vec<(u64, T)>, where each tuple
-/// represents a response, and the order it needs to be sent back to the client in relation to
-/// other responses.
-///
-/// Since we may send requests to multiple servers, we end up with Vec<Vec<(u64, T)>>, and so here
-/// we're flattening out those nested vectors, and then ensuring a global order of the messages.
-pub fn flatten_ordered_messages<T>(msgs: Vec<Vec<(u64, T)>>) -> Vec<T>
+pub fn get_ordered_batch_size<T>(batch: &Vec<(u64, i64, T)>) -> usize
 where
-    T: Sized,
+    T: Sizable,
 {
-    let mut items = msgs.into_iter().flatten().collect::<Vec<_>>();
-    items.sort_by(|(a, _), (b, _)| a.cmp(b));
-    items.into_iter().map(|(_, item)| item).collect()
+    batch.into_iter().fold(0, |acc, (_, _, x)| acc + x.size())
 }
 
 /// A type that can report back its own size in bytes.
