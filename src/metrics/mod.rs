@@ -1,6 +1,24 @@
-use std::{fmt, io, thread};
-use std::time::Instant;
-use hotmic::{Receiver, Sink, Controller, Facet, Sample, Snapshot};
+// Copyright (c) 2018 Nuclear Furnace
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+use hotmic::{Controller, Facet, Receiver, Sample, Sink, Snapshot};
+use std::{fmt, io, thread, time::Instant};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Metrics {
@@ -44,9 +62,7 @@ lazy_static! {
     };
 }
 
-pub fn get_facade() -> &'static MetricsFacade {
-    &METRICS
-}
+pub fn get_facade() -> &'static MetricsFacade { &METRICS }
 
 pub fn get_sink() -> MetricSink {
     let facade = get_facade();
@@ -66,9 +82,7 @@ impl MetricsFacade {
         }
     }
 
-    pub fn get_snapshot(&self) -> Result<Snapshot<Metrics>, io::Error> {
-        self.controller.get_snapshot()
-    }
+    pub fn get_snapshot(&self) -> Result<Snapshot<Metrics>, io::Error> { self.controller.get_snapshot() }
 
     pub fn get_sink(&self) -> MetricSink {
         MetricSink {
@@ -87,17 +101,11 @@ impl MetricSink {
         self.sink.send(Sample::Timing(key, start, stop, 1)).unwrap()
     }
 
-    pub fn update_count(&mut self, key: Metrics, value: i64) {
-        self.sink.send(Sample::Count(key, value)).unwrap()
-    }
+    pub fn update_count(&mut self, key: Metrics, value: i64) { self.sink.send(Sample::Count(key, value)).unwrap() }
 
-    pub fn increment(&mut self, key: Metrics) {
-        self.update_count(key, 1)
-    }
+    pub fn increment(&mut self, key: Metrics) { self.update_count(key, 1) }
 
-    pub fn decrement(&mut self, key: Metrics) {
-        self.update_count(key, -1)
-    }
+    pub fn decrement(&mut self, key: Metrics) { self.update_count(key, -1) }
 }
 
 fn run_metrics_loop(mut receiver: Receiver<Metrics>) {

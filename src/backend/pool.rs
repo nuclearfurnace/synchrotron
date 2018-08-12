@@ -18,28 +18,29 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use super::{
-    distributor::{BackendDescriptor, Distributor}, hasher::KeyHasher,
+    distributor::{BackendDescriptor, Distributor},
+    hasher::KeyHasher,
 };
-use backend::sync::{RequestTransformer, TaskBackend};
+use backend::{backend::Backend, processor::RequestProcessor};
+use common::{Keyed, OrderedMessages};
 use futures::prelude::*;
-use std::{io::Error, net::SocketAddr};
-use tokio::{net::TcpStream};
+use std::{io, net::SocketAddr};
+use tokio::net::TcpStream;
 
 pub struct BackendPool<T>
 where
-    T: RequestTransformer,
+    T: RequestProcessor,
 {
     distributor: Box<Distributor + Send + Sync>,
     hasher: Box<KeyHasher + Send + Sync>,
-    backends: Vec<TaskBackend<T>>,
+    backends: Vec<Backend<T>>,
 }
 
 impl<T> BackendPool<T>
 where
-    T: RequestTransformer + Clone + Send + 'static,
-    T::Request: Send + 'static,
-    T::Response: Send + 'static,
-    T::Executor: Future<Item = (TcpStream, T::Response), Error = Error> + Send + 'static,
+    T: RequestProcessor + Clone + Send + 'static,
+    T::Message: Keyed + Send + 'static,
+    T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = io::Error> + Send + 'static,
 {
     pub fn new(
         addresses: Vec<SocketAddr>, transformer: T, mut dist: Box<Distributor + Send + Sync>,
@@ -49,7 +50,7 @@ where
         let mut backends = vec![];
         let mut descriptors = vec![];
         for address in &addresses {
-            let (backend, runner) = TaskBackend::new(address.clone(), transformer.clone(), 16);
+            let (backend, runner) = Backend::new(address.clone(), transformer.clone(), 16);
             backends.push(backend);
 
             // eventually, we'll populate this with weight, etc, so that
@@ -76,7 +77,7 @@ where
         self.distributor.choose(key_id)
     }
 
-    pub fn get_backend_by_index(&self, idx: usize) -> &TaskBackend<T> {
+    pub fn get_backend_by_index(&self, idx: usize) -> &Backend<T> {
         match self.backends.get(idx) {
             Some(backend) => backend,
             None => unreachable!("incorrect backend idx"),

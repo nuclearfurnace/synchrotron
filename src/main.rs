@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #![feature(test)]
+#![feature(nll)]
 #![feature(iterator_flatten)]
 #![feature(associated_type_defaults)]
 #![feature(duration_as_u128)]
@@ -29,33 +30,28 @@ extern crate lazy_static;
 
 extern crate config;
 extern crate crypto;
-extern crate pruefung;
 extern crate fnv;
+extern crate pruefung;
 extern crate serde;
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
 
-extern crate chan;
-extern crate chan_signal;
-
-use chan_signal::Signal;
+extern crate libc;
+extern crate signal_hook;
 
 extern crate tokio;
 extern crate tokio_io;
 #[macro_use]
 extern crate futures;
-extern crate net2;
 extern crate futures_turnstyle;
+extern crate net2;
 
-use futures_turnstyle::{Turnstyle, Waiter};
-use std::{error::Error, process, thread};
-use std::net::Shutdown;
-use tokio::{
-    executor::thread_pool, prelude::*, runtime::self,
-    net::TcpListener, io
-};
 use futures::future::{lazy, ok, Shared};
+use futures_turnstyle::{Turnstyle, Waiter};
+use signal_hook::iterator::Signals;
+use std::{error::Error, net::Shutdown, process, thread};
+use tokio::{executor::thread_pool, io, net::TcpListener, prelude::*, runtime};
 
 #[macro_use]
 extern crate log;
@@ -70,9 +66,9 @@ use slog::Drain;
 
 extern crate btoi;
 extern crate bytes;
+extern crate hotmic;
 extern crate itoa;
 extern crate rand;
-extern crate hotmic;
 
 #[cfg(test)]
 extern crate test;
@@ -81,32 +77,28 @@ extern crate test;
 extern crate spectral;
 
 mod backend;
+mod common;
 mod conf;
 mod listener;
-mod protocol;
-mod util;
 mod metrics;
+mod protocol;
+mod routing;
+mod util;
 
 use conf::{Configuration, LevelExt};
 
 fn run() -> i32 {
-    // Due to the way signal masking apparently works, or works with this library, we
-    // must initialize our signal handling code before *any* threads are spun up by
-    // the process, otherwise we don't seem to get them delivered to us.
-    //
-    // We also have this accessory thread because trying to wrap the channel as a stream
-    // was fraught with pain and this is much simpler.  C'est la vie.
-    let signals = chan_signal::notify(&[Signal::USR1, Signal::INT]);
+    // Set up our signal handling before anything else.
+    let signals = Signals::new(&[libc::SIGINT, libc::SIGUSR1]).expect("failed to register signal handlers");
     let turnstyle = Turnstyle::new();
     let closer = turnstyle.join().shared();
     thread::spawn(move || {
-        loop {
-            let signal = signals.recv().unwrap();
+        for signal in signals.forever() {
             info!("[core] signal received: {:?}", signal);
 
             match signal {
-                Signal::USR1 => {}, // signal to spawn new process
-                Signal::INT => {
+                libc::SIGUSR1 => {}, // signal to spawn new process
+                libc::SIGINT => {
                     // signal to close this process
                     turnstyle.turn();
                     break;
@@ -151,8 +143,7 @@ fn run() -> i32 {
                 let config = x.clone();
 
                 listener::from_config(config, close)
-            })
-            .collect::<Vec<_>>();
+            }).collect::<Vec<_>>();
 
         let mut errors = Vec::new();
         for listener in &listeners {
@@ -198,11 +189,14 @@ fn launch_stats(close: Shared<Waiter>) {
 
     let addr = "127.0.0.1:9999".parse().unwrap();
     let listener = TcpListener::bind(&addr).unwrap();
-    let processor = listener.incoming()
+    let processor = listener
+        .incoming()
         .map_err(|e| eprintln!("failed to accept stats connection: {:?}", e))
         .inspect(|_| debug!("got new stats connection"))
         .for_each(move |socket| {
-            facade.get_snapshot().into_future()
+            facade
+                .get_snapshot()
+                .into_future()
                 .map_err(|e| eprintln!("failed to get metrics snapshot: {:?}", e))
                 .and_then(|snapshot| {
                     let mut output = "{".to_owned();
@@ -219,14 +213,12 @@ fn launch_stats(close: Shared<Waiter>) {
                     output += "}";
 
                     ok(output)
-                })
-                .and_then(|buf| io::write_all(socket, buf.into_bytes()).map_err(|_| ()))
+                }).and_then(|buf| io::write_all(socket, buf.into_bytes()).map_err(|_| ()))
                 .and_then(|(c, _)| {
                     c.shutdown(Shutdown::Both).unwrap();
                     ok(())
                 })
-        })
-        .select2(close)
+        }).select2(close)
         .map(|_| ())
         .map_err(|_| ());
 
