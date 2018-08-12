@@ -37,7 +37,7 @@ pub struct ListenerConfiguration {
     pub protocol: String,
     pub address: String,
     pub pools: HashMap<String, PoolConfiguration>,
-    pub routing: String,
+    pub routing: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
