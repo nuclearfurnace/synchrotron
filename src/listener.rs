@@ -18,24 +18,34 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use backend::{
-    distributor, hasher, pool::BackendPool, redis::{generate_batched_redis_writes, RedisRequestTransformer},
+    distributor, hasher,
+    pool::BackendPool,
+    processor::{MessageSink, RequestProcessor},
+    redis::RedisRequestProcessor,
 };
+use common::{Keyed, OrderedMessages};
 use conf::ListenerConfiguration;
 use futures::{
-    future::{join_all, lazy, ok, Shared}, prelude::*,
+    future::{lazy, ok, Shared},
+    prelude::*,
 };
 use futures_turnstyle::Waiter;
-use metrics;
-use metrics::Metrics;
+use metrics::{self, Metrics};
 use net2::TcpBuilder;
-use protocol::redis;
+use routing::{FixedRouter, Router, RouterError};
 use std::{
-    collections::HashMap, io::{Error, ErrorKind}, net::SocketAddr, sync::Arc,
+    collections::HashMap,
+    io::{Error, ErrorKind},
+    net::SocketAddr,
+    sync::Arc,
     time::Instant,
 };
-use tokio::{io, net::TcpListener, reactor};
-use tokio_io::AsyncRead;
-use util::{flatten_ordered_messages, get_batch_size, StreamExt};
+use tokio::{
+    io,
+    net::{TcpListener, TcpStream},
+    reactor,
+};
+use util::{get_ordered_batch_size, Sizable, StreamExt};
 
 type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 'static>;
 
@@ -44,9 +54,7 @@ type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 's
 /// The listener will spawn a socket for accepting client connections, and when a client connects,
 /// spawn a task to process all of the messages from that client until the client disconnects or
 /// there is an unrecoverable connection/protocol error.
-pub fn from_config(
-    config: ListenerConfiguration, close: Shared<Waiter>,
-) -> Result<GenericRuntimeFuture, Error> {
+pub fn from_config(config: ListenerConfiguration, close: Shared<Waiter>) -> Result<GenericRuntimeFuture, Error> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
     let listener = get_listener(&listen_address).expect("failed to create the TCP listener");
@@ -54,7 +62,7 @@ pub fn from_config(
     // Get the correct handler based on protocol.
     let protocol = config.protocol.to_lowercase();
     let handler = match protocol.as_str() {
-        "redis" => redis_from_config(config, listener)?,
+        "redis" => routing_from_config(config, listener, RedisRequestProcessor::new())?,
         s => panic!("unknown protocol type: {}", s),
     };
 
@@ -64,21 +72,27 @@ pub fn from_config(
         info!("[listener] starting listener '{}'...", listen_address);
         ok(())
     }).and_then(|_| handler)
-        .select2(close)
-        .then(move |_| {
-            info!("[pool] shutting down listener '{}'", listen_address2);
-            ok(())
-        });
+    .select2(close)
+    .then(move |_| {
+        info!("[pool] shutting down listener '{}'", listen_address2);
+        ok(())
+    });
     Ok(Box::new(wrapped))
 }
 
-fn redis_from_config(
-    config: ListenerConfiguration, listener: TcpListener,
-) -> Result<GenericRuntimeFuture, Error> {
-    // Gather up all of the backend pools.
+fn routing_from_config<T>(
+    config: ListenerConfiguration, listener: TcpListener, processor: T,
+) -> Result<GenericRuntimeFuture, Error>
+where
+    T: RequestProcessor + Clone + Sync + Send + 'static,
+    T::Message: Keyed + Sizable + Clone + Send + 'static,
+    T::ClientReader: Stream<Item = T::Message, Error = Error> + Send + 'static,
+    T::ClientWriter: MessageSink<Message = T::Message> + Send + 'static,
+    T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = Error> + Send + 'static,
+{
     let mut pools = HashMap::new();
     let pool_configs = config.pools.clone();
-    for (pool_name, mut pool_config) in pool_configs {
+    for (pool_name, pool_config) in pool_configs {
         debug!(
             "[listener] configuring backend pool '{}' for address '{}'",
             &pool_name,
@@ -101,11 +115,9 @@ fn redis_from_config(
         let hasher = hasher::configure_hasher(&hash_type);
         debug!("[listener] using hasher '{}'", hash_type);
 
-        let transformer = RedisRequestTransformer::new();
-
         let pool = Arc::new(BackendPool::new(
             pool_config.addresses,
-            transformer,
+            processor.clone(),
             distributor,
             hasher,
         ));
@@ -113,156 +125,105 @@ fn redis_from_config(
     }
 
     // Figure out what sort of routing we're doing so we can grab the right handler.
-    let routing_type = config.routing.to_lowercase();
-    match routing_type.as_str() {
-        "warmup" => redis_warmup_handler(listener, pools),
-        _ => redis_normal_handler(listener, pools),
+    let mut routing = config.routing;
+    let route_type = routing
+        .entry("type".to_owned())
+        .or_insert("fixed".to_owned())
+        .to_lowercase();
+    match route_type.as_str() {
+        "fixed" => get_fixed_router(listener, pools, processor),
+        x => panic!("unknown route type '{}'", x),
     }
 }
 
-fn redis_warmup_handler(
-    listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
-) -> Result<GenericRuntimeFuture, Error> {
-    let warm_pool = pools
-        .get("warm")
-        .ok_or(Error::new(
-            ErrorKind::Other,
-            "redis warmup handler has no 'warm' pool configured!",
-        ))?
-        .clone();
+fn get_fixed_router<T>(
+    listener: TcpListener, pools: HashMap<String, Arc<BackendPool<T>>>, processor: T,
+) -> Result<GenericRuntimeFuture, Error>
+where
+    T: RequestProcessor + Clone + Sync + Send + 'static,
+    T::Message: Keyed + Sizable + Clone + Send + 'static,
+    T::ClientReader: Stream<Item = T::Message, Error = Error> + Send + 'static,
+    T::ClientWriter: MessageSink<Message = T::Message> + Send + 'static,
+    T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = Error> + Send + 'static,
+{
+    // Construct an instance of our router.
+    let default_pool = pools.get("default").ok_or(Error::new(
+        ErrorKind::Other,
+        "no default pool configured for fixed router",
+    ))?;
+    let router = FixedRouter::new(processor.clone(), default_pool.clone());
 
-    let cold_pool = pools
-        .get("cold")
-        .ok_or(Error::new(
-            ErrorKind::Other,
-            "redis warmup handler has no 'cold' pool configured!",
-        ))?
-        .clone();
-
-    let handler = listener
-        .incoming()
-        .map_err(|e| error!("[pool] accept failed: {:?}", e))
-        .for_each(move |socket| {
-            let client_addr = socket.peer_addr().unwrap();
-            debug!("[client] connection established -> {:?}", client_addr);
-
-            let cold = cold_pool.clone();
-            let warm = warm_pool.clone();
-
-            let (client_rx, client_tx) = socket.split();
-            let client_proto = redis::read_messages_stream(client_rx)
-                .map_err(|e| {
-                    error!("[client] caught error while reading from client: {:?}", e);
-                })
-                .batch(128)
-                .fold(client_tx, move |tx, msgs| {
-                    trace!("[client] got batch of {} messages!", msgs.len());
-
-                    // Fire off our cold pool operations asynchronously so that we don't influence
-                    // the normal client path.
-                    let cold_msgs = msgs.clone();
-                    let cold_batches = generate_batched_redis_writes(&cold, cold_msgs);
-                    let cold_handler = join_all(cold_batches)
-                        .map_err(|err| error!("[client] error while sending warming ops to cold pool: {:?}", err))
-                        .map(|_| ());
-
-                    tokio::spawn(cold_handler);
-
-                    // Now run our normal writes.
-                    let warm_handler = join_all(generate_batched_redis_writes(&warm, msgs))
-                        .and_then(|results| ok(flatten_ordered_messages(results)))
-                        .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron error (WRJE)"))
-                        .and_then(move |items| redis::write_messages(tx, items))
-                        .map(|(w, _n)| w)
-                        .map_err(|err| error!("[client] caught error while handling request: {:?}", err));
-
-                    warm_handler
-                })
-                .map(|_| ());
-
-            tokio::spawn(client_proto);
-            ok(())
-        });
-
-    Ok(Box::new(handler))
+    build_router_chain(listener, processor, router)
 }
 
-fn redis_normal_handler(
-    listener: TcpListener, pools: HashMap<String, Arc<BackendPool<RedisRequestTransformer>>>,
-) -> Result<GenericRuntimeFuture, Error> {
-    let default_pool = pools
-        .get("default")
-        .ok_or(Error::new(
-            ErrorKind::Other,
-            "redis normal handler has no 'default' pool configured!",
-        ))?
-        .clone();
-
-    let handler = listener
+fn build_router_chain<T, R>(listener: TcpListener, processor: T, router: R) -> Result<GenericRuntimeFuture, Error>
+where
+    T: RequestProcessor + Clone + Sync + Send + 'static,
+    T::Message: Keyed + Sizable + Clone + Send + 'static,
+    T::ClientReader: Stream<Item = T::Message, Error = Error> + Send + 'static,
+    T::ClientWriter: MessageSink<Message = T::Message> + Send + 'static,
+    T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = Error> + Send + 'static,
+    R: Router<T> + Clone + Sync + Send + 'static,
+    R::Future: Future<Item = OrderedMessages<T::Message>, Error = RouterError> + Send + 'static,
+{
+    let task = listener
         .incoming()
-        .map_err(|e| error!("[pool] accept failed: {:?}", e))
-        .for_each(move |socket| {
+        .for_each(move |client| {
             let mut metrics = metrics::get_sink();
-
-            let client_addr = socket.peer_addr().unwrap();
-            debug!("[client] connection established -> {:?}", client_addr);
             metrics.increment(Metrics::ClientsConnected);
 
-            let default = default_pool.clone();
-
-            let (client_rx, client_tx) = socket.split();
-            let client_proto = redis::read_messages_stream(client_rx)
+            let router = router.clone();
+            let (client_rx, client_tx) = processor.get_client_streams(client);
+            let client_proto = client_rx
                 .map_err(|e| {
-                    let mut ms = metrics::get_sink();
-                    ms.decrement(Metrics::ClientsConnected);
-                    error!("[client] caught error while reading from client: {:?}", e);
-                })
-                .batch(128)
-                .fold((client_tx, client_addr, metrics, 0), move |(tx, addr, mut ms, msg_count), msgs| {
+                    match e.kind() {
+                        // We really only care about the "other" type which we comandeer for
+                        // custom messages.  Connection resets, etc, are a fact of life and
+                        // often occur when clients disconnect.  No point in logging those.
+                        io::ErrorKind::Other => error!("[client] caught error while reading from client: {:?}", e),
+                        _ => (),
+                    }
+                }).ordered_batch(128)
+                .fold((router, client_tx, metrics), |(router, tx, mut ms), req| {
+                    ms.update_count(Metrics::ServerMessagesReceived, req.len() as i64);
+
+                    let batch_size = get_ordered_batch_size(&req);
+                    ms.update_count(Metrics::ServerBytesReceived, batch_size as i64);
+
                     let batch_start = Instant::now();
-                    trace!("[client] [{:?}] got batch of {} messages!", addr, msgs.len());
+                    router
+                        .route(req)
+                        .into_future()
+                        .and_then(|res| res)
+                        .map_err(|e| e.into())
+                        .and_then(|res| tx.send(res))
+                        .map_err(|e| {
+                            match e.kind() {
+                                // We really only care about the "other" type which we comandeer for
+                                // custom messages.  Connection resets, etc, are a fact of life and
+                                // often occur when clients disconnect.  No point in logging those.
+                                io::ErrorKind::Other => error!("[client] caught error while handling request: {:?}", e),
+                                _ => (),
+                            }
+                        }).map(move |(mc, nw, tx)| {
+                            let batch_end = Instant::now();
+                            ms.update_latency(Metrics::ClientMessageBatchServiced, batch_start, batch_end);
+                            ms.update_count(Metrics::ServerMessagesSent, mc as i64);
+                            ms.update_count(Metrics::ServerBytesSent, nw as i64);
 
-                    let batch_size_bytes = get_batch_size(&msgs);
-                    ms.update_count(Metrics::ServerBytesReceived, batch_size_bytes as i64);
-
-                    let new_msg_count = msg_count + msgs.len();
-                    ms.update_count(Metrics::ServerMessagesReceived, msgs.len() as i64);
-
-                    join_all(generate_batched_redis_writes(&default, msgs))
-                        .and_then(|results| ok(flatten_ordered_messages(results)))
-                        .map_err(|_| Error::new(ErrorKind::Other, "internal synchrotron error (NRJE)"))
-                        .and_then(move |items| {
-                            ms.update_count(Metrics::ServerMessagesSent, items.len() as i64);
-
-                            redis::write_messages(tx, items)
-                                .map(|(w, n)| (w, n, ms))
+                            (router, tx, ms)
                         })
-                        .map(move |(w, n, mut ms)| {
-                            let batch_finished = Instant::now();
-
-                            debug!(
-                                "[client] [{:?}] sent batch of responses to client",
-                                addr,
-                            );
-
-                            ms.update_count(Metrics::ServerBytesSent, n as i64);
-                            ms.update_latency(Metrics::ClientMessageBatchServiced, batch_start, batch_finished);
-
-                            (w, addr, ms, new_msg_count)
-                        })
-                        .map_err(|err| error!("[client] caught error while handling request: {:?}", err))
-                })
-                .map(|(_, addr, mut ms, msg_count)| {
+                }).and_then(|(_, _, mut ms)| {
                     ms.decrement(Metrics::ClientsConnected);
-                    debug!("[client] connection complete -> {:?}; processed {} messages", addr, msg_count);
-                    ()
-                });
+                    ok(())
+                }).map(|_| ());
 
             tokio::spawn(client_proto);
-            ok(())
-        });
 
-    Ok(Box::new(handler))
+            ok(())
+        }).map_err(|e| error!("[listener] caught error while accepting connections: {:?}", e));
+
+    Ok(Box::new(task))
 }
 
 fn get_listener(addr_str: &String) -> io::Result<TcpListener> {
@@ -274,7 +235,9 @@ fn get_listener(addr_str: &String) -> io::Result<TcpListener> {
     configure_builder(&builder)?;
     builder.reuse_address(true)?;
     builder.bind(addr)?;
-    builder.listen(1024).and_then(|l| TcpListener::from_std(l, &reactor::Handle::current()))
+    builder
+        .listen(1024)
+        .and_then(|l| TcpListener::from_std(l, &reactor::Handle::current()))
 }
 
 #[cfg(unix)]

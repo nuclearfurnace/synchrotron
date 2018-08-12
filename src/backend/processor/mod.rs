@@ -17,12 +17,10 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-pub mod backend;
-pub mod distributor;
 mod errors;
-pub mod hasher;
-pub mod pool;
-pub mod processor;
-pub mod redis;
+mod processor;
 
-pub use self::errors::BackendError;
+pub use self::{
+    errors::ProcessorError,
+    processor::{MessageSink, RequestProcessor, TcpStreamFuture},
+};

@@ -17,23 +17,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use futures::future::{Either, FutureResult};
-use std::io::Error;
-use tokio::net::{ConnectFuture, TcpStream};
+use backend::processor::RequestProcessor;
+use common::OrderedMessages;
+use routing::errors::RouterError;
 
-mod task;
+pub trait Router<T: RequestProcessor> {
+    type Future;
 
-pub use self::task::{TaskBackend, TaskBackendConnection};
-
-/// An existing or pending TcpStream.
-pub type TcpStreamFuture = Either<FutureResult<TcpStream, Error>, ConnectFuture>;
-
-/// Transformers a request into a response by generating a future which will consume a given
-/// TcpStream to an underlying server, do its work, and hand back both the stream and the results.
-pub trait RequestTransformer {
-    type Request;
-    type Response;
-    type Executor;
-
-    fn transform(&self, Self::Request, TcpStreamFuture) -> Self::Executor;
+    fn route(&self, OrderedMessages<T::Message>) -> Result<Self::Future, RouterError>;
 }

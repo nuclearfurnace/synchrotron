@@ -17,12 +17,41 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-pub mod backend;
-pub mod distributor;
-mod errors;
-pub mod hasher;
-pub mod pool;
-pub mod processor;
-pub mod redis;
+use std::{error, fmt, io};
 
-pub use self::errors::BackendError;
+#[derive(Debug)]
+pub enum ProcessorError {
+    FragmentError(String),
+    DefragmentError(String),
+}
+
+impl Into<io::Error> for ProcessorError {
+    fn into(self) -> io::Error {
+        let desc = match self {
+            ProcessorError::FragmentError(s) => s,
+            ProcessorError::DefragmentError(s) => s,
+        };
+
+        io::Error::new(io::ErrorKind::Other, desc)
+    }
+}
+
+impl error::Error for ProcessorError {
+    fn description(&self) -> &str {
+        match self {
+            ProcessorError::FragmentError(s) => s.as_str(),
+            ProcessorError::DefragmentError(s) => s.as_str(),
+        }
+    }
+
+    fn cause(&self) -> Option<&error::Error> { None }
+}
+
+impl fmt::Display for ProcessorError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ProcessorError::FragmentError(s) => write!(f, "fragment error: {}", s.as_str()),
+            ProcessorError::DefragmentError(s) => write!(f, "defragment error: {}", s.as_str()),
+        }
+    }
+}
