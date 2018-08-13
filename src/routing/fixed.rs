@@ -155,6 +155,7 @@ where
     type Future = Box<Future<Item = OrderedMessages<T::Message>, Error = RouterError> + Send + 'static>;
 
     fn route(&self, req: OrderedMessages<T::Message>) -> Result<Self::Future, RouterError> {
+        debug!("[fixed] running batch of {} messages", req.len());
         let f = self.run_batch(req)?;
         Ok(Box::new(f))
     }

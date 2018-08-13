@@ -45,7 +45,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     reactor,
 };
-use util::{get_ordered_batch_size, Sizable, StreamExt};
+use util::StreamExt;
 
 type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Sync + Send + 'static>;
 
@@ -85,7 +85,7 @@ fn routing_from_config<T>(
 ) -> Result<GenericRuntimeFuture, Error>
 where
     T: RequestProcessor + Clone + Sync + Send + 'static,
-    T::Message: Keyed + Sizable + Clone + Send + 'static,
+    T::Message: Keyed + Clone + Send + 'static,
     T::ClientReader: Stream<Item = T::Message, Error = Error> + Send + 'static,
     T::ClientWriter: MessageSink<Message = T::Message> + Send + 'static,
     T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = Error> + Send + 'static,
@@ -141,7 +141,7 @@ fn get_fixed_router<T>(
 ) -> Result<GenericRuntimeFuture, Error>
 where
     T: RequestProcessor + Clone + Sync + Send + 'static,
-    T::Message: Keyed + Sizable + Clone + Send + 'static,
+    T::Message: Keyed + Clone + Send + 'static,
     T::ClientReader: Stream<Item = T::Message, Error = Error> + Send + 'static,
     T::ClientWriter: MessageSink<Message = T::Message> + Send + 'static,
     T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = Error> + Send + 'static,
@@ -159,7 +159,7 @@ where
 fn build_router_chain<T, R>(listener: TcpListener, processor: T, router: R) -> Result<GenericRuntimeFuture, Error>
 where
     T: RequestProcessor + Clone + Sync + Send + 'static,
-    T::Message: Keyed + Sizable + Clone + Send + 'static,
+    T::Message: Keyed + Clone + Send + 'static,
     T::ClientReader: Stream<Item = T::Message, Error = Error> + Send + 'static,
     T::ClientWriter: MessageSink<Message = T::Message> + Send + 'static,
     T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = Error> + Send + 'static,
@@ -186,9 +186,6 @@ where
                 }).ordered_batch(128)
                 .fold((router, client_tx, metrics), |(router, tx, mut ms), req| {
                     ms.update_count(Metrics::ServerMessagesReceived, req.len() as i64);
-
-                    let batch_size = get_ordered_batch_size(&req);
-                    ms.update_count(Metrics::ServerBytesReceived, batch_size as i64);
 
                     let batch_start = Instant::now();
                     router
