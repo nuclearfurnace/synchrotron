@@ -70,9 +70,9 @@ impl RequestProcessor for RedisRequestProcessor {
 
     fn process(&self, req: OrderedMessages<Self::Message>, stream: TcpStreamFuture) -> Self::Future {
         let inner = stream
-            .and_then(move |server| redis::write_ordered_messages(server, req))
-            .and_then(move |(server, msgs, _n)| redis::read_messages(server, msgs))
-            .and_then(move |(server, _n, resps)| ok((server, resps)));
+            .and_then(move |server| redis::write_server_ordered_messages(server, req))
+            .and_then(move |(server, msgs, _nw)| redis::read_messages(server, msgs))
+            .and_then(move |(server, resps)| ok((server, resps)));
         Box::new(inner)
     }
 }
