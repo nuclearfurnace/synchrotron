@@ -262,7 +262,13 @@ mod redis_tests {
         let value: isize = conn.get("").unwrap();
         assert_eq!(value, 19);
 
-        let _ = conn.send_packed_command(b"quit").unwrap();
+        // Now end the connection with QUIT.
+        let _ = conn.send_packed_command(b"quit\r\n").unwrap();
+        let _ = conn.recv_response().unwrap();
+
+        // We still have our sending side open, so we can send the PING command, but trying to
+        // receive the command should fail.
+        let _ = conn.send_packed_command(b"ping\r\n").unwrap();
         let _ = conn.recv_response().unwrap();
 
         drop(_daemons);

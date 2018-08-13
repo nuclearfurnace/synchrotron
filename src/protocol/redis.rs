@@ -22,10 +22,9 @@ use btoi::btoi;
 use bytes::{BufMut, BytesMut};
 use common::{Keyed, OrderedMessages};
 use futures::prelude::*;
+use metrics::{self, MetricSink, Metrics};
 use std::{error::Error, io, mem};
 use tokio::io::{write_all, AsyncRead, AsyncWrite, Write};
-use metrics;
-use metrics::{Metrics, MetricSink};
 
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
 const REDIS_COMMAND_STATUS: u8 = '+' as u8;
@@ -53,6 +52,7 @@ where
     rx: R,
     rd: BytesMut,
     metrics: MetricSink,
+    closed: bool,
 }
 
 /// A future that pulls multiple Redis messages from an asynchronous reader.
@@ -211,6 +211,7 @@ where
             rx,
             rd: BytesMut::new(),
             metrics: metrics::get_sink(),
+            closed: false,
         }
     }
 
@@ -234,12 +235,29 @@ where
     type Item = RedisMessage;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        if self.closed {
+            return Ok(Async::Ready(None));
+        }
+
         let socket_closed = self.fill_read_buf()?.is_ready();
 
         match read_message(&mut self.rd) {
             Ok(Async::Ready((bytes_read, cmd))) => {
                 trace!("[protocol] got message from client! ({} bytes)", bytes_read);
-                self.metrics.update_count(Metrics::ServerBytesReceived, bytes_read as i64);
+                self.metrics
+                    .update_count(Metrics::ServerBytesReceived, bytes_read as i64);
+
+                // If client has quit, mark the stream closed so that we return Ready(None) on the
+                // next call to poll.  This is the easiest way to ensure that all messages before
+                // this get processed but that we stop the flow of messages and thus close out the
+                // connection to the client.
+                match cmd {
+                    RedisMessage::Quit => {
+                        self.closed = true;
+                    },
+                    _ => {},
+                }
+
                 Ok(Async::Ready(Some(cmd)))
             },
             Err(e) => Err(e),
@@ -299,11 +317,9 @@ where
         loop {
             // We've collected all the messages, time to return.
             if self.msg_count == self.msg_idx {
-                self.metrics.update_count(Metrics::ServerBytesReceived, self.bytes_read as i64);
-                return Ok(Async::Ready((
-                    self.rx.take().unwrap(),
-                    self.msgs.take().unwrap(),
-                )));
+                self.metrics
+                    .update_count(Metrics::ServerBytesReceived, self.bytes_read as i64);
+                return Ok(Async::Ready((self.rx.take().unwrap(), self.msgs.take().unwrap())));
             }
 
             // If we have a pre-responsed-to message, skip it.
@@ -315,7 +331,7 @@ where
                     self.msg_idx += 1;
                     continue;
                 },
-                _ => {}
+                _ => {},
             }
 
             let result = read_message(&mut self.rd);
@@ -362,9 +378,7 @@ where
         self, msgs: OrderedMessages<Self::Message>,
     ) -> Box<Future<Item = (usize, usize, Self), Error = io::Error> + Send + 'static> {
         let msg_count = msgs.len();
-        let f = write_client_ordered_messages(self, msgs).map(move |(tx, _, nw)| {
-            (msg_count, nw, tx)
-        });
+        let f = write_client_ordered_messages(self, msgs).map(move |(tx, _, nw)| (msg_count, nw, tx));
         Box::new(f)
     }
 }
@@ -413,7 +427,7 @@ fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     // or null string.  Rather than using the full parser, we can quickly and easily match on those
     // hard-coded buffers.
     if let Some(msg_tuple) = read_inline_messages(rd) {
-        return Ok(Async::Ready(msg_tuple))
+        return Ok(Async::Ready(msg_tuple));
     }
 
     read_message_internal(rd)
@@ -643,7 +657,6 @@ where
     let buf_len = buf.len();
     write_all(tx, buf).map(move |(tx, _buf)| (tx, msgs, buf_len))
 }
-
 
 #[cfg(test)]
 mod tests {
