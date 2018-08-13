@@ -232,7 +232,6 @@ mod redis_tests {
     fn test_null_key() {
         let (_daemons, redis_url) = start_daemons(2);
 
-        // A simple set and then get.
         let client = redis::Client::open(redis_url.as_str()).unwrap();
         let conn = client.get_connection().unwrap();
 
@@ -250,4 +249,23 @@ mod redis_tests {
 
         drop(_daemons);
     }
+
+    #[test]
+    #[should_panic]
+    fn test_quit_drops_conn() {
+        let (_daemons, redis_url) = start_daemons(3);
+
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let conn = client.get_connection().unwrap();
+
+        let _: () = conn.set("", 19).unwrap();
+        let value: isize = conn.get("").unwrap();
+        assert_eq!(value, 19);
+
+        let _ = conn.send_packed_command(b"quit").unwrap();
+        let _ = conn.recv_response().unwrap();
+
+        drop(_daemons);
+    }
+
 }
