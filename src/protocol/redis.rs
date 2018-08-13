@@ -24,7 +24,8 @@ use common::{Keyed, OrderedMessages};
 use futures::prelude::*;
 use std::{error::Error, io, mem};
 use tokio::io::{write_all, AsyncRead, AsyncWrite, Write};
-use util::Sizable;
+use metrics;
+use metrics::{Metrics, MetricSink};
 
 const REDIS_COMMAND_ERROR: u8 = '-' as u8;
 const REDIS_COMMAND_STATUS: u8 = '+' as u8;
@@ -34,6 +35,7 @@ const REDIS_COMMAND_BULK: u8 = '*' as u8;
 
 const REDIS_NULL_BUF: [u8; 5] = [b'$', b'-', b'1', b'\r', b'\n'];
 const REDIS_OK_BUF: [u8; 5] = [b'+', b'O', b'K', b'\r', b'\n'];
+const REDIS_PING_RESP_BUF: [u8; 7] = [b'+', b'P', b'O', b'N', b'G', b'\r', b'\n'];
 const REDIS_STATUS_BUF: [u8; 1] = [REDIS_COMMAND_STATUS];
 const REDIS_ERR_BUF: [u8; 5] = [b'-', b'E', b'R', b'R', b' '];
 const REDIS_INT_BUF: [u8; 1] = [REDIS_COMMAND_INTEGER];
@@ -50,6 +52,7 @@ where
 {
     rx: R,
     rd: BytesMut,
+    metrics: MetricSink,
 }
 
 /// A future that pulls multiple Redis messages from an asynchronous reader.
@@ -59,6 +62,7 @@ where
 {
     rx: Option<R>,
     rd: BytesMut,
+    metrics: MetricSink,
     bytes_read: usize,
     msg_count: usize,
     msg_idx: usize,
@@ -88,6 +92,8 @@ where
 pub enum RedisMessage {
     Null,
     OK,
+    Ping,
+    Quit,
     Status(BytesMut, usize),
     Error(BytesMut, usize),
     Integer(BytesMut, i64),
@@ -146,6 +152,8 @@ impl RedisMessage {
         match self {
             RedisMessage::Null => BytesMut::from(&REDIS_NULL_BUF[..]),
             RedisMessage::OK => BytesMut::from(&REDIS_OK_BUF[..]),
+            RedisMessage::Ping => BytesMut::from(&REDIS_PING_RESP_BUF[..]),
+            RedisMessage::Quit => BytesMut::from(&REDIS_OK_BUF[..]),
             RedisMessage::Status(buf, _) => buf,
             RedisMessage::Error(buf, _) => buf,
             RedisMessage::Integer(buf, _) => buf,
@@ -158,6 +166,8 @@ impl RedisMessage {
         match self {
             RedisMessage::Null => BytesMut::from(&REDIS_NULL_BUF[..]),
             RedisMessage::OK => BytesMut::from(&REDIS_OK_BUF[..]),
+            RedisMessage::Ping => BytesMut::from(&REDIS_PING_RESP_BUF[..]),
+            RedisMessage::Quit => BytesMut::from(&REDIS_OK_BUF[..]),
             RedisMessage::Status(ref buf, _) => buf.clone(),
             RedisMessage::Error(ref buf, _) => buf.clone(),
             RedisMessage::Integer(ref buf, _) => buf.clone(),
@@ -185,21 +195,9 @@ impl Keyed for RedisMessage {
                 let end = buf.len() - 2;
                 &buf[*offset..end]
             },
+            RedisMessage::Ping => b"ping",
+            RedisMessage::Quit => b"quit",
             _ => panic!("message should be multi-bulk or data!"),
-        }
-    }
-}
-
-impl Sizable for RedisMessage {
-    fn size(&self) -> usize {
-        match self {
-            RedisMessage::Null => *&REDIS_NULL_BUF[..].len(),
-            RedisMessage::OK => *&REDIS_OK_BUF[..].len(),
-            RedisMessage::Status(buf, _) => buf.len(),
-            RedisMessage::Error(buf, _) => buf.len(),
-            RedisMessage::Integer(buf, _) => buf.len(),
-            RedisMessage::Data(buf, _) => buf.len(),
-            RedisMessage::Bulk(buf, _) => buf.len(),
         }
     }
 }
@@ -212,6 +210,7 @@ where
         RedisMessageStream {
             rx,
             rd: BytesMut::new(),
+            metrics: metrics::get_sink(),
         }
     }
 
@@ -240,6 +239,7 @@ where
         match read_message(&mut self.rd) {
             Ok(Async::Ready((bytes_read, cmd))) => {
                 trace!("[protocol] got message from client! ({} bytes)", bytes_read);
+                self.metrics.update_count(Metrics::ServerBytesReceived, bytes_read as i64);
                 Ok(Async::Ready(Some(cmd)))
             },
             Err(e) => Err(e),
@@ -264,6 +264,7 @@ where
         RedisMultipleMessages {
             rx: Some(rx),
             rd: BytesMut::new(),
+            metrics: metrics::get_sink(),
             bytes_read: 0,
             msgs: Some(msgs),
             msg_count: msgs_len,
@@ -290,7 +291,7 @@ where
     R: AsyncRead,
 {
     type Error = io::Error;
-    type Item = (R, usize, RedisOrderedMessages);
+    type Item = (R, RedisOrderedMessages);
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let socket_closed = self.fill_read_buf()?.is_ready();
@@ -298,11 +299,23 @@ where
         loop {
             // We've collected all the messages, time to return.
             if self.msg_count == self.msg_idx {
+                self.metrics.update_count(Metrics::ServerBytesReceived, self.bytes_read as i64);
                 return Ok(Async::Ready((
                     self.rx.take().unwrap(),
-                    self.bytes_read,
                     self.msgs.take().unwrap(),
                 )));
+            }
+
+            // If we have a pre-responsed-to message, skip it.
+            let msgs = self.msgs.as_mut().unwrap();
+            let (_, _, msg_slot) = &mut msgs[self.msg_idx];
+            match msg_slot {
+                RedisMessage::Ping | RedisMessage::Quit => {
+                    // Skip these.  They're placeholders.
+                    self.msg_idx += 1;
+                    continue;
+                },
+                _ => {}
             }
 
             let result = read_message(&mut self.rd);
@@ -311,8 +324,6 @@ where
                     // We read a message successfully, store it and continue on.
                     trace!("[protocol] got message from server! ({} bytes)", bytes_read);
 
-                    let msgs = self.msgs.as_mut().unwrap();
-                    let (_, _, msg_slot) = &mut msgs[self.msg_idx];
                     let _ = mem::replace(msg_slot, msg);
                     self.msg_idx += 1;
                 },
@@ -351,7 +362,9 @@ where
         self, msgs: OrderedMessages<Self::Message>,
     ) -> Box<Future<Item = (usize, usize, Self), Error = io::Error> + Send + 'static> {
         let msg_count = msgs.len();
-        let f = write_ordered_messages(self, msgs).map(move |(tx, _, nw)| (msg_count, nw, tx));
+        let f = write_client_ordered_messages(self, msgs).map(move |(tx, _, nw)| {
+            (msg_count, nw, tx)
+        });
         Box::new(f)
     }
 }
@@ -394,27 +407,52 @@ where
 }
 
 fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
-    // The only command we handle in non-RESP format is PING.  This is for simplicity
-    // and compatibility with redis-benchmark, and also allowing health checks that don't need to
-    // follow the RESP structure.
+    // Check to see if we got any inline commands.
+    //
+    // This is either shortform commands -- like PING or QUIT -- or hard-coded responses like an OK
+    // or null string.  Rather than using the full parser, we can quickly and easily match on those
+    // hard-coded buffers.
+    if let Some(msg_tuple) = read_inline_messages(rd) {
+        return Ok(Async::Ready(msg_tuple))
+    }
+
+    read_message_internal(rd)
+}
+
+fn read_inline_messages(rd: &mut BytesMut) -> Option<(usize, RedisMessage)> {
     if rd.starts_with(&b"ping\r\n"[..]) || rd.starts_with(&b"PING\r\n"[..]) {
         let _ = rd.split_to(6);
-        return Ok(Async::Ready((6, RedisMessage::from_inline("ping\r\n"))));
+        return Some((6, RedisMessage::Ping));
+    }
+
+    if rd.starts_with(&b"*1\r\n$4\r\nping\r\n"[..]) || rd.starts_with(&b"*1\r\n$4\r\nPING\r\n"[..]) {
+        let _ = rd.split_to(14);
+        return Some((14, RedisMessage::Ping));
+    }
+
+    if rd.starts_with(&b"quit\r\n"[..]) || rd.starts_with(&b"QUIT\r\n"[..]) {
+        let _ = rd.split_to(6);
+        return Some((6, RedisMessage::Quit));
+    }
+
+    if rd.starts_with(&b"*1\r\n$4\r\nquit\r\n"[..]) || rd.starts_with(&b"*1\r\n$4\r\nQUIT\r\n"[..]) {
+        let _ = rd.split_to(14);
+        return Some((14, RedisMessage::Quit));
     }
 
     // See if this is an OK response.
     if rd.starts_with(&b"+OK\r\n"[..]) {
         let _ = rd.split_to(5);
-        return Ok(Async::Ready((5, RedisMessage::OK)));
+        return Some((5, RedisMessage::OK));
     }
 
     // See if this is a NULL response.
     if rd.starts_with(&b"$-1\r\n"[..]) {
         let _ = rd.split_to(5);
-        return Ok(Async::Ready((5, RedisMessage::Null)));
+        return Some((5, RedisMessage::Null));
     }
 
-    read_message_internal(rd)
+    None
 }
 
 fn read_message_internal(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
@@ -565,33 +603,47 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), io::Error> {
     Ok(Async::Ready((total, RedisMessage::Bulk(buf, args))))
 }
 
-pub fn write_ordered_messages<T>(
+pub fn write_client_ordered_messages<T>(
     tx: T, mut msgs: RedisOrderedMessages,
 ) -> impl Future<Item = (T, RedisOrderedMessages, usize), Error = io::Error>
 where
     T: AsyncWrite,
 {
-    let msgs_len = msgs.len();
-    let buf = match msgs_len {
-        1 => {
-            let (_, _, msg) = &mut msgs[0];
-            let msg2 = mem::replace(msg, RedisMessage::Null);
-            msg2.as_resp()
-        },
-        _ => {
-            let mut buf = BytesMut::new();
-            for (_, _, msg) in &mut msgs {
-                let msg2 = mem::replace(msg, RedisMessage::Null);
-                let msg_buf = msg2.as_resp();
-                buf.extend_from_slice(&msg_buf[..]);
-            }
-            buf
-        },
-    };
+    let mut buf = BytesMut::new();
+    for (_, _, msg) in &mut msgs {
+        let msg2 = mem::replace(msg, RedisMessage::Null);
+        let msg_buf = msg2.as_resp();
+        buf.extend_from_slice(&msg_buf[..]);
+    }
 
     let buf_len = buf.len();
     write_all(tx, buf).map(move |(tx, _buf)| (tx, msgs, buf_len))
 }
+
+pub fn write_server_ordered_messages<T>(
+    tx: T, mut msgs: RedisOrderedMessages,
+) -> impl Future<Item = (T, RedisOrderedMessages, usize), Error = io::Error>
+where
+    T: AsyncWrite,
+{
+    let mut buf = BytesMut::new();
+    for (_, _, msg) in &mut msgs {
+        match msg {
+            // Leave ping/quit messages in place and intact. These are forwarded wholesale back to
+            // the client and aren't actually written to the backends because that'd be silly.
+            RedisMessage::Ping | RedisMessage::Quit => {},
+            x => {
+                let msg2 = mem::replace(x, RedisMessage::Null);
+                let msg_buf = msg2.as_resp();
+                buf.extend_from_slice(&msg_buf[..]);
+            },
+        }
+    }
+
+    let buf_len = buf.len();
+    write_all(tx, buf).map(move |(tx, _buf)| (tx, msgs, buf_len))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -614,6 +666,12 @@ mod tests {
     static DATA_SHORT_CIRCUIT_ARG_LEN_PAST_END: &[u8] = b"*2\r\n$3\r\nget\r\n$9\r\nfoobar\r\n";
     static DATA_PING_LOWER: &[u8] = b"ping\r\n";
     static DATA_PING_UPPER: &[u8] = b"PING\r\n";
+    static DATA_PING_FULL_LOWER: &[u8] = b"*1\r\n$4\r\nping\r\n";
+    static DATA_PING_FULL_UPPER: &[u8] = b"*1\r\n$4\r\nPING\r\n";
+    static DATA_QUIT_LOWER: &[u8] = b"quit\r\n";
+    static DATA_QUIT_UPPER: &[u8] = b"QUIT\r\n";
+    static DATA_QUIT_FULL_LOWER: &[u8] = b"*1\r\n$4\r\nquit\r\n";
+    static DATA_QUIT_FULL_UPPER: &[u8] = b"*1\r\n$4\r\nQUIT\r\n";
 
     fn get_message_from_buf(buf: &[u8]) -> Poll<RedisMessage, io::Error> {
         let mut rd = BytesMut::with_capacity(buf.len());
@@ -796,23 +854,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_ping_lower() {
-        let res = get_message_from_buf(&DATA_PING_LOWER);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
+    fn parse_ping() {
+        match get_message_from_buf(&DATA_PING_LOWER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
+            _ => panic!("should have had message"),
+        }
 
-        match res.unwrap() {
-            Async::Ready(msg) => check_bulk_matches(msg, vec![b"ping"]),
+        match get_message_from_buf(&DATA_PING_UPPER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
+            _ => panic!("should have had message"),
+        }
+
+        match get_message_from_buf(&DATA_PING_FULL_LOWER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
+            _ => panic!("should have had message"),
+        }
+
+        match get_message_from_buf(&DATA_PING_FULL_UPPER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
             _ => panic!("should have had message"),
         }
     }
 
     #[test]
-    fn parse_ping_upper() {
-        let res = get_message_from_buf(&DATA_PING_UPPER);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
+    fn parse_quit() {
+        match get_message_from_buf(&DATA_QUIT_LOWER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
+            _ => panic!("should have had message"),
+        }
 
-        match res.unwrap() {
-            Async::Ready(msg) => check_bulk_matches(msg, vec![b"ping"]),
+        match get_message_from_buf(&DATA_QUIT_UPPER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
+            _ => panic!("should have had message"),
+        }
+
+        match get_message_from_buf(&DATA_QUIT_FULL_LOWER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
+            _ => panic!("should have had message"),
+        }
+
+        match get_message_from_buf(&DATA_QUIT_FULL_UPPER) {
+            Ok(Async::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
             _ => panic!("should have had message"),
         }
     }
