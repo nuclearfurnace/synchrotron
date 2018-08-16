@@ -20,7 +20,10 @@
 use futures::stream::Stream;
 
 mod batch;
-pub use self::batch::OrderedBatch;
+pub use self::batch::Batch;
+
+mod work_queue;
+pub use self::work_queue::{WorkQueue, Worker};
 
 impl<T: ?Sized> StreamExt for T where T: Stream {}
 
@@ -39,10 +42,23 @@ pub trait StreamExt: Stream {
     ///
     /// If the underlying stream signals that it is not ready, and no items have been batched, then
     /// the stream will emit nothing.
-    fn ordered_batch(self, capacity: usize) -> batch::OrderedBatch<Self>
+    fn batch(self, capacity: usize) -> batch::Batch<Self>
     where
         Self: Sized,
     {
         batch::new(self, capacity)
     }
+}
+
+/// Calculates the size of bytes for all items in a batch.
+pub fn get_batch_size<T>(batch: &[T]) -> usize
+where
+    T: Sizable,
+{
+    batch.into_iter().fold(0, |acc, x| acc + x.size())
+}
+
+/// A type that can report back its own size in bytes.
+pub trait Sizable {
+    fn size(&self) -> usize;
 }

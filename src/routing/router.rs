@@ -17,12 +17,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use backend::processor::RequestProcessor;
-use common::OrderedMessages;
+use backend::{message_queue::QueuedMessage, processor::RequestProcessor};
 use routing::errors::RouterError;
 
 pub trait Router<T: RequestProcessor> {
-    type Future;
-
-    fn route(&self, OrderedMessages<T::Message>) -> Result<Self::Future, RouterError>;
+    fn route(&self, Vec<QueuedMessage<T::Message>>) -> Result<(), RouterError>;
 }

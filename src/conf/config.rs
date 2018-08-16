@@ -50,6 +50,9 @@ impl Configuration {
     pub fn new() -> Result<Self, ConfigError> {
         let mut s = Config::new();
 
+        // TODO: the hierarchy stuff doesn't work IIRC.  re-examine that and figure out if my
+        // memory is just shit or if it actually doesn't work.
+
         // Set some defaults.
         s.set_default("logging.level", "info")?;
         // how tf do we make this work?
@@ -59,7 +62,7 @@ impl Configuration {
         // Now load in any configuration files we can find.
         s.merge(File::with_name("config/synchrotron").required(false))?;
 
-        let env = env::var("ENV").unwrap_or("dev".into());
+        let env = env::var("ENV").unwrap_or_else(|_| "dev".into());
         s.merge(File::with_name(&format!("config/synchrotron.{}", env)).required(false))?;
         s.merge(File::with_name("config/synchrotron.local").required(false))?;
 

@@ -33,41 +33,41 @@ use std::mem;
 /// Batches items to match the `OrderedMessages` type.
 #[derive(Debug)]
 #[must_use = "streams do nothing unless polled"]
-pub struct OrderedBatch<S>
+pub struct Batch<S>
 where
     S: Stream,
 {
-    items: Vec<(u64, i64, S::Item)>,
+    items: Vec<S::Item>,
     err: Option<S::Error>,
     stream: Fuse<S>,
 }
 
-pub fn new<S>(s: S, capacity: usize) -> OrderedBatch<S>
+pub fn new<S>(s: S, capacity: usize) -> Batch<S>
 where
     S: Stream,
 {
     assert!(capacity > 0);
 
-    OrderedBatch {
+    Batch {
         items: Vec::with_capacity(capacity),
         err: None,
         stream: s.fuse(),
     }
 }
 
-impl<S: Stream> OrderedBatch<S> {
-    fn take(&mut self) -> Vec<(u64, i64, S::Item)> {
+impl<S: Stream> Batch<S> {
+    fn take(&mut self) -> Vec<S::Item> {
         let cap = self.items.capacity();
         mem::replace(&mut self.items, Vec::with_capacity(cap))
     }
 }
 
-impl<S> Stream for OrderedBatch<S>
+impl<S> Stream for Batch<S>
 where
     S: Stream,
 {
-    type Error = <S as Stream>::Error;
-    type Item = Vec<(u64, i64, <S as Stream>::Item)>;
+    type Error = S::Error;
+    type Item = Vec<S::Item>;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         if let Some(err) = self.err.take() {
@@ -81,9 +81,10 @@ where
                 // simply return them to the caller and zero out our internal buffer.  If we have
                 // no items, then tell the caller we aren't ready.
                 Ok(Async::NotReady) => {
-                    return match self.items.len() {
-                        0 => Ok(Async::NotReady),
-                        _ => Ok(Some(self.take()).into()),
+                    return if self.items.is_empty() {
+                        Ok(Async::NotReady)
+                    } else {
+                        Ok(Some(self.take()).into())
                     }
                 },
 
@@ -94,8 +95,7 @@ where
                 // possible item available to us at the time of a given `poll`, maximixing the
                 // batching effect.
                 Ok(Async::Ready(Some(item))) => {
-                    let index = self.items.len() as u64;
-                    self.items.push((index, -1, item));
+                    self.items.push(item);
                     if self.items.len() >= cap {
                         return Ok(Some(self.take()).into());
                     }
@@ -104,7 +104,7 @@ where
                 // Since the underlying stream ran out of values, return what we have buffered, if
                 // we have anything at all.
                 Ok(Async::Ready(None)) => {
-                    return if self.items.len() > 0 {
+                    return if !self.items.is_empty() {
                         Ok(Some(self.take()).into())
                     } else {
                         Ok(Async::Ready(None))
@@ -114,7 +114,7 @@ where
                 // If we've got buffered items be sure to return them first, we'll defer our error
                 // for later.
                 Err(e) => {
-                    if self.items.len() == 0 {
+                    if self.items.is_empty() {
                         return Err(e);
                     } else {
                         self.err = Some(e);
