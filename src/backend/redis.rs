@@ -17,20 +17,23 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use backend::processor::{ProcessorError, RequestProcessor, TcpStreamFuture};
+use backend::{
+    message_queue::{MessageState, QueuedMessage},
+    processor::{ProcessorError, RequestProcessor, TcpStreamFuture},
+};
 use bytes::BytesMut;
-use common::OrderedMessages;
 use futures::{future::ok, prelude::*};
 use itoa;
 use protocol::{
     self,
-    redis::{self, RedisMessage, RedisMessageSink, RedisMessageStream},
+    errors::ProtocolError,
+    redis::{self, RedisMessage, RedisMessageStream},
 };
-use std::{collections::HashMap, error::Error, io};
-use tokio::{
-    io::{AsyncRead, ReadHalf, WriteHalf},
-    net::TcpStream,
-};
+use std::{borrow::Borrow, error::Error};
+use tokio::{io::ReadHalf, net::TcpStream};
+
+const REDIS_DEL: &[u8] = b"del";
+const REDIS_SET: &[u8] = b"set";
 
 #[derive(Clone)]
 pub struct RedisRequestProcessor;
@@ -41,184 +44,196 @@ impl RedisRequestProcessor {
 
 impl RequestProcessor for RedisRequestProcessor {
     type ClientReader = RedisMessageStream<ReadHalf<TcpStream>>;
-    type ClientWriter = RedisMessageSink<WriteHalf<TcpStream>>;
-    type Future = Box<Future<Item = (TcpStream, OrderedMessages<Self::Message>), Error = io::Error> + Send>;
+    type Future = Box<Future<Item = TcpStream, Error = ProtocolError> + Send>;
     type Message = RedisMessage;
 
-    fn is_fragmented(&self, msg: &Self::Message) -> bool { redis_is_multi_message(msg) }
-
-    fn get_fragments(&self, msg: Self::Message) -> Result<Vec<Self::Message>, ProcessorError> {
-        redis_fragment_message(msg)
+    fn fragment_messages(
+        &self, msgs: Vec<Self::Message>,
+    ) -> Result<Vec<(MessageState, Self::Message)>, ProcessorError> {
+        redis_fragment_messages(msgs)
     }
 
-    fn defragment_messages(
-        &self, msgs: OrderedMessages<Self::Message>, ops: HashMap<u64, Self::Message>,
-    ) -> Result<OrderedMessages<Self::Message>, ProcessorError> {
-        redis_defragment_messages(msgs, ops)
+    fn defragment_messages(&self, msgs: Vec<(MessageState, Self::Message)>) -> Result<Self::Message, ProcessorError> {
+        redis_defragment_messages(msgs)
     }
 
     fn get_error_message(&self, e: Box<Error>) -> Self::Message { RedisMessage::from_error(e) }
 
-    fn get_client_streams(&self, client: TcpStream) -> (Self::ClientReader, Self::ClientWriter) {
-        let (client_rx, client_tx) = client.split();
-
-        let rd = protocol::redis::read_messages_stream(client_rx);
-        let wr = protocol::redis::write_messages_sink(client_tx);
-
-        (rd, wr)
+    fn get_read_stream(&self, client_rx: ReadHalf<TcpStream>) -> Self::ClientReader {
+        protocol::redis::read_messages_stream(client_rx)
     }
 
-    fn process(&self, req: OrderedMessages<Self::Message>, stream: TcpStreamFuture) -> Self::Future {
+    fn process(&self, req: Vec<QueuedMessage<Self::Message>>, stream: TcpStreamFuture) -> Self::Future {
         let inner = stream
-            .and_then(move |server| redis::write_server_ordered_messages(server, req))
-            .and_then(move |(server, msgs, _nw)| redis::read_messages(server, msgs))
-            .and_then(move |(server, resps)| ok((server, resps)));
+            .map_err(|e| e.into())
+            .and_then(move |server| redis::write_messages(server, req))
+            .and_then(move |(server, msgs, _n)| redis::read_messages(server, msgs))
+            .and_then(move |(server, _n)| ok(server));
         Box::new(inner)
     }
 }
 
-fn redis_fragment_message(msg: RedisMessage) -> Result<Vec<RedisMessage>, ProcessorError> {
-    match msg {
-        RedisMessage::Bulk(_, mut args) => {
-            // Split off the actual command string and figure out what the new command string
-            // will be for our fragments.
-            let cmd = args.remove(0);
-            let cmd_buf = redis_get_data_buffer(&cmd);
-            let new_cmd_buf = match cmd_buf {
-                Some(buf) => {
-                    match buf {
-                        b"mget" => b"get",
-                        b"del" => b"del",
-                        b"mset" => b"set",
-                        x => {
+fn redis_fragment_messages(msgs: Vec<RedisMessage>) -> Result<Vec<(MessageState, RedisMessage)>, ProcessorError> {
+    let mut fragments = Vec::new();
+
+    for msg in msgs {
+        match redis_is_multi_message(&msg) {
+            // This message isn't fragmentable, so it passes through untouched.
+            false => fragments.push((MessageState::Standalone, msg)),
+            true => {
+                match msg {
+                    RedisMessage::Bulk(_, mut args) => {
+                        // Split off the actual command string and figure out what the new command string
+                        // will be for our fragments.
+                        let cmd = args.remove(0);
+                        let cmd_buf = redis_get_data_buffer(&cmd);
+                        let new_cmd_buf = match cmd_buf {
+                            Some(buf) => {
+                                match buf {
+                                    b"mget" => b"get",
+                                    b"del" => b"del",
+                                    b"mset" => b"set",
+                                    x => {
+                                        return Err(ProcessorError::FragmentError(format!(
+                                            "tried to fragment command '{:?}' but command is not fragmentable!",
+                                            x
+                                        )))
+                                    },
+                                }
+                            },
+                            None => {
+                                return Err(ProcessorError::FragmentError(
+                                    "tried to fragment bulk message with non-data argument in position 0!".to_owned(),
+                                ))
+                            },
+                        };
+
+                        // Now we'll do the actual splitting.  We take the new command string (get for
+                        // mget, set for mset, and del for del) and build a buffer for it.  We extract
+                        // N arguments at a time from our original message, where N is either 1 or 2
+                        // depending on if this is a set operation.  With each N arguments, we build a
+                        // new message using the new command string and the arguments we extract.
+                        let cmd_arg = redis_new_data_buffer(&new_cmd_buf[..]);
+                        let mut cmd_type = BytesMut::with_capacity(new_cmd_buf.len());
+                        cmd_type.extend_from_slice(&new_cmd_buf[..]);
+
+                        let arg_take_cnt = if new_cmd_buf == b"set" { 2 } else { 1 };
+                        let total_fragments = args.len();
+
+                        // Make sure we won't be left with extra arguments.
+                        if total_fragments % arg_take_cnt != 0 {
                             return Err(ProcessorError::FragmentError(format!(
-                                "tried to fragment command '{:?}' but command is not fragmentable!",
-                                x
-                            )))
-                        },
-                    }
-                },
-                None => {
-                    return Err(ProcessorError::FragmentError(format!(
-                        "tried to fragment bulk message with non-data argument in position 0!"
-                    )))
-                },
-            };
+                                "incorrect multiple of argument count! (multiple: {}, arg count: {}, cmd type: {:?})",
+                                arg_take_cnt,
+                                args.len(),
+                                &cmd_type
+                            )));
+                        }
 
-            let cmd_arg = redis_new_data_buffer(&new_cmd_buf[..]);
+                        // For get requests, we can stream back the fragments so long as they're in
+                        // order.  We also need to make sure we provide the proper header (aka the data
+                        // that tells the client the response is going to be multiple items) to the
+                        // first fragment so that we generate valid output.
+                        let is_streaming = new_cmd_buf == b"get";
+                        let mut streaming_hdr = if is_streaming {
+                            Some(redis_new_bulk_buffer(total_fragments))
+                        } else {
+                            None
+                        };
 
-            // Now do the actual spliting.  Depending on the command, we may take one or two
-            // items.  We build a new bulk message based on the replacement command plus the args
-            // that we peel off.
-            let arg_take_cnt = if new_cmd_buf == b"set" { 2 } else { 1 };
+                        let mut fragment_count = 0;
+                        while !args.is_empty() {
+                            // This is contorted but we split off the first N arguments, which leaves `args`
+                            // with those N and `new_args` with the rest.  We feed those to a function which
+                            // builds us our new message, and then finally we replace `args` with `new_args`
+                            // so that we can continue on.
+                            let new_args = args.split_off(arg_take_cnt);
+                            args.insert(0, cmd_arg.clone());
+                            let new_bulk = redis_new_bulk_from_args(args);
 
-            let mut fragments = Vec::new();
-            fragments.push(cmd);
-            while args.len() > 0 {
-                if args.len() < arg_take_cnt {
-                    return Err(ProcessorError::FragmentError(format!(
-                        "tried to take {} arguments, only {} left!",
-                        arg_take_cnt,
-                        args.len()
-                    )));
+                            let state = match is_streaming {
+                                true => MessageState::StreamingFragmented(streaming_hdr.take()),
+                                // Normal fragments need to know the command they're being used for so
+                                // we can properly form a command-specific response when we ultimate
+                                // defragment these messages later on.
+                                false => MessageState::Fragmented(cmd_type.clone(), fragment_count, total_fragments),
+                            };
+
+                            fragments.push((state, new_bulk));
+                            fragment_count += 1;
+                            args = new_args;
+                        }
+                    },
+                    _ => unreachable!(),
                 }
-
-                // This is contorted but we split off the first N arguments, which leaves `args`
-                // with those N and `new_args` with the rest.  We feed those to a function which
-                // builds us our new message, and then finally we replace `args` with `new_args`
-                // so that we can continue on.
-                let new_args = args.split_off(arg_take_cnt);
-                args.insert(0, cmd_arg.clone());
-                let new_bulk = redis_new_bulk_from_args(args);
-                fragments.push(new_bulk);
-
-                args = new_args;
-            }
-
-            Ok(fragments)
-        },
-        x => Ok(vec![x]),
+            },
+        }
     }
+
+    Ok(fragments)
 }
 
-fn redis_defragment_messages(
-    msgs: OrderedMessages<RedisMessage>, ops: HashMap<u64, RedisMessage>,
-) -> Result<OrderedMessages<RedisMessage>, ProcessorError> {
-    let mut new_msgs = Vec::with_capacity(msgs.len());
-    let mut fragmented_parts = HashMap::new();
-
-    // For each message, if it has a fragment ID of -1, it's standalone, so just store it.  If it
-    // has anything else, it's a fragment, and we need to track it so we can compress it down at
-    // the end.
-    for (id, fragment_id, msg) in msgs {
-        if fragment_id < 0 {
-            new_msgs.push((id, fragment_id, msg));
-        } else {
-            let fragment_batch = fragmented_parts.entry(id).or_insert(Vec::new());
-            fragment_batch.insert(fragment_id as usize, msg);
-        }
+fn redis_defragment_messages(fragments: Vec<(MessageState, RedisMessage)>) -> Result<RedisMessage, ProcessorError> {
+    // This shouldn't happen but it's a simple invariant that lets me write slightly cleaner code.
+    if fragments.is_empty() {
+        return Ok(RedisMessage::Null);
     }
 
-    // Now we build new messages from the fragments.  Go through our ops map to figure out what
-    // sort of message we should be building.
-    for (id, op) in ops {
-        match redis_get_data_buffer(&op) {
-            Some(cmd) => {
-                match cmd {
-                    b"mget" => {
-                        // MGET is straight-forward.  Take all the fragments we got, and create a bulk message.
-                        let fragments = fragmented_parts
-                            .remove(&id)
-                            .ok_or(ProcessorError::DefragmentError(format!("no fragment batch for MGET")))?;
-                        let mut new_buf = redis_new_bulk_buffer(fragments.len());
-                        for fragment in &fragments {
-                            new_buf.unsplit(fragment.get_buf());
-                        }
+    // Peek at the metadata buffer on the first message.  If it's not a fragmented message, then
+    // something isn't rightand we need to bomb out.
+    let first = fragments.first().unwrap();
+    let cmd_type = match first {
+        (MessageState::Fragmented(buf, _, _), _) => buf.clone(),
+        _ => {
+            return Err(ProcessorError::DefragmentError(
+                "tried to defragment messages, but got non-fragmented message in list".to_owned(),
+            ))
+        },
+    };
 
-                        new_msgs.push((id, -1, RedisMessage::Bulk(new_buf, fragments)));
-                    },
-                    b"del" => {
-                        // DEL returns the number of keys it deleted, so we have to tally up the
-                        // integer responses.
-                        let mut keys_deleted = 0;
-                        let fragments = fragmented_parts
-                            .remove(&id)
-                            .ok_or(ProcessorError::DefragmentError(format!("no fragment batch for DEL")))?;
-                        for fragment in &fragments {
-                            match fragment {
-                                RedisMessage::Integer(_, value) => keys_deleted += value,
-                                _ => {
-                                    return Err(ProcessorError::DefragmentError(format!(
-                                        "non-integer response for DEL!"
-                                    )))
-                                },
-                            }
-                        }
-
-                        new_msgs.push((id, -1, RedisMessage::from_integer(keys_deleted)));
-                    },
-                    b"mset" => {
-                        // MSET apparently "can't fail", and supposedly only ever returns OK, so just
-                        // blindly push in an OK message.
-                        new_msgs.push((id, -1, RedisMessage::OK));
-                    },
-                    x => {
-                        return Err(ProcessorError::DefragmentError(format!(
-                            "unaccounted for fragment op: {:?}",
-                            x
-                        )))
+    // We have the command type, so let's actually defragment now.
+    match cmd_type.borrow() {
+        // DEL returns the number of keys it deleted, so we have to tally up the integer responses.
+        REDIS_DEL => {
+            let mut keys_deleted = 0;
+            for (_state, fragment) in fragments {
+                match fragment {
+                    RedisMessage::Integer(_, value) => keys_deleted += value,
+                    RedisMessage::Error(_, _) => return Ok(fragment),
+                    _ => {
+                        return Err(ProcessorError::DefragmentError(
+                            "non-integer response for DEL!".to_owned(),
+                        ))
                     },
                 }
-            },
-            None => {
-                return Err(ProcessorError::DefragmentError(format!(
-                    "fragment op was not data message"
-                )))
-            },
-        }
-    }
+            }
 
-    Ok(new_msgs)
+            Ok(RedisMessage::from_integer(keys_deleted))
+        },
+        REDIS_SET => {
+            // MSET is funny because it says it can't fail, but really, the command has no failure
+            // mode _except_ for, like, you know, the server running out of memory.  However, MSET
+            // also promises to be atomic.
+            //
+            // So, we have to lie a bit here.  If we get back an error, other things could have
+            // completed, but we'll send back the first error we iterate over so we can at least
+            // inform the caller that _something_ bad happened.  If we see no errors, we assume
+            // everything went well, and send back the "normal" OK message.
+            for (_state, fragment) in fragments {
+                if let RedisMessage::Error(_, _) = fragment {
+                    return Ok(fragment);
+                }
+            }
+
+            Ok(RedisMessage::OK)
+        },
+        x => {
+            Err(ProcessorError::DefragmentError(format!(
+                "unknown command type '{:?}'",
+                x
+            )))
+        },
+    }
 }
 
 fn redis_get_data_buffer(msg: &RedisMessage) -> Option<&[u8]> {
@@ -251,7 +266,7 @@ fn redis_is_multi_message(msg: &RedisMessage) -> bool {
     }
 }
 
-fn redis_clean_data<'a>(buf: &'a BytesMut, offset: usize) -> &'a [u8] {
+fn redis_clean_data(buf: &BytesMut, offset: usize) -> &[u8] {
     assert!(buf.len() > 2);
     let val_len = buf.len() - 2;
     &buf[offset..val_len]

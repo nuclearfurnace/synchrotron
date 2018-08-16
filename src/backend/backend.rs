@@ -17,20 +17,87 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use backend::{processor::RequestProcessor, BackendError};
-use common::{Keyed, OrderedMessages};
+use backend::{message_queue::QueuedMessage, processor::RequestProcessor};
 use futures::{
-    future::{ok, Either},
+    future::{ok, Either, Shared},
     prelude::*,
-    sync::{mpsc, oneshot},
+    sync::mpsc,
 };
-use metrics::{get_sink, MetricSink, Metrics};
-use std::{io, net::SocketAddr};
+use futures_turnstyle::Waiter;
+use protocol::errors::ProtocolError;
+use std::net::SocketAddr;
 use tokio::net::TcpStream;
+use util::{WorkQueue, Worker};
 
-pub enum BackendConnection {
-    Alive(TcpStream),
+pub enum BackendCommand {
     Error,
+}
+
+struct BackendConnection<P>
+where
+    P: RequestProcessor,
+    P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
+{
+    processor: P,
+    worker: Worker<Vec<QueuedMessage<P::Message>>>,
+    command_tx: mpsc::UnboundedSender<BackendCommand>,
+    address: SocketAddr,
+
+    socket: Option<TcpStream>,
+    current: Option<P::Future>,
+}
+
+impl<P> Future for BackendConnection<P>
+where
+    P: RequestProcessor,
+    P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
+{
+    type Error = ();
+    type Item = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            // First, check if we have an operation running.  If we do, poll it to drive it towards
+            // completion.  If it's done, we'll reclaim the socket and then fallthrough to trying to
+            // find another piece of work to run.
+            if let Some(task) = self.current.as_mut() {
+                match task.poll() {
+                    Ok(Async::Ready(socket)) => {
+                        // The operation finished, and gave us the connection back.
+                        self.socket = Some(socket);
+                        self.current = None;
+                    },
+                    Ok(Async::NotReady) => return Ok(Async::NotReady),
+                    Err(_) => {
+                        // On error, we kill ourselves but notify the supervisor first so it can
+                        // replace us down the line.
+                        let _ = self.command_tx.unbounded_send(BackendCommand::Error);
+                        return Err(());
+                    },
+                }
+            }
+
+            // If we're here, we have no current operation to drive, so see if anything is in our work
+            // queue that we can grab.
+            match self.worker.poll() {
+                Ok(Async::Ready(Some(batch))) => {
+                    let socket = match self.socket.take() {
+                        Some(socket) => Either::A(ok(socket)),
+                        None => Either::B(TcpStream::connect(&self.address)),
+                    };
+
+                    let work = self.processor.process(batch, socket);
+                    self.current = Some(work);
+                },
+                Ok(Async::Ready(None)) => return Ok(Async::Ready(())),
+                Ok(Async::NotReady) => return Ok(Async::NotReady),
+                Err(e) => {
+                    let _ = self.command_tx.unbounded_send(BackendCommand::Error);
+                    return Err(e);
+                },
+            }
+        }
+    }
 }
 
 /// A state machine that drives the pooling of backend connections and the requests that require
@@ -43,118 +110,95 @@ pub enum BackendConnection {
 /// There is an implicit requirement that a backend be created with a sibling state machine, and
 /// each given the appropriate tx/rx sides of a channel that allows them to communicate with each
 /// other.
-pub struct BackendStateMachine<T>
+pub struct BackendSupervisor<P>
 where
-    T: RequestProcessor,
+    P: RequestProcessor + Clone + Send,
+    P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
 {
-    sink: MetricSink,
-
-    processor: T,
-    requests_rx: mpsc::UnboundedReceiver<(
-        OrderedMessages<T::Message>,
-        oneshot::Sender<Result<OrderedMessages<T::Message>, BackendError>>,
-    )>,
+    processor: P,
+    worker: Worker<Vec<QueuedMessage<P::Message>>>,
+    command_rx: mpsc::UnboundedReceiver<BackendCommand>,
+    command_tx: mpsc::UnboundedSender<BackendCommand>,
 
     address: SocketAddr,
-    conns: Vec<TcpStream>,
-    conns_rx: mpsc::UnboundedReceiver<BackendConnection>,
-    conns_tx: mpsc::UnboundedSender<BackendConnection>,
     conn_count: usize,
     conn_limit: usize,
+
+    close: Shared<Waiter>,
 }
 
-impl<T> Future for BackendStateMachine<T>
+impl<P> Future for BackendSupervisor<P>
 where
-    T: RequestProcessor,
-    T::Message: Keyed + Send + 'static,
-    T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = io::Error> + Send + 'static,
+    P: RequestProcessor + Clone + Send + 'static,
+    P::Message: Send,
+    P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
 {
     type Error = ();
     type Item = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        // If we're supposed to close, do it now.
+        if let Ok(Async::Ready(_)) = self.close.poll() {
+            return Ok(Async::Ready(()));
+        }
+
+        // Process any commands.
         loop {
-            // See if we have a connection to recover or replace.
-            match self.conns_rx.poll() {
-                Ok(Async::Ready(Some(conn))) => {
-                    match conn {
-                        BackendConnection::Alive(conn) => self.conns.push(conn),
-                        BackendConnection::Error => {
+            match self.command_rx.poll() {
+                Ok(Async::Ready(Some(cmd))) => {
+                    match cmd {
+                        BackendCommand::Error => {
                             self.conn_count -= 1;
                         },
                     }
                 },
-                Ok(Async::NotReady) => {},
-                _ => return Err(()),
-            }
-
-            // If all connections are currently busy, we can't do anything else.  By waiting until
-            // we've exhausted our connections channel to check here, we're making sure we set
-            // ourselves up to be notified when a connection is recovered, or fails.
-            if self.conns.len() == 0 && self.conn_count == self.conn_limit {
-                return Ok(Async::NotReady);
-            }
-
-            // See if we have a request waiting to be processed.
-            match self.requests_rx.poll() {
-                Ok(Async::NotReady) => return Ok(Async::NotReady),
-                Ok(Async::Ready(Some((request, response_tx)))) => {
-                    // We have a new request.  Grab a connection and attempt to service it.
-                    let connection = match self.conns.len() {
-                        0 => {
-                            self.conn_count += 1;
-                            self.sink.increment(Metrics::BackendNewConnections);
-                            Either::B(TcpStream::connect(&self.address))
-                        },
-                        _ => self.conns.pop().map(|x| Either::A(ok(x))).unwrap(),
-                    };
-
-                    let conns_tx = self.conns_tx.clone();
-                    let inner_work = self.processor.process(request, connection);
-                    let work = inner_work
-                        .then(|result| {
-                            match result {
-                                Ok((conn, x)) => ok((BackendConnection::Alive(conn), Ok(x))),
-                                Err(e) => ok((BackendConnection::Error, Err(e.into()))),
-                            }
-                        }).and_then(move |(br, or)| conns_tx.send(br).map(|_| or))
-                        .and_then(move |result| ok(response_tx.send(result)))
-                        .map_err(|_| ())
-                        .map(|_| ());
-
-                    tokio::spawn(work);
-                },
+                Ok(Async::NotReady) => break,
                 _ => return Err(()),
             }
         }
+
+        // Make sure all connections have been spawned.
+        while self.conn_count < self.conn_limit {
+            let connection = BackendConnection {
+                processor: self.processor.clone(),
+                worker: self.worker.clone(),
+                address: self.address,
+                command_tx: self.command_tx.clone(),
+                current: None,
+                socket: None,
+            };
+
+            tokio::spawn(connection);
+
+            self.conn_count += 1;
+        }
+
+        Ok(Async::NotReady)
     }
 }
 
-fn new_state_machine<T>(
-    addr: SocketAddr, processor: T,
-    rx: mpsc::UnboundedReceiver<(
-        OrderedMessages<T::Message>,
-        oneshot::Sender<Result<OrderedMessages<T::Message>, BackendError>>,
-    )>,
-    conn_limit: usize,
-) -> BackendStateMachine<T>
+fn new_supervisor<P>(
+    addr: SocketAddr, processor: P, worker: Worker<Vec<QueuedMessage<P::Message>>>, conn_limit: usize,
+    close: Shared<Waiter>,
+) -> BackendSupervisor<P>
 where
-    T: RequestProcessor,
+    P: RequestProcessor + Clone + Send,
+    P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
 {
-    let (conns_tx, conns_rx) = mpsc::unbounded();
+    let (command_tx, command_rx) = mpsc::unbounded();
 
-    BackendStateMachine {
-        sink: get_sink(),
-
+    BackendSupervisor {
         processor,
-        requests_rx: rx,
+        worker,
+
+        command_rx,
+        command_tx,
 
         address: addr,
-        conns: Vec::new(),
-        conns_rx,
-        conns_tx,
         conn_count: 0,
         conn_limit,
+
+        close,
     }
 }
 
@@ -169,35 +213,29 @@ where
 ///
 /// Backends maintain a given number of connections to their underlying service, and track error
 /// states, recycling connections and pausing work when required.
-pub struct Backend<T>
+pub struct Backend<P>
 where
-    T: RequestProcessor,
+    P: RequestProcessor + Clone + Send,
+    P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
 {
-    requests_tx: mpsc::UnboundedSender<(
-        OrderedMessages<T::Message>,
-        oneshot::Sender<Result<OrderedMessages<T::Message>, BackendError>>,
-    )>,
+    work_queue: WorkQueue<Vec<QueuedMessage<P::Message>>>,
 }
 
-impl<T> Backend<T>
+impl<P> Backend<P>
 where
-    T: RequestProcessor,
+    P: RequestProcessor + Clone + Send,
+    P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
 {
-    pub fn new(addr: SocketAddr, processor: T, conn_limit: usize) -> (Backend<T>, BackendStateMachine<T>) {
-        let (tx, rx) = mpsc::unbounded();
-        let backend = Backend { requests_tx: tx };
-        let runner = new_state_machine(addr, processor, rx, conn_limit);
+    pub fn new(
+        addr: SocketAddr, processor: P, conn_limit: usize, close: Shared<Waiter>,
+    ) -> (Backend<P>, BackendSupervisor<P>) {
+        let work_queue = WorkQueue::new();
+        let worker = work_queue.worker();
+        let backend = Backend { work_queue };
+        let runner = new_supervisor(addr, processor, worker, conn_limit, close);
 
         (backend, runner)
     }
 
-    pub fn submit(
-        &self, request: OrderedMessages<T::Message>,
-    ) -> oneshot::Receiver<Result<OrderedMessages<T::Message>, BackendError>> {
-        let (tx, rx) = oneshot::channel();
-        self.requests_tx
-            .unbounded_send((request, tx))
-            .expect("unbounded task send failed");
-        rx
-    }
+    pub fn submit(&self, batch: Vec<QueuedMessage<P::Message>>) { self.work_queue.send(batch) }
 }
