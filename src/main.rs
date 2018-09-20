@@ -19,14 +19,17 @@
 // SOFTWARE.
 #![feature(test)]
 #![feature(nll)]
-#![feature(iterator_flatten)]
 #![feature(associated_type_defaults)]
 #![feature(duration_as_u128)]
 #![feature(extern_prelude)]
+#![feature(option_replace)]
 #![recursion_limit = "1024"]
 
 #[macro_use]
 extern crate lazy_static;
+
+#[macro_use]
+extern crate crossbeam;
 
 extern crate config;
 extern crate crypto;
@@ -36,6 +39,7 @@ extern crate serde;
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
+extern crate slab;
 
 extern crate libc;
 extern crate signal_hook;
@@ -51,7 +55,7 @@ use futures::future::{lazy, ok, Shared};
 use futures_turnstyle::{Turnstyle, Waiter};
 use signal_hook::iterator::Signals;
 use std::{error::Error, net::Shutdown, process, thread};
-use tokio::{executor::thread_pool, io, net::TcpListener, prelude::*, runtime};
+use tokio::{io, net::TcpListener, prelude::*, runtime};
 
 #[macro_use]
 extern crate log;
@@ -122,17 +126,18 @@ fn run() -> i32 {
     );
 
     let _scope_guard = slog_scope::set_global_logger(logger);
-    let _log_guard = slog_stdlog::init().unwrap();
+    slog_stdlog::init().unwrap();
     info!("[core] logging configured");
 
     // Now run.
-    let mut threadpool_builder = thread_pool::Builder::new();
-    threadpool_builder.name_prefix("synchrotron-worker-").pool_size(4);
+    // let mut threadpool_builder = thread_pool::Builder::new();
+    // threadpool_builder.name_prefix("synchrotron-worker-").pool_size(4);
 
-    let mut runtime = runtime::Builder::new()
-        .threadpool_builder(threadpool_builder)
-        .build()
-        .expect("failed to create tokio runtime");
+    // let mut runtime = runtime::Builder::new()
+    //    .threadpool_builder(threadpool_builder)
+    //    .build()
+    //    .expect("failed to create tokio runtime");
+    let mut runtime = runtime::current_thread::Runtime::new().unwrap();
 
     let initial = lazy(move || {
         let listeners = configuration
@@ -154,7 +159,7 @@ fn run() -> i32 {
             }
         }
 
-        if errors.len() > 0 {
+        if !errors.is_empty() {
             error!("[core] encountered errors while spawning listeners:");
 
             for error in errors {
@@ -179,10 +184,14 @@ fn run() -> i32 {
 
     info!("[core] synchrotron running");
 
-    runtime.shutdown_on_idle().wait().unwrap();
-    return 0;
+    // runtime.shutdown_on_idle().wait().unwrap();
+    runtime.run().unwrap();
+    0
 }
 
+// TODO: this should 100% be using either tower-web or warp.  it's super janky as-is.  it should
+// also move to the metrics module where we can simply spawn it after getting the service from a
+// builder function.
 fn launch_stats(close: Shared<Waiter>) {
     // Touch the global registry for the first time to initialize it.
     let facade = metrics::get_facade();
@@ -219,7 +228,10 @@ fn launch_stats(close: Shared<Waiter>) {
                     ok(())
                 })
         }).select2(close)
-        .map(|_| ())
+        .and_then(|_| {
+            debug!("[stats] closing stats listener");
+            ok(())
+        }).map(|_| ())
         .map_err(|_| ());
 
     tokio::spawn(processor);

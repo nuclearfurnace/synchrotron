@@ -17,7 +17,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use backend::{processor::ProcessorError, BackendError};
+use backend::processor::ProcessorError;
 use std::{error, fmt, io};
 
 #[derive(Debug)]
@@ -27,12 +27,7 @@ pub enum RouterError {
 }
 
 impl RouterError {
-    pub fn from_backend(e: BackendError) -> Self {
-        let desc = e.to_string();
-        RouterError::BadResponse(desc)
-    }
-
-    pub fn from_processor(e: ProcessorError) -> Self {
+    pub fn from_processor(e: &ProcessorError) -> Self {
         let desc = e.to_string();
         match e {
             ProcessorError::FragmentError(_) => RouterError::BadRequest(desc),
@@ -42,7 +37,7 @@ impl RouterError {
 }
 
 impl From<ProcessorError> for RouterError {
-    fn from(e: ProcessorError) -> Self { RouterError::from_processor(e) }
+    fn from(e: ProcessorError) -> Self { RouterError::from_processor(&e) }
 }
 
 impl Into<io::Error> for RouterError {

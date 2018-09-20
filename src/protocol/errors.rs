@@ -17,12 +17,29 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use bytes::BytesMut;
+use std::io;
 
-pub trait Keyed {
-    fn key(&self) -> &[u8];
+#[derive(Debug)]
+pub enum ProtocolError {
+    IoError(io::Error),
+    InvalidProtocol,
+    BackendClosedPrematurely,
 }
 
-pub trait IntoMutBuf {
-    fn into_mut_buf(self) -> BytesMut;
+impl ProtocolError {
+    pub fn client_closed(&self) -> bool {
+        match self {
+            ProtocolError::IoError(e) => {
+                match e.kind() {
+                    io::ErrorKind::ConnectionReset => true,
+                    _ => false,
+                }
+            },
+            _ => false,
+        }
+    }
+}
+
+impl From<io::Error> for ProtocolError {
+    fn from(e: io::Error) -> ProtocolError { ProtocolError::IoError(e) }
 }
