@@ -21,6 +21,7 @@ pub mod backend;
 pub mod distributor;
 mod errors;
 pub mod hasher;
+pub mod message_queue;
 pub mod pool;
 pub mod processor;
 pub mod redis;

@@ -22,5 +22,5 @@ mod processor;
 
 pub use self::{
     errors::ProcessorError,
-    processor::{MessageSink, RequestProcessor, TcpStreamFuture},
+    processor::{RequestProcessor, TcpStreamFuture},
 };

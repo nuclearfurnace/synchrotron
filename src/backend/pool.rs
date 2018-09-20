@@ -22,14 +22,16 @@ use super::{
     hasher::KeyHasher,
 };
 use backend::{backend::Backend, processor::RequestProcessor};
-use common::{Keyed, OrderedMessages};
-use futures::prelude::*;
-use std::{io, net::SocketAddr};
+use futures::{future::Shared, prelude::*};
+use futures_turnstyle::Waiter;
+use protocol::errors::ProtocolError;
+use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
 pub struct BackendPool<T>
 where
-    T: RequestProcessor,
+    T: RequestProcessor + Clone + Send,
+    T::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
 {
     distributor: Box<Distributor + Send + Sync>,
     hasher: Box<KeyHasher + Send + Sync>,
@@ -39,18 +41,18 @@ where
 impl<T> BackendPool<T>
 where
     T: RequestProcessor + Clone + Send + 'static,
-    T::Message: Keyed + Send + 'static,
-    T::Future: Future<Item = (TcpStream, OrderedMessages<T::Message>), Error = io::Error> + Send + 'static,
+    T::Message: Send,
+    T::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
 {
     pub fn new(
-        addresses: Vec<SocketAddr>, transformer: T, mut dist: Box<Distributor + Send + Sync>,
-        hasher: Box<KeyHasher + Send + Sync>,
+        addresses: &[SocketAddr], transformer: T, mut dist: Box<Distributor + Send + Sync>,
+        hasher: Box<KeyHasher + Send + Sync>, conn_limit: usize, close: Shared<Waiter>,
     ) -> BackendPool<T> {
         // Assemble the list of backends and backend descriptors.
         let mut backends = vec![];
         let mut descriptors = vec![];
-        for address in &addresses {
-            let (backend, runner) = Backend::new(address.clone(), transformer.clone(), 16);
+        for address in addresses {
+            let (backend, runner) = Backend::new(*address, transformer.clone(), conn_limit, close.clone());
             backends.push(backend);
 
             // eventually, we'll populate this with weight, etc, so that
