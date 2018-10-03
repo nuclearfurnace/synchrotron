@@ -1,11 +1,10 @@
-dist: trusty
 language: rust
 services: docker
-sudo: required
 
 env:
   global:
     - CRATE_NAME=synchrotron
+    - REDIS_BIN=/usr/bin/redis-server
 
 matrix:
   include:
@@ -13,7 +12,7 @@ matrix:
     - env: TARGET=aarch64-unknown-linux-gnu
     - env: TARGET=arm-unknown-linux-gnueabi
     - env: TARGET=armv7-unknown-linux-gnueabihf
-    # TODO: rust-crypto fails to compile on 32-bit, gotta figure that one out
+    # This breaks when it goes to compile rust-crypto. *shrug*
     #- env: TARGET=i686-unknown-linux-gnu
     - env: TARGET=x86_64-unknown-linux-gnu
 
