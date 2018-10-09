@@ -48,7 +48,7 @@ type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 /// spawn a task to process all of the messages from that client until the client disconnects or
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
-    config: ListenerConfiguration, close: Shared<Waiter>,
+    version: usize, config: ListenerConfiguration, close: Shared<Waiter>,
 ) -> Result<GenericRuntimeFuture, CreationError> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
@@ -64,12 +64,13 @@ pub fn from_config(
     // Make sure our handlers close out when told.
     let listen_address2 = listen_address.clone();
     let wrapped = lazy(move || {
-        info!("[listener] starting listener '{}'", listen_address);
+        info!("[listener] starting listener '{}' (v{})", listen_address, version);
         ok(())
-    }).and_then(|_| handler)
+    })
+    .and_then(|_| handler)
     .select2(close)
     .then(move |_| {
-        info!("[listener] shutting down listener '{}'", listen_address2);
+        info!("[listener] shutting down listener '{}' (v{})", listen_address2, version);
         ok(())
     });
     Ok(Box::new(wrapped))
@@ -185,7 +186,8 @@ where
                             client_addr, e
                         )
                     }
-                }).batch(128)
+                })
+                .batch(128)
                 .fold((router, mqcp, metrics), |(router, mut mqcp, mut metrics), req| {
                     metrics.update_count(Metrics::ServerMessagesReceived, req.len() as i64);
 
@@ -196,24 +198,28 @@ where
                                 .route(qmsgs)
                                 .map(|_| router)
                                 .map_err(|e| error!("[client] error during routing: {}", e))
-                        }).map(move |router| {
+                        })
+                        .map(move |router| {
                             let batch_end = Instant::now();
                             metrics.update_latency(Metrics::ClientMessageBatchServiced, batch_start, batch_end);
 
                             (router, mqcp, metrics)
                         })
-                }).and_then(|(_, _, mut metrics)| {
+                })
+                .and_then(|(_, _, mut metrics)| {
                     debug!("[client] disconnected");
                     metrics.decrement(Metrics::ClientsConnected);
                     ok(())
-                }).select2(close)
+                })
+                .select2(close)
                 .map(|_| ())
                 .map_err(|_| ());
 
             tokio::spawn(client_proto);
 
             ok(())
-        }).map_err(|e| error!("[listener] caught error while accepting connections: {:?}", e))
+        })
+        .map_err(|e| error!("[listener] caught error while accepting connections: {:?}", e))
         .select2(close2)
         .map(|_| ())
         .map_err(|_| ());

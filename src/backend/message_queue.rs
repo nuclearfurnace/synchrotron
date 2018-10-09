@@ -202,12 +202,15 @@ where
                 }
 
                 write_all(tx, obuf).map_err(|_| ()).map(|(tx, _)| tx)
-            }).and_then(|_| {
+            })
+            .and_then(|_| {
                 trace!("[message queue send buffer] dropping");
                 ok(())
-            }).map_err(|_| {
+            })
+            .map_err(|_| {
                 get_sink().increment(Metrics::ClientTxErrors);
-            }).map(|_| ());
+            })
+            .map(|_| ());
         tokio::spawn(f);
 
         let data = MessageQueue {

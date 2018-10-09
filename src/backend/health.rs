@@ -99,7 +99,8 @@ impl BackendHealth {
                 error_count.store(0, SeqCst);
                 let _ = updates_tx.unbounded_send(());
                 ok(())
-            }).map(|_| ());
+            })
+            .map(|_| ());
 
         tokio::spawn(delay);
     }
