@@ -100,6 +100,7 @@ mod util;
 
 use conf::{Configuration, LevelExt};
 use errors::CreationError;
+use util::typeless;
 
 enum SupervisorCommand {
     Launch,
@@ -195,11 +196,9 @@ fn launch_supervisor(supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, 
             }
 
             shutdown_tx.send(())
-        })
-        .map(|_| ())
-        .map_err(|_| ());
+        });
 
-    tokio::spawn(supervisor);
+    tokio::spawn(typeless(supervisor));
 }
 
 fn launch_listeners(version: usize, close: Waiter) -> Result<(), CreationError> {
@@ -286,11 +285,9 @@ fn launch_stats(port: u16, close: oneshot::Receiver<()>) {
         .and_then(|_| {
             trace!("[stats] closing stats listener");
             ok(())
-        })
-        .map(|_| ())
-        .map_err(|_| ());
+        });
 
-    tokio::spawn(processor);
+    tokio::spawn(typeless(processor));
 }
 
 fn main() {
