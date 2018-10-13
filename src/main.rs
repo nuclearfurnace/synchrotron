@@ -86,6 +86,8 @@ extern crate test;
 #[cfg(test)]
 extern crate spectral;
 
+extern crate tokio_evacuate;
+
 mod backend;
 mod common;
 mod conf;
@@ -137,7 +139,7 @@ fn run() -> i32 {
     // and pulled in helper macros that correspond to the various logging levels.
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
+    let drain = slog_async::Async::new(drain).chan_size(1024 * 1024).build().fuse();
     let logger = slog::Logger::root(
         slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
         slog_o!("version" => env!("GIT_HASH")),
@@ -282,7 +284,7 @@ fn launch_stats(port: u16, close: oneshot::Receiver<()>) {
         })
         .select2(close)
         .and_then(|_| {
-            debug!("[stats] closing stats listener");
+            trace!("[stats] closing stats listener");
             ok(())
         })
         .map(|_| ())

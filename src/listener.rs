@@ -38,7 +38,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
     reactor,
 };
-use util::StreamExt;
+use tokio_evacuate::{Evacuate, Warden};
+use util::{typeless, StreamExt};
 
 type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 
@@ -54,7 +55,7 @@ pub fn from_config(
     let listen_address = config.address.clone();
     let listener = get_listener(&listen_address).expect("failed to create the TCP listener");
 
-    // Get the correct handler based on protocol.
+    // Now build our handler: this is what's actually going to do the real work.
     let protocol = config.protocol.to_lowercase();
     let handler = match protocol.as_str() {
         "redis" => routing_from_config(config, listener, close.clone(), RedisRequestProcessor::new()),
@@ -76,15 +77,21 @@ pub fn from_config(
     Ok(Box::new(wrapped))
 }
 
-fn routing_from_config<P>(
-    config: ListenerConfiguration, listener: TcpListener, close: Shared<Waiter>, processor: P,
+fn routing_from_config<P, C>(
+    config: ListenerConfiguration, listener: TcpListener, close: C, processor: P,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: RequestProcessor + Clone + Send + 'static,
     P::Message: Message + Send + 'static,
     P::ClientReader: Stream<Item = P::Message, Error = ProtocolError> + Send + 'static,
     P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
+    C: Future + Clone + Send + 'static,
 {
+    // Build our evacuator and wrap it as shared.  This lets us soft close everything.
+    let (warden, evacuate) = Evacuate::new(close, 3000);
+    let closer = evacuate.shared();
+
+    // Extract all the configured pools and build a backend pool for them.
     let mut pools = HashMap::new();
     let pool_configs = config.pools.clone();
     for (pool_name, pool_config) in pool_configs {
@@ -96,7 +103,7 @@ where
 
         let opts = pool_config.options.unwrap_or_else(HashMap::new);
 
-        let pool = BackendPool::new(&pool_config.addresses, processor.clone(), opts, close.clone())?;
+        let pool = BackendPool::new(&pool_config.addresses, processor.clone(), opts, closer.clone())?;
         pools.insert(pool_name, pool);
     }
 
@@ -107,19 +114,20 @@ where
         .or_insert_with(|| "fixed".to_owned())
         .to_lowercase();
     match route_type.as_str() {
-        "fixed" => get_fixed_router(listener, pools, processor, close.clone()),
+        "fixed" => get_fixed_router(listener, pools, processor, warden, closer.clone()),
         x => Err(CreationError::InvalidResource(format!("unknown route type '{}'", x))),
     }
 }
 
-fn get_fixed_router<P>(
-    listener: TcpListener, pools: HashMap<String, Arc<BackendPool<P>>>, processor: P, close: Shared<Waiter>,
+fn get_fixed_router<P, C>(
+    listener: TcpListener, pools: HashMap<String, Arc<BackendPool<P>>>, processor: P, warden: Warden, close: C,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: RequestProcessor + Clone + Send + 'static,
     P::Message: Message + Send + 'static,
     P::ClientReader: Stream<Item = P::Message, Error = ProtocolError> + Send + 'static,
     P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
+    C: Future + Clone + Send + 'static,
 {
     // Construct an instance of our router.
     let default_pool = pools
@@ -127,11 +135,11 @@ where
         .ok_or_else(|| CreationError::InvalidResource("no default pool configured for fixed router".to_string()))?;
     let router = FixedRouter::new(processor.clone(), default_pool.clone());
 
-    build_router_chain(listener, processor, router, close)
+    build_router_chain(listener, processor, router, warden, close)
 }
 
-fn build_router_chain<P, R>(
-    listener: TcpListener, processor: P, router: R, close: Shared<Waiter>,
+fn build_router_chain<P, R, C>(
+    listener: TcpListener, processor: P, router: R, warden: Warden, close: C,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: RequestProcessor + Clone + Send + 'static,
@@ -139,6 +147,7 @@ where
     P::ClientReader: Stream<Item = P::Message, Error = ProtocolError> + Send + 'static,
     P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
     R: Router<P> + Clone + Send + 'static,
+    C: Future + Clone + Send + 'static,
 {
     let close2 = close.clone();
 
@@ -146,12 +155,14 @@ where
         .incoming()
         .for_each(move |client| {
             debug!("[client] connected");
+            warden.increment();
             let mut metrics = metrics::get_sink();
             metrics.increment(Metrics::ClientsConnected);
 
             let router = router.clone();
             let processor = processor.clone();
             let close = close.clone();
+            let warden2 = warden.clone();
             let client_addr = client.peer_addr().unwrap();
 
             // Spin up our protocol read stream and our outbound message queue.
@@ -162,31 +173,6 @@ where
 
             // Run the client.
             let client_proto = proto_rx
-                .map_err(move |e| {
-                    if e.client_closed() {
-                        // If the client closed normally, we don't need to log anything but we
-                        // do need to decrement the client count.  Since we use `fold` to
-                        // enumerate over the message batches, we're working with a future at
-                        // that point, which terminates when an error occurs, unlike with a
-                        // stream.  Since we have `and_then` to handle normal "client done"
-                        // activities, we never hit that if an error is thrown.  Further, we've
-                        // changed to a RouterError in the `fold`, completely losing the
-                        // `ProtocolError` we get directly from the message stream.
-                        //
-                        // Long story short, we handle it here.  No biggie. :)
-                        metrics::get_sink().decrement(Metrics::ClientsConnected);
-                    } else {
-                        // This is a "real" error that we may or may not care about.  Technically
-                        // it could be a legitimate protocol error i.e. malformed message
-                        // structure, which could spam the logs... but there's a good chance we
-                        // actually want to know if a ton of clients are sending malformed
-                        // messages.
-                        error!(
-                            "[client] [{:?}] caught error while reading from client: {:?}",
-                            client_addr, e
-                        )
-                    }
-                })
                 .batch(128)
                 .fold((router, mqcp, metrics), |(router, mut mqcp, mut metrics), req| {
                     metrics.update_count(Metrics::ServerMessagesReceived, req.len() as i64);
@@ -205,26 +191,43 @@ where
 
                             (router, mqcp, metrics)
                         })
+                        .map_err(|_| ProtocolError::Empty)
                 })
-                .and_then(|(_, _, mut metrics)| {
-                    debug!("[client] disconnected");
-                    metrics.decrement(Metrics::ClientsConnected);
-                    ok(())
-                })
-                .select2(close)
-                .map(|_| ())
-                .map_err(|_| ());
+                .then(move |result| {
+                    match result {
+                        Ok((_, _, mut metrics)) => {
+                            debug!("[client] disconnected");
+                            metrics.decrement(Metrics::ClientsConnected);
+                        },
+                        Err(e) => {
+                            if !e.client_closed() {
+                                // This is a "real" error that we may or may not care about.  Technically
+                                // it could be a legitimate protocol error i.e. malformed message
+                                // structure, which could spam the logs... but there's a good chance we
+                                // actually want to know if a ton of clients are sending malformed
+                                // messages.
+                                error!(
+                                    "[client] [{:?}] caught error while reading from client: {:?}",
+                                    client_addr, e
+                                )
+                            }
+                        },
+                    }
 
-            tokio::spawn(client_proto);
+                    warden2.decrement();
+
+                    ok::<(), ()>(())
+                })
+                .select2(close);
+
+            tokio::spawn(typeless(client_proto));
 
             ok(())
         })
         .map_err(|e| error!("[listener] caught error while accepting connections: {:?}", e))
-        .select2(close2)
-        .map(|_| ())
-        .map_err(|_| ());
+        .select2(close2);
 
-    Ok(Box::new(task))
+    Ok(Box::new(typeless(task)))
 }
 
 fn get_listener(addr_str: &str) -> io::Result<TcpListener> {
