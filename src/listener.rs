@@ -87,8 +87,10 @@ where
     P::Future: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
     C: Future + Clone + Send + 'static,
 {
+    let reload_timeout_ms = config.reload_timeout_ms.unwrap_or_else(|| 5000);
+
     // Build our evacuator and wrap it as shared.  This lets us soft close everything.
-    let (warden, evacuate) = Evacuate::new(close, 3000);
+    let (warden, evacuate) = Evacuate::new(close, reload_timeout_ms);
     let closer = evacuate.shared();
 
     // Extract all the configured pools and build a backend pool for them.

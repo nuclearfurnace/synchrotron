@@ -140,7 +140,7 @@ fn run() -> i32 {
     // and pulled in helper macros that correspond to the various logging levels.
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).chan_size(1024 * 1024).build().fuse();
+    let drain = slog_async::Async::new(drain).build().fuse();
     let logger = slog::Logger::root(
         slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
         slog_o!("version" => env!("GIT_HASH")),
