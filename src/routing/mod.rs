@@ -23,6 +23,3 @@ pub use self::errors::RouterError;
 mod fixed;
 mod shadow;
 pub use self::{fixed::FixedRouter, shadow::ShadowRouter};
-
-mod router;
-pub use self::router::Router;

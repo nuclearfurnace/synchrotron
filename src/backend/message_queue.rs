@@ -19,20 +19,9 @@
 // SOFTWARE.
 use backend::processor::{Processor, ProcessorError};
 use bytes::BytesMut;
-use common::Message;
-use futures::{
-    future::ok,
-    prelude::*,
-    sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
-        oneshot::{self, Sender},
-    },
-};
-use metrics::{get_sink, Metrics};
+use common::{AssignedRequests, AssignedResponse, Message, MessageResponse};
 use slab::Slab;
 use std::collections::VecDeque;
-use tokio::io::{write_all, AsyncWrite};
-use util::typeless;
 
 /// Message state of queued messages.
 #[derive(Debug, PartialEq)]
@@ -72,201 +61,33 @@ pub enum MessageState {
     StreamingFragmented(Option<BytesMut>),
 }
 
-/// Message response types for a queued message.
-#[derive(Debug)]
-pub enum MessageResponse<M> {
-    /// The message ultimately "failed".  This happens if a queued message is dropped before having
-    /// a response sent for it, which may happen if an error occurs during the backend read, etc.
-    Failed,
-
-    /// The message was processored correctly and a response was submitted to the message queue.
-    Complete(M),
-}
-
-/// A proxy to a queued message slot.
-///
-/// This holds the actual request which is tied to the response slot, as well as the slot and the
-/// return channel so that callers can hand over the response and shuttle it back to the message
-/// queue without explicit knowledge of how to get it there.
-#[derive(Debug)]
-pub struct QueuedMessage<M> {
-    msg: Option<M>,
-    slot: usize,
-    completed: bool,
-    response_tx: Option<UnboundedSender<(usize, MessageResponse<M>)>>,
-}
-
-impl<M> Message for QueuedMessage<M>
-where
-    M: Message,
-{
-    fn key(&self) -> &[u8] { self.msg.as_ref().unwrap().key() }
-
-    fn is_inline(&self) -> bool { self.msg.as_ref().unwrap().is_inline() }
-
-    fn into_buf(mut self) -> BytesMut { self.msg.take().unwrap().into_buf() }
-}
-
-impl<M> QueuedMessage<M>
-where
-    M: Clone,
-{
-    pub fn new(msg: M, slot: usize, response_tx: UnboundedSender<(usize, MessageResponse<M>)>) -> QueuedMessage<M> {
-        QueuedMessage {
-            msg: Some(msg),
-            slot,
-            completed: false,
-            response_tx: Some(response_tx),
-        }
-    }
-
-    /// Consumes the request message and returns it to the caller.
-    pub fn consume_inner(&mut self) -> Option<M> { self.msg.take() }
-
-    /// Sends back a message to the queue to the assigned slot.
-    pub fn respond(&mut self, response: M) {
-        if self.completed {
-            return;
-        }
-
-        let _ = self
-            .response_tx
-            .take()
-            .unwrap()
-            .unbounded_send((self.slot, MessageResponse::Complete(response)));
-        self.completed = true;
-    }
-
-    /// Creates a new read-only version of this queued message.
-    ///
-    /// Useful for getting a copy of a given queued message where it's impossible to overwrite the
-    /// message slot pointed to by the original.
-    pub fn as_read(&self) -> QueuedMessage<M> {
-        QueuedMessage {
-            msg: self.msg.clone(),
-            slot: 0,
-            completed: true,
-            response_tx: None,
-        }
-    }
-}
-
-impl<M> Drop for QueuedMessage<M> {
-    fn drop(&mut self) {
-        // Since we always want to respond to a client otherwise they would just hang, we need to
-        // make sure if a queued message is dropped before having a response sent, we send a
-        // default error message back to the client.  The message queue will ask the processor for
-        // a protocol-specific error payload to send back when it reads a "failed" slot.
-        if !self.completed {
-            let _ = self
-                .response_tx
-                .take()
-                .unwrap()
-                .unbounded_send((self.slot, MessageResponse::Failed));
-        }
-    }
-}
-
-/// Control messages that can be sent to the message queue.
-enum QueueControlMessage<M> {
-    /// Enqueues a set of messages in the message queue, returning the allocated slots for all
-    /// expanded messages in the original list.
-    ///
-    /// Messages are defragmented at this stage so the slot allocation can account for them, so for
-    /// multi-backend messages, the number of returned messages will be greater than the number of
-    /// input messages.
-    Enqueue(Vec<M>, Sender<Vec<QueuedMessage<M>>>),
-}
-
-/// A message queue provides an ordered queue of message placeholders.  These placeholders are, in
-/// essence, futures, representing a to-be-received response to some request.
-///
-/// Downstream tasks that processes these requests and generate responses have a fast path back to
-/// the queue in order to hand back the response so it can be sent to the client.
 pub struct MessageQueue<P>
 where
-    P: Processor + Send + 'static,
+    P: Processor,
 {
-    input_closed: bool,
-    output_closed: bool,
-
     // Processor that provides fragmentation capabilities.
     processor: P,
-
-    // Channel that allows the control plane to interact with us at runtime.
-    control_rx: UnboundedReceiver<QueueControlMessage<P::Message>>,
 
     // Holds all message slots, and stores the slot IDs in order of the messages tied to them.
     slot_order: VecDeque<(usize, MessageState)>,
     slots: Slab<Option<P::Message>>,
-
-    // Channel for backends to notify us when a response has been generated.
-    responses_rx: UnboundedReceiver<(usize, MessageResponse<P::Message>)>,
-    responses_tx: Option<UnboundedSender<(usize, MessageResponse<P::Message>)>>,
-
-    buf_tx: UnboundedSender<Vec<BytesMut>>,
 }
 
 impl<P> MessageQueue<P>
 where
-    P: Processor + Send + 'static,
+    P: Processor,
     P::Message: Message + Clone,
 {
-    pub fn new<T>(processor: P, tx: T) -> (MessageQueue<P>, MessageQueueControlPlane<P>)
-    where
-        T: AsyncWrite + Send + 'static,
-    {
-        let (control_tx, control_rx) = mpsc::unbounded();
-        let (responses_tx, responses_rx) = mpsc::unbounded();
-        let (buf_tx, buf_rx) = mpsc::unbounded();
-
-        // Spinning up our buffer shuttling task.
-        let f = buf_rx
-            .fold(tx, |tx, ibufs| {
-                let mut obuf = BytesMut::new();
-                for ibuf in ibufs {
-                    obuf.unsplit(ibuf);
-                }
-
-                write_all(tx, obuf).map_err(|_| ()).map(|(tx, _)| tx)
-            })
-            .and_then(|_| {
-                trace!("[message queue send buffer] dropping");
-                ok(())
-            })
-            .map_err(|_| {
-                get_sink().increment(Metrics::ClientTxErrors);
-            });
-        tokio::spawn(typeless(f));
-
-        let data = MessageQueue {
-            input_closed: false,
-            output_closed: false,
-
+    pub fn new(processor: P) -> MessageQueue<P> {
+        MessageQueue {
             processor,
-            control_rx,
-
             slot_order: VecDeque::new(),
             slots: Slab::new(),
-
-            responses_rx,
-            responses_tx: Some(responses_tx),
-
-            buf_tx,
-        };
-
-        let control = MessageQueueControlPlane { control_tx };
-
-        (data, control)
+        }
     }
 
-    /// Determines if a given slot has been filled yet.
-    ///
-    /// The `index` given is the ordering index, i.e. `self.slot_order`, so an `index` of `0` is
-    /// the first slot, `1` is the second slot, etc.  It is unrelated to the underlying index in
-    /// the slab.
-    fn is_slot_ready(&self, index: usize) -> bool {
-        match self.slot_order.get(index) {
+    fn is_slot_ready(&self, slot: usize) -> bool {
+        match self.slot_order.get(slot) {
             None => false,
             Some((slot_id, _)) => {
                 match self.slots.get(*slot_id) {
@@ -277,33 +98,22 @@ where
         }
     }
 
-    fn get_next_response(&mut self) -> Poll<Option<BytesMut>, ProcessorError> {
-        // If we have no slots in play, then we're "technically" done, although downstream code
-        // will likely boolean-and this with whether or not the response stream is closed.
-        if self.slot_order.is_empty() {
-            return Ok(Async::Ready(None));
-        }
-
-        // See if the next slot is even ready yet.  If it's not, then we can't do anything.
-        if !self.is_slot_ready(0) {
-            return Ok(Async::NotReady);
-        }
-
+    fn get_next_response(&mut self) -> Result<Option<BytesMut>, ProcessorError> {
         // If we have an immediately available response aka a standalone message or streaming
         // fragment, just return it.
         let has_immediate = match self.slot_order.front() {
-            None => false,
+            None => return Ok(None),
             Some((slot_id, state)) => {
                 match self.slots.get(*slot_id) {
                     Some(_) => {
                         match state {
-                            MessageState::Standalone => true,
-                            MessageState::Inline => true,
-                            MessageState::StreamingFragmented(_) => true,
+                            MessageState::Standalone | MessageState::Inline | MessageState::StreamingFragmented(_) => {
+                                true
+                            },
                             MessageState::Fragmented(_, _, _) => false,
                         }
                     },
-                    None => false,
+                    None => return Ok(None),
                 }
             },
         };
@@ -326,7 +136,7 @@ where
                 _ => unreachable!(),
             };
 
-            return Ok(Async::Ready(Some(buf)));
+            return Ok(Some(buf));
         }
 
         // Now we know that the next slot has been fulfilled, and that it's a fragmented message.
@@ -344,7 +154,7 @@ where
 
         for index in 0..fragment_count {
             if !self.is_slot_ready(index) {
-                return Ok(Async::NotReady);
+                return Ok(None);
             }
         }
 
@@ -357,188 +167,61 @@ where
         }
 
         let msg = self.processor.defragment_messages(fragments)?;
-        Ok(Async::Ready(Some(msg.into_buf())))
+        Ok(Some(msg.into_buf()))
     }
-}
 
-impl<P> Future for MessageQueue<P>
-where
-    P: Processor + Send + 'static,
-    P::Message: Message + Clone,
-{
-    type Error = ();
-    type Item = ();
+    pub fn enqueue(&mut self, msgs: Vec<P::Message>) -> Result<AssignedRequests<P::Message>, ProcessorError> {
+        let fmsgs = self.processor.fragment_messages(msgs)?;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if self.input_closed && self.output_closed {
-            trace!("[message queue] input/output closed, shutting down");
-            return Ok(Async::Ready(()));
+        let mut amsgs = Vec::new();
+        for (msg_state, msg) in fmsgs {
+            if msg_state == MessageState::Inline {
+                let slot_id = self.slots.insert(Some(msg));
+                self.slot_order.push_back((slot_id, msg_state));
+            } else {
+                let slot_id = self.slots.insert(None);
+                self.slot_order.push_back((slot_id, msg_state));
+                amsgs.push((slot_id, msg));
+            }
         }
 
-        // First, go through and process any control messages.
+        Ok(amsgs)
+    }
+
+    pub fn fulfill<I>(&mut self, batch: I)
+    where
+        I: IntoIterator<Item = AssignedResponse<P::Message>>,
+    {
+        for (slot, response) in batch.into_iter() {
+            let slot = self.slots.get_mut(slot).unwrap();
+            match response {
+                MessageResponse::Complete(msg) => {
+                    slot.replace(msg);
+                },
+                MessageResponse::Failed => {
+                    let err = self.processor.get_error_message_str("failed to receive response");
+                    slot.replace(err);
+                },
+            }
+        }
+    }
+
+    pub fn get_sendable_buf(&mut self) -> Option<BytesMut> {
+        if !self.is_slot_ready(0) {
+            return None;
+        }
+
+        let mut mbuf = BytesMut::new();
         loop {
-            // Only service the control loop if we're not closed.   Otherwise, we're just draining
-            // responses as they come in for the client.
-            if self.input_closed {
-                break;
-            }
-
-            match self.control_rx.poll() {
-                Ok(Async::Ready(Some(msg))) => {
-                    match msg {
-                        QueueControlMessage::Enqueue(msgs, tx) => {
-                            match self.processor.fragment_messages(msgs) {
-                                Ok(fmsgs) => {
-                                    trace!("[message queue] enqueueing {} message fragments", fmsgs.len());
-
-                                    let mut qmsgs = Vec::new();
-                                    for (msg_state, msg) in fmsgs {
-                                        if msg_state == MessageState::Inline {
-                                            let slot_id = self.slots.insert(Some(msg));
-                                            self.slot_order.push_back((slot_id, msg_state));
-                                        } else {
-                                            let slot_id = self.slots.insert(None);
-                                            self.slot_order.push_back((slot_id, msg_state));
-                                            qmsgs.push(QueuedMessage::new(
-                                                msg,
-                                                slot_id,
-                                                self.responses_tx.as_ref().unwrap().clone(),
-                                            ));
-                                        }
-                                    }
-
-                                    match tx.send(qmsgs) {
-                                        Ok(()) => {},
-                                        // If the receiver has dropped, the client is gone and/or
-                                        // we're probably shutting down, so let's also close.
-                                        Err(_) => return Ok(Async::Ready(())),
-                                    }
-                                },
-                                // TODO: how do we propagate this back to the main client loop?
-                                Err(_) => return Err(()),
-                            }
-                        },
-                    }
+            let resp = self.get_next_response();
+            match resp {
+                Ok(Some(buf)) => {
+                    mbuf.unsplit(buf);
                 },
-                Ok(Async::NotReady) => break,
-                Ok(Async::Ready(None)) => {
-                    trace!("[message queue] control plane dropped, closing input");
-                    self.input_closed = true;
-
-                    // We have to drop our copy of the sending side of the responses channel
-                    // otherwise the receiver will never know to actually close the stream.
-                    let _responses_tx = self.responses_tx.take();
-                    drop(_responses_tx);
-
-                    break;
-                },
-                // Unbounded receivers never actually throw an error.
-                Err(_) => unreachable!(),
+                _ => break,
             }
         }
 
-        // Pull in any responses we've gotten.
-        loop {
-            match self.responses_rx.poll() {
-                Ok(Async::Ready(Some((id, rmsg)))) => {
-                    let slot = self.slots.get_mut(id).unwrap();
-                    match rmsg {
-                        MessageResponse::Complete(msg) => {
-                            slot.replace(msg);
-                        },
-                        MessageResponse::Failed => {
-                            let err = self.processor.get_error_message_str("failed to receive response");
-                            slot.replace(err);
-                        },
-                    }
-                },
-                Ok(Async::NotReady) | Ok(Async::Ready(None)) => break,
-                // Unbounded receivers never actually throw an error.
-                Err(_) => unreachable!(),
-            }
-        }
-
-        // Now just go through our slots and see if we have any that are ready to send!
-        let mut bufs = Vec::new();
-
-        loop {
-            match self.get_next_response() {
-                Ok(Async::Ready(Some(buf))) => bufs.push(buf),
-                Ok(Async::NotReady) => break,
-                Ok(Async::Ready(None)) => {
-                    if self.input_closed {
-                        // We've cleared everything out of the queue.  Time to shutdown for real.
-                        // Notify ourselves so that we get polled one more time, which should
-                        // trigger the full shutdown when it checks if input/output is closed.
-                        self.output_closed = true;
-                        trace!("[message queue] no more slots present, closing output");
-                    }
-
-                    break;
-                },
-                // TODO: how do we propagate this back to the main client loop?
-                Err(_) => return Err(()),
-            }
-        }
-
-        // If we get an error during the send, it means the receiver has dropped, and the
-        // receiver would only drop if there was an error during a send to the client.  Likely,
-        // the client has dropped and so we can't write to them anymore, which means we have no
-        // more reason to be running the queue.  Time to abandon ship!
-        if !bufs.is_empty() && self.buf_tx.unbounded_send(bufs).is_err() {
-            return Ok(Async::Ready(()));
-        }
-
-        // Fast path to close the message queue if we're shutting down.
-        if self.input_closed && self.output_closed {
-            trace!("[message queue] input/output closed, shutting down (fast path)");
-            return Ok(Async::Ready(()));
-        }
-
-        Ok(Async::NotReady)
-    }
-}
-
-impl<P> Drop for MessageQueue<P>
-where
-    P: Processor + Send,
-{
-    fn drop(&mut self) {
-        trace!("[message queue] dropping");
-    }
-}
-
-/// Control surface for a message queue.
-///
-/// Allows operating with a message queue at runtime, once it has been spawned and no longer owned.
-pub struct MessageQueueControlPlane<P>
-where
-    P: Processor + Send + 'static,
-{
-    control_tx: UnboundedSender<QueueControlMessage<P::Message>>,
-}
-
-impl<P> MessageQueueControlPlane<P>
-where
-    P: Processor + Send + 'static,
-{
-    /// Queues a set of messages in this message queue, allocating a slot for a response for each
-    /// message.  Queued messages have a reference back to this message queue in order to notify it.
-    pub fn enqueue(&mut self, msgs: Vec<P::Message>) -> impl Future<Item = Vec<QueuedMessage<P::Message>>, Error = ()> {
-        let (tx, rx) = oneshot::channel();
-
-        self.control_tx
-            .unbounded_send(QueueControlMessage::Enqueue(msgs, tx))
-            .expect("unable to send to unbounded control_tx");
-        rx.map_err(|_| ())
-    }
-}
-
-impl<P> Drop for MessageQueueControlPlane<P>
-where
-    P: Processor + Send + 'static,
-{
-    fn drop(&mut self) {
-        trace!("[message queue control plane] dropping");
+        Some(mbuf)
     }
 }

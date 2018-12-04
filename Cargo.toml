@@ -25,6 +25,7 @@ serde_derive = "^1.0"
 serde_json = "^1.0"
 tokio = "^0.1"
 tokio-io = "^0.1"
+tokio-io-pool = "^0.1"
 futures = "^0.1"
 net2 = "^0.2"
 libc = "^0.2"
@@ -46,7 +47,6 @@ tokio-evacuate = "^1.1"
 
 [dependencies.slog]
 version = "^2.4"
-features = ["max_level_trace", "release_max_level_info"]
 
 [dependencies.config]
 version = "^0.9"
