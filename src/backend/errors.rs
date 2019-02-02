@@ -19,19 +19,26 @@
 // SOFTWARE.
 use backend::processor::ProcessorError;
 use std::{error, fmt, io};
+use tokio::sync::oneshot;
 
 #[derive(Debug)]
 pub enum BackendError {
-    InternalError(String),
-    IoError(io::Error),
+    Internal(String),
+    Io(io::Error),
+}
+
+#[derive(Debug)]
+pub enum PoolError {
+    Internal(String),
+    Backend(BackendError),
 }
 
 impl From<ProcessorError> for BackendError {
     fn from(e: ProcessorError) -> Self {
         let desc = e.to_string();
         match e {
-            ProcessorError::FragmentError(_) => BackendError::InternalError(desc),
-            ProcessorError::DefragmentError(_) => BackendError::InternalError(desc),
+            ProcessorError::FragmentError(_) => BackendError::Internal(desc),
+            ProcessorError::DefragmentError(_) => BackendError::Internal(desc),
         }
     }
 }
@@ -39,21 +46,27 @@ impl From<ProcessorError> for BackendError {
 impl Into<io::Error> for BackendError {
     fn into(self) -> io::Error {
         match self {
-            BackendError::InternalError(s) => io::Error::new(io::ErrorKind::Other, s),
-            BackendError::IoError(e) => e,
+            BackendError::Internal(s) => io::Error::new(io::ErrorKind::Other, s),
+            BackendError::Io(e) => e,
         }
     }
 }
 
 impl From<io::Error> for BackendError {
-    fn from(e: io::Error) -> BackendError { BackendError::IoError(e) }
+    fn from(e: io::Error) -> BackendError { BackendError::Io(e) }
+}
+
+impl From<oneshot::error::RecvError> for BackendError {
+    fn from(e: oneshot::error::RecvError) -> BackendError {
+        BackendError::Internal("receive failed".to_owned())
+    }
 }
 
 impl error::Error for BackendError {
     fn description(&self) -> &str {
         match self {
-            BackendError::InternalError(s) => s.as_str(),
-            BackendError::IoError(e) => e.description(),
+            BackendError::Internal(s) => s.as_str(),
+            BackendError::Io(e) => e.description(),
         }
     }
 
@@ -65,8 +78,20 @@ impl fmt::Display for BackendError {
         use std::error::Error;
 
         match self {
-            BackendError::InternalError(s) => write!(f, "internal error: {}", s.as_str()),
-            BackendError::IoError(e) => write!(f, "internal error: {}", e.description()),
+            BackendError::Internal(s) => write!(f, "internal error: {}", s.as_str()),
+            BackendError::Io(e) => write!(f, "internal error: {}", e.description()),
         }
+    }
+}
+
+impl From<BackendError> for PoolError {
+    fn from(e: BackendError) -> PoolError {
+        PoolError::Backend(e)
+    }
+}
+
+impl From<oneshot::error::RecvError> for PoolError {
+    fn from(e: oneshot::error::RecvError) -> PoolError {
+        PoolError::Internal("receive failed".to_owned())
     }
 }

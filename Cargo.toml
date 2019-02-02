@@ -43,6 +43,10 @@ crossbeam-arccell = "^0.6"
 parking_lot = "^0.7"
 tokio-evacuate = "^1.1"
 warp = "^0.1"
+tower = { git = "https://github.com/nuclearfurnace/tower" }
+tower-direct-service = { git = "https://github.com/nuclearfurnace/tower" }
+tower-buffer = { git = "https://github.com/nuclearfurnace/tower" }
+tower-balance = { git = "https://github.com/nuclearfurnace/tower" }
 
 [dependencies.tokio]
 version = "^0.1"

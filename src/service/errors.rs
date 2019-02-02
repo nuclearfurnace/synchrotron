@@ -19,7 +19,7 @@
 // SOFTWARE.
 use backend::processor::ProcessorError;
 use futures::prelude::*;
-use service::DirectService;
+use tower_direct_service::DirectService;
 use std::fmt;
 
 /// Error type for `Pipeline`.

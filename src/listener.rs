@@ -32,7 +32,9 @@ use metrics::get_sink;
 use hotmic::Sink as MetricSink;
 use protocol::errors::ProtocolError;
 use routing::{FixedRouter, ShadowRouter};
-use service::{DirectService, Pipeline};
+use service::Pipeline;
+use tower_buffer::Buffer;
+use tower_direct_service::DirectService;
 use std::{collections::HashMap, fmt::Display, net::SocketAddr};
 use tokio::{io, net::TcpListener, reactor};
 use tokio_evacuate::{Evacuate, Warden};
@@ -104,7 +106,7 @@ where
             config.address.clone()
         );
 
-        let pool = BackendPoolBuilder::new(pool_name.clone(), processor.clone(), closer.clone(), pool_config, sink.clone());
+        let pool = BackendPoolBuilder::new(pool_name.clone(), processor.clone(), pool_config, sink.clone());
         pools.insert(pool_name, pool);
     }
 
@@ -122,7 +124,7 @@ where
 }
 
 fn get_fixed_router<P, C>(
-    listener: TcpListener, mut pools: HashMap<String, BackendPoolBuilder<P, C>>, processor: P,
+    listener: TcpListener, mut pools: HashMap<String, BackendPoolBuilder<P>>, processor: P,
     warden: Warden, close: C, sink: MetricSink<&'static str>,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
@@ -143,7 +145,7 @@ where
 }
 
 fn get_shadow_router<P, C>(
-    listener: TcpListener, mut pools: HashMap<String, BackendPoolBuilder<P, C>>, processor: P,
+    listener: TcpListener, mut pools: HashMap<String, BackendPoolBuilder<P>>, processor: P,
     warden: Warden, close: C, sink: MetricSink<&'static str>,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
@@ -179,13 +181,14 @@ where
     P::Message: Message + Clone + Send + 'static,
     P::Transport:
         Sink<SinkItem = BytesMut, SinkError = std::io::Error> + Stream<Item = P::Message, Error = ProtocolError> + Send,
-    R: DirectService<AssignedRequests<P::Message>> + Clone + Send + 'static,
+    R: DirectService<AssignedRequests<P::Message>> + Send + 'static,
     R::Error: Display,
     R::Response: IntoIterator<Item = AssignedResponse<P::Message>> + Send,
     R::Future: Future + Send,
     C: Future + Clone + Send + 'static,
 {
     let close2 = close.clone();
+    let inner = Buffer::new(router, 32);
 
     let task = listener
         .incoming()
@@ -193,7 +196,7 @@ where
             warden.increment();
             sink.increment("clients_connected");
 
-            let router = router.clone();
+            let inner = inner.clone();
             let processor = processor.clone();
             let close = close.clone();
             let warden2 = warden.clone();
@@ -202,7 +205,7 @@ where
             debug!("[client] {} connected", client_addr);
 
             let transport = processor.get_transport(client);
-            let runner = Pipeline::new(transport, router, processor, sink.scoped("client"))
+            let runner = Pipeline::new(transport, inner, processor, sink.scoped("client"))
                 .then(move |result| {
                     match result {
                         Ok(_) => {

@@ -43,6 +43,10 @@ extern crate signal_hook;
 extern crate tokio;
 extern crate tokio_io;
 extern crate tokio_io_pool;
+extern crate tower;
+extern crate tower_direct_service;
+extern crate tower_balance;
+extern crate tower_buffer;
 #[macro_use]
 extern crate futures;
 extern crate futures_turnstyle;

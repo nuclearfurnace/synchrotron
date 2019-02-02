@@ -1251,6 +1251,10 @@ dependencies = [
  "tokio-evacuate 1.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-io 0.1.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-io-pool 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tower 0.1.0 (git+https://github.com/nuclearfurnace/tower)",
+ "tower-balance 0.1.0 (git+https://github.com/nuclearfurnace/tower)",
+ "tower-buffer 0.1.0 (git+https://github.com/nuclearfurnace/tower)",
+ "tower-direct-service 0.1.0 (git+https://github.com/nuclearfurnace/tower)",
  "warp 0.1.11 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
@@ -1472,6 +1476,64 @@ dependencies = [
  "tokio-codec 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-io 0.1.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-reactor 0.1.8 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "tower"
+version = "0.1.0"
+source = "git+https://github.com/nuclearfurnace/tower#61a183fe88067469e7bbab74cb4cecbcd3c60129"
+
+[[package]]
+name = "tower-balance"
+version = "0.1.0"
+source = "git+https://github.com/nuclearfurnace/tower#61a183fe88067469e7bbab74cb4cecbcd3c60129"
+dependencies = [
+ "futures 0.1.25 (registry+https://github.com/rust-lang/crates.io-index)",
+ "indexmap 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rand 0.6.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio-timer 0.2.9 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tower-direct-service 0.1.0 (git+https://github.com/nuclearfurnace/tower)",
+ "tower-discover 0.1.0 (git+https://github.com/nuclearfurnace/tower)",
+ "tower-service 0.2.0 (git+https://github.com/nuclearfurnace/tower)",
+]
+
+[[package]]
+name = "tower-buffer"
+version = "0.1.0"
+source = "git+https://github.com/nuclearfurnace/tower#61a183fe88067469e7bbab74cb4cecbcd3c60129"
+dependencies = [
+ "futures 0.1.25 (registry+https://github.com/rust-lang/crates.io-index)",
+ "lazycell 1.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio-executor 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio-sync 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tower-direct-service 0.1.0 (git+https://github.com/nuclearfurnace/tower)",
+ "tower-service 0.2.0 (git+https://github.com/nuclearfurnace/tower)",
+]
+
+[[package]]
+name = "tower-direct-service"
+version = "0.1.0"
+source = "git+https://github.com/nuclearfurnace/tower#61a183fe88067469e7bbab74cb4cecbcd3c60129"
+dependencies = [
+ "futures 0.1.25 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "tower-discover"
+version = "0.1.0"
+source = "git+https://github.com/nuclearfurnace/tower#61a183fe88067469e7bbab74cb4cecbcd3c60129"
+dependencies = [
+ "futures 0.1.25 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tower-service 0.2.0 (git+https://github.com/nuclearfurnace/tower)",
+]
+
+[[package]]
+name = "tower-service"
+version = "0.2.0"
+source = "git+https://github.com/nuclearfurnace/tower#61a183fe88067469e7bbab74cb4cecbcd3c60129"
+dependencies = [
+ "futures 0.1.25 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -1811,6 +1873,12 @@ dependencies = [
 "checksum tokio-timer 0.2.9 (registry+https://github.com/rust-lang/crates.io-index)" = "21c04a314a1f69f73c0227beba6250e06cdc1e9a62e7eff912bf54a59b6d1b94"
 "checksum tokio-udp 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)" = "66268575b80f4a4a710ef83d087fdfeeabdce9b74c797535fbac18a2cb906e92"
 "checksum tokio-uds 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)" = "037ffc3ba0e12a0ab4aca92e5234e0dedeb48fddf6ccd260f1f150a36a9f2445"
+"checksum tower 0.1.0 (git+https://github.com/nuclearfurnace/tower)" = "<none>"
+"checksum tower-balance 0.1.0 (git+https://github.com/nuclearfurnace/tower)" = "<none>"
+"checksum tower-buffer 0.1.0 (git+https://github.com/nuclearfurnace/tower)" = "<none>"
+"checksum tower-direct-service 0.1.0 (git+https://github.com/nuclearfurnace/tower)" = "<none>"
+"checksum tower-discover 0.1.0 (git+https://github.com/nuclearfurnace/tower)" = "<none>"
+"checksum tower-service 0.2.0 (git+https://github.com/nuclearfurnace/tower)" = "<none>"
 "checksum try-lock 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)" = "e604eb7b43c06650e854be16a2a03155743d3752dd1c943f6829e26b7a36e382"
 "checksum tungstenite 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)" = "e9573852f935883137b7f0824832493ce7418bf290c8cf164b7aafc9b0a99aa0"
 "checksum typenum 1.10.0 (registry+https://github.com/rust-lang/crates.io-index)" = "612d636f949607bdf9b123b4a6f6d966dedf3ff669f7f045890d3a4a73948169"

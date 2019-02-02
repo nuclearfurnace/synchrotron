@@ -46,6 +46,7 @@ pub type AssignedRequests<T> = Vec<AssignedRequest<T>>;
 pub type AssignedResponses<T> = Vec<AssignedResponse<T>>;
 
 pub type PendingResponse<T> = Receiver<AssignedResponse<T>>;
+pub type PendingResponses<T> = Vec<PendingResponse<T>>;
 pub type EnqueuedRequests<T> = Vec<EnqueuedRequest<T>>;
 
 pub struct EnqueuedRequest<T> {
