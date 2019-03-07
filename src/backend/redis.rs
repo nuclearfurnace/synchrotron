@@ -24,7 +24,7 @@ use backend::{
 use bytes::BytesMut;
 use common::{EnqueuedRequests, Message};
 use futures::{
-    future::{ok, Either},
+    future::{err, ok, Either},
     prelude::*,
 };
 use itoa;
@@ -32,7 +32,7 @@ use protocol::{
     errors::ProtocolError,
     redis::{self, RedisMessage, RedisTransport},
 };
-use std::{borrow::Borrow, error::Error, net::SocketAddr};
+use std::{borrow::Borrow, collections::HashMap, error::Error, net::SocketAddr};
 use tokio::net::TcpStream;
 use util::ProcessFuture;
 
@@ -40,10 +40,16 @@ const REDIS_DEL: &[u8] = b"del";
 const REDIS_SET: &[u8] = b"set";
 
 #[derive(Clone)]
-pub struct RedisProcessor;
+pub struct RedisProcessor {
+    auth_password: Option<String>,
+}
 
 impl RedisProcessor {
-    pub fn new() -> RedisProcessor { RedisProcessor {} }
+    pub fn new(options: HashMap<String, String>) -> RedisProcessor {
+        let auth_password = options.get(&"auth".to_owned()).cloned();
+
+        RedisProcessor { auth_password }
+    }
 }
 
 impl Processor for RedisProcessor {
@@ -64,11 +70,37 @@ impl Processor for RedisProcessor {
 
     fn get_error_message_str(&self, e: &str) -> Self::Message { RedisMessage::from_error_str(e) }
 
-    fn get_transport(&self, client: TcpStream) -> Self::Transport { RedisTransport::new(client) }
+    fn get_transport(&self, client: TcpStream) -> Self::Transport {
+        RedisTransport::new(client, self.auth_password.clone())
+    }
 
     fn preconnect(&self, addr: &SocketAddr, noreply: bool) -> ProcessFuture {
+        let auth_password = self.auth_password.clone();
         let inner = TcpStream::connect(addr)
             .map_err(ProtocolError::IoError)
+            .and_then(move |conn| {
+                match auth_password {
+                    Some(password) => {
+                        let parts = ["AUTH", password.as_str()];
+                        let auth_req = RedisMessage::from_inline_parts(parts.into_iter().map(|x| *x));
+                        let auth_verify = redis::write_raw_message(conn, auth_req)
+                            .and_then(|(conn, _n)| redis::read_raw_message(conn))
+                            .and_then(|(conn, msg)| {
+                                if let RedisMessage::OK = msg {
+                                    ok(conn)
+                                } else {
+                                    error!("[redis backend] failed to authenticate to backend: {:?}", msg);
+                                    err(ProtocolError::ClientVisible(
+                                        "failed to authenticate to backend".to_owned(),
+                                    ))
+                                }
+                            });
+
+                        Either::A(auth_verify)
+                    },
+                    None => Either::B(ok(conn)),
+                }
+            })
             .and_then(move |conn| {
                 if noreply {
                     let noreply_req = RedisMessage::from_inline("CLIENT REPLY OFF");

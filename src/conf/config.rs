@@ -36,6 +36,7 @@ pub struct LoggingConfiguration {
 #[derive(Deserialize, Default, Clone, Debug)]
 pub struct ListenerConfiguration {
     pub protocol: String,
+    pub options: Option<HashMap<String, String>>,
     pub address: String,
     pub reload_timeout_ms: Option<u64>,
     pub pools: HashMap<String, PoolConfiguration>,

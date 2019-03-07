@@ -62,8 +62,9 @@ pub fn from_config(
 
     // Now build our handler: this is what's actually going to do the real work.
     let protocol = config.protocol.to_lowercase();
+    let options = config.options.clone().unwrap_or_else(|| HashMap::new());
     let handler = match protocol.as_str() {
-        "redis" => routing_from_config(name, config, listener, close.clone(), RedisProcessor::new()),
+        "redis" => routing_from_config(name, config, listener, close.clone(), RedisProcessor::new(options)),
         s => Err(CreationError::InvalidResource(format!("unknown cache protocol: {}", s))),
     }?;
 

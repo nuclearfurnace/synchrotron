@@ -25,6 +25,7 @@ pub enum ProtocolError {
     IoError(io::Error),
     InvalidProtocol,
     BackendClosedPrematurely,
+    ClientVisible(String),
 }
 
 impl ProtocolError {
@@ -47,6 +48,7 @@ impl error::Error for ProtocolError {
             ProtocolError::IoError(ref e) => e.description(),
             ProtocolError::InvalidProtocol => "invalid protocol",
             ProtocolError::BackendClosedPrematurely => "backend closed prematurely",
+            ProtocolError::ClientVisible(ref s) => s.as_str(),
         }
     }
 
@@ -59,6 +61,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::IoError(ref ie) => fmt::Display::fmt(ie, f),
             ProtocolError::InvalidProtocol => write!(f, "invalid protocol"),
             ProtocolError::BackendClosedPrematurely => write!(f, "backend closed prematurely"),
+            ProtocolError::ClientVisible(ref s) => write!(f, "{}", s),
         }
     }
 }

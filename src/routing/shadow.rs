@@ -97,9 +97,9 @@ where
                 // time to go.
                 Ok(Async::Ready(None)) => {
                     if self.should_close {
-                        return Ok(Async::Ready(()))
+                        return Ok(Async::Ready(()));
                     } else {
-                        break
+                        break;
                     }
                 },
                 Ok(Async::NotReady) => break,

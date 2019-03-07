@@ -90,6 +90,8 @@ extern crate spectral;
 
 extern crate tokio_evacuate;
 
+#[macro_use]
+mod macros;
 mod backend;
 mod common;
 mod conf;

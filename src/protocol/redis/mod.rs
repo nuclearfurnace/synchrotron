@@ -46,15 +46,29 @@ const REDIS_INT_BUF: [u8; 1] = [REDIS_COMMAND_INTEGER];
 const REDIS_CRLF: [u8; 2] = [b'\r', b'\n'];
 const REDIS_BACKEND_CLOSED: &str = "backend closed prematurely";
 
+enum State {
+    Unauthenticated(String),
+    Ready,
+    Closed,
+}
+
 /// A Redis-specific transport.
 pub struct RedisTransport<T>
 where
     T: AsyncRead + AsyncWrite,
 {
     transport: T,
+    state: State,
     rbuf: BytesMut,
     wbuf: BytesMut,
-    closed: bool,
+}
+
+pub struct RedisSingleMessage<T>
+where
+    T: AsyncRead,
+{
+    transport: Option<T>,
+    rbuf: BytesMut,
 }
 
 pub struct RedisMultipleMessages<T>
@@ -94,8 +108,15 @@ pub enum RedisMessage {
 
 impl RedisMessage {
     pub fn from_inline(cmd: &str) -> RedisMessage {
-        let args = cmd
-            .split_whitespace()
+        let parts = cmd.split_whitespace();
+        RedisMessage::from_inline_parts(parts)
+    }
+
+    pub fn from_inline_parts<'a, A>(parts: A) -> RedisMessage
+    where
+        A: Iterator<Item = &'a str>,
+    {
+        let args = parts
             .map(|part| {
                 let buf = part.as_bytes();
                 let mut new_buf = BytesMut::new();
@@ -159,6 +180,20 @@ impl RedisMessage {
         rd.put_slice(&REDIS_CRLF[..]);
 
         RedisMessage::Error(rd, 5)
+    }
+
+    pub fn from_custom_error(err_type: &str, err_str: &str) -> RedisMessage {
+        let type_bytes = err_type.as_bytes();
+        let str_bytes = err_str.as_bytes();
+
+        let mut rd = BytesMut::with_capacity(type_bytes.len() + str_bytes.len() + 4);
+        rd.put(REDIS_COMMAND_ERROR);
+        rd.put_slice(&type_bytes);
+        rd.put(b' ');
+        rd.put_slice(&str_bytes);
+        rd.put_slice(&REDIS_CRLF[..]);
+
+        RedisMessage::Error(rd, type_bytes.len() + 2)
     }
 
     pub fn from_integer(value: i64) -> RedisMessage {
@@ -271,12 +306,17 @@ impl<T> RedisTransport<T>
 where
     T: AsyncRead + AsyncWrite,
 {
-    pub fn new(transport: T) -> Self {
+    pub fn new(transport: T, auth_password: Option<String>) -> Self {
+        let state = match auth_password {
+            Some(password) => State::Unauthenticated(password),
+            None => State::Ready,
+        };
+
         RedisTransport {
             transport,
+            state,
             rbuf: BytesMut::new(),
             wbuf: BytesMut::new(),
-            closed: false,
         }
     }
 
@@ -300,46 +340,54 @@ where
     type Item = RedisMessage;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        if self.closed {
-            return Ok(Async::Ready(None));
-        }
-
         let socket_closed = self.fill_read_buf()?.is_ready();
 
-        match read_message(&mut self.rbuf) {
-            Ok(Async::Ready((bytes_read, cmd))) => {
-                trace!("[protocol] got message from client! ({} bytes)", bytes_read);
+        match self.state {
+            State::Closed => Ok(Async::Ready(None)),
+            State::Unauthenticated(ref password) => {
+                let (_n, message) = try_transport_ready!(read_message(&mut self.rbuf), socket_closed);
 
-                // If client has quit, mark the stream closed so that we return Ready(None) on the
-                // next call to poll.  This is the easiest way to ensure that all messages before
-                // this get processed but that we stop the flow of messages and thus close out the
-                // connection to the client.
-                if let RedisMessage::Quit = cmd {
-                    self.closed = true;
+                if matches_auth_command(&message, password.as_ref()) {
+                    // The client authenticated successfully with us.
+                    self.state = State::Ready;
+                    Ok(Async::Ready(Some(RedisMessage::OK)))
+                } else {
+                    // If a client sends us a quit command, we mark ourselves closed so that the next
+                    // poll concludes the stream, but we still return the message here so that we can
+                    // respond with the acknowledgement of the client quitting.
+                    let result = if let RedisMessage::Quit = message {
+                        self.state = State::Closed;
+                        message
+                    } else {
+                        // The password wasn't right, or they sent a regular command
+                        // before authenticating, so tell them what's up.
+                        RedisMessage::from_custom_error("NOAUTH", "Authentication required.")
+                    };
+
+                    Ok(Async::Ready(Some(result)))
+                }
+            },
+            State::Ready => {
+                let (_n, message) = try_transport_ready!(read_message(&mut self.rbuf), socket_closed);
+
+                // Need to handle clients quitting here, as well.
+                if let RedisMessage::Quit = message {
+                    self.state = State::Closed;
                 }
 
                 // If this command is invalid, kill the transport.  We also give the transport
                 // owner an error message, which is inlined and so we can kill the transport while
                 // still sending an error back to the client themselves.
-                if let Some(cmd_key) = cmd.get_command() {
+                if let Some(cmd_key) = message.get_command() {
                     if !check_command_validity(cmd_key) {
-                        self.closed = true;
+                        self.state = State::Closed;
 
-                        let emsg = RedisMessage::from_error_str("command not valid");
-                        return Ok(Async::Ready(Some(emsg)));
+                        let err_msg = RedisMessage::from_error_str("command not valid");
+                        return Ok(Async::Ready(Some(err_msg)));
                     }
                 }
 
-                Ok(Async::Ready(Some(cmd)))
-            },
-            Err(e) => Err(e),
-            _ => {
-                if socket_closed {
-                    // If the socket is closed, let's also close up shop.
-                    Ok(Async::Ready(None))
-                } else {
-                    Ok(Async::NotReady)
-                }
+                Ok(Async::Ready(Some(message)))
             },
         }
     }
@@ -456,6 +504,66 @@ where
     T: AsyncRead,
 {
     RedisMultipleMessages::new(rx, msgs)
+}
+
+impl<T> RedisSingleMessage<T>
+where
+    T: AsyncRead,
+{
+    pub fn new(transport: T) -> Self {
+        RedisSingleMessage {
+            transport: Some(transport),
+            rbuf: BytesMut::new(),
+        }
+    }
+
+    fn fill_read_buf(&mut self) -> Poll<(), ProtocolError> {
+        loop {
+            self.rbuf.reserve(16384);
+
+            let n = try_ready!(self.transport.as_mut().unwrap().read_buf(&mut self.rbuf));
+            if n == 0 {
+                return Ok(Async::Ready(()));
+            }
+        }
+    }
+}
+
+impl<T> Future for RedisSingleMessage<T>
+where
+    T: AsyncRead,
+{
+    type Error = ProtocolError;
+    type Item = (T, RedisMessage);
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let socket_closed = self.fill_read_buf()?.is_ready();
+
+        match read_message(&mut self.rbuf) {
+            Ok(Async::Ready((bytes_read, msg))) => {
+                trace!("[protocol] got message from server! ({} bytes)", bytes_read);
+
+                return Ok(Async::Ready((self.transport.take().unwrap(), msg)));
+            },
+            Err(e) => return Err(e),
+            _ => {
+                return if socket_closed {
+                    // If the socket is closed, let's also close up shop after responding to
+                    // the client with errors.
+                    Err(ProtocolError::BackendClosedPrematurely)
+                } else {
+                    Ok(Async::NotReady)
+                };
+            },
+        }
+    }
+}
+
+pub fn read_raw_message<T>(transport: T) -> RedisSingleMessage<T>
+where
+    T: AsyncRead,
+{
+    RedisSingleMessage::new(transport)
 }
 
 fn read_message(rd: &mut BytesMut) -> Poll<(usize, RedisMessage), ProtocolError> {
@@ -692,6 +800,23 @@ where
     write_all(transport, buf)
         .map(move |(transport, _buf)| (transport, msgs, buf_len))
         .map_err(|e| e.into())
+}
+
+fn matches_auth_command(message: &RedisMessage, password: &str) -> bool {
+    match message {
+        RedisMessage::Bulk(_, args) => {
+            if let Some(cmd) = args.get(0) {
+                if let Some(pw) = args.get(1) {
+                    cmd.key() == "AUTH".as_bytes() && pw.key() == password.as_bytes()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        },
+        _ => false,
+    }
 }
 
 #[cfg(test)]

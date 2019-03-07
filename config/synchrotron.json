@@ -15,6 +15,21 @@
         "type": "fixed"
       }
     },
+    "authed": {
+      "protocol": "redis",
+      "address": "127.0.0.1:6999",
+      "options": {
+        "auth": "foobar"
+      },
+      "pools": {
+        "default": {
+          "addresses": ["127.0.0.1:6379"]
+        }
+      },
+      "routing": {
+        "type": "fixed"
+      }
+    },
     "fixed_spread": {
       "protocol": "redis",
       "address": "127.0.0.1:6381",
