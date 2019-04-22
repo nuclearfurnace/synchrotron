@@ -17,8 +17,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-mod web;
-pub use self::web::build_with_graceful_shutdown;
-
 mod facade;
 pub use self::facade::{get_facade, get_sink};
+
+mod utils;
+pub use self::utils::Timed;

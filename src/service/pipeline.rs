@@ -21,11 +21,12 @@ use backend::{message_queue::MessageQueue, processor::Processor};
 use bytes::BytesMut;
 use common::{AssignedRequests, AssignedResponse, Message};
 use futures::prelude::*;
-use hotmic::Sink as MetricSink;
+use metrics::Sink as MetricSink;
 use service::PipelineError;
 use std::collections::VecDeque;
 use tower_service::Service;
 use util::Batch;
+use smetrics::Timed;
 
 /// Pipeline-capable service base.
 ///
@@ -40,7 +41,7 @@ where
     P: Processor,
     P::Message: Message + Clone,
 {
-    responses: VecDeque<S::Future>,
+    responses: VecDeque<Timed<S::Future>>,
     transport: Batch<T>,
     service: S,
     queue: MessageQueue<P>,
@@ -48,7 +49,7 @@ where
     send_buf: Option<(BytesMut, u64)>,
     finish: bool,
 
-    sink: MetricSink<&'static str>,
+    sink: MetricSink,
 }
 
 impl<T, S, P> Pipeline<T, S, P>
@@ -60,7 +61,7 @@ where
     P::Message: Message + Clone,
 {
     /// Creates a new `Pipeline`.
-    pub fn new(transport: T, service: S, processor: P, sink: MetricSink<&'static str>) -> Self {
+    pub fn new(transport: T, service: S, processor: P, sink: MetricSink) -> Self {
         Pipeline {
             responses: VecDeque::new(),
             transport: Batch::new(transport, 128),
@@ -91,8 +92,10 @@ where
             // isn't ready to flush to the message queue.
             while let Some(mut f) = self.responses.pop_front() {
                 match f.poll() {
-                    Ok(Async::Ready(rsp)) => {
+                    Ok(Async::Ready((start, rsp))) => {
                         self.queue.fulfill(rsp);
+                        let end = self.sink.now();
+                        self.sink.record_timing("client_e2e", start, end);
                     },
                     Ok(Async::NotReady) => {
                         self.responses.push_front(f);
@@ -117,8 +120,8 @@ where
                     return Ok(Async::NotReady);
                 }
 
-                self.sink.update_count("messages_sent", count as i64);
-                self.sink.update_count("bytes_sent", buf_len as i64);
+                self.sink.record_count("messages_sent", count);
+                self.sink.record_count("bytes_sent", buf_len as u64);
             }
 
             let mut msgs_sent = 0;
@@ -130,8 +133,8 @@ where
                     self.transport.start_send(buf).map_err(PipelineError::from_sink_error)?
                 {
                     self.send_buf = Some((buf, count));
-                    self.sink.update_count("messages_sent", msgs_sent as i64);
-                    self.sink.update_count("bytes_sent", bytes_sent as i64);
+                    self.sink.record_count("messages_sent", msgs_sent);
+                    self.sink.record_count("bytes_sent", bytes_sent as u64);
                     return Ok(Async::NotReady);
                 }
 
@@ -139,8 +142,8 @@ where
                 bytes_sent += buf_len;
             }
 
-            self.sink.update_count("messages_sent", msgs_sent as i64);
-            self.sink.update_count("bytes_sent", bytes_sent as i64);
+            self.sink.record_count("messages_sent", msgs_sent);
+            self.sink.record_count("bytes_sent", bytes_sent as u64);
 
             // Drive our transport to flush any buffers we have.
             if let Async::Ready(()) = self.transport.poll_complete().map_err(PipelineError::from_sink_error)? {
@@ -162,12 +165,13 @@ where
             // See if we can pull a batch from the transport.
             match try_ready!(self.transport.poll().map_err(PipelineError::from_stream_error)) {
                 Some((batch, batch_size)) => {
-                    self.sink.update_count("messages_received", batch.len() as i64);
-                    self.sink.update_count("bytes_received", batch_size as i64);
+                    self.sink.record_count("messages_received", batch.len() as u64);
+                    self.sink.record_count("bytes_received", batch_size as u64);
                     let batch = self.queue.enqueue(batch)?;
                     if !batch.is_empty() {
                         let fut = self.service.call(batch);
-                        self.responses.push_back(fut);
+                        let start = self.sink.now();
+                        self.responses.push_back(Timed(start, fut));
                     }
                 },
                 None => {

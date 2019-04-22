@@ -31,8 +31,8 @@ use futures::{
     prelude::*,
 };
 use futures_turnstyle::Waiter;
-use hotmic::Sink as MetricSink;
-use metrics::get_sink;
+use metrics::Sink as MetricSink;
+use smetrics::get_sink;
 use net2::TcpBuilder;
 use protocol::errors::ProtocolError;
 use routing::{FixedRouter, ShadowRouter};
@@ -136,7 +136,7 @@ where
 
 fn get_fixed_router<P, C>(
     listener: TcpListener, pools: HashMap<String, BufferedPool<P, P::Message>>, processor: P, warden: Warden, close: C,
-    sink: MetricSink<&'static str>,
+    sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: Processor + Clone + Send + 'static,
@@ -157,7 +157,7 @@ where
 
 fn get_shadow_router<P, C>(
     listener: TcpListener, pools: HashMap<String, BufferedPool<P, P::Message>>, processor: P, warden: Warden, close: C,
-    sink: MetricSink<&'static str>,
+    sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: Processor + Clone + Send + 'static,
@@ -183,7 +183,7 @@ where
 }
 
 fn build_router_chain<P, R, C>(
-    listener: TcpListener, processor: P, router: R, warden: Warden, close: C, sink: MetricSink<&'static str>,
+    listener: TcpListener, processor: P, router: R, warden: Warden, close: C, sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: Processor + Clone + Send + 'static,
@@ -201,7 +201,7 @@ where
         .incoming()
         .for_each(move |client| {
             warden.increment();
-            sink.increment("clients_connected");
+            sink.record_count("clients_connected", 1);
 
             let router = router.clone();
             let processor = processor.clone();
@@ -224,7 +224,7 @@ where
                                 // clients closing their connection is a normal thing.
                                 PipelineError::TransportReceive(ie) => {
                                     if !ie.client_closed() {
-                                        sink2.increment("client_errors");
+                                        sink2.record_count("client_errors", 1);
                                         error!("[client] transport error from {}: {}", client_addr, ie);
                                     }
                                 },
@@ -234,7 +234,6 @@ where
                     }
 
                     warden2.decrement();
-                    sink2.decrement("clients_connected");
 
                     ok::<(), ()>(())
                 })

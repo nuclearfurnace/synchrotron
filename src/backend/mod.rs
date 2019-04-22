@@ -36,7 +36,7 @@ use futures::{
     prelude::*,
     Poll,
 };
-use hotmic::Sink as MetricSink;
+use metrics::Sink as MetricSink;
 use std::{
     collections::{HashMap, VecDeque},
     marker::PhantomData,
@@ -94,7 +94,7 @@ where
     pending: VecDeque<EnqueuedRequests<P::Message>>,
     pending_len: usize,
 
-    sink: MetricSink<&'static str>,
+    sink: MetricSink,
 }
 
 impl<P> BackendConnection<P>
@@ -103,7 +103,7 @@ where
     P::Message: Message + Clone + Send + 'static,
 {
     pub fn new(
-        address: SocketAddr, processor: P, timeout_ms: u64, noreply: bool, sink: MetricSink<&'static str>,
+        address: SocketAddr, processor: P, timeout_ms: u64, noreply: bool, sink: MetricSink,
     ) -> BackendConnection<P> {
         BackendConnection {
             processor,
@@ -199,7 +199,7 @@ where
                     let stream = match self.stream.take() {
                         Some(stream) => Either::A(ok(stream)),
                         None => {
-                            self.sink.increment("connects");
+                            self.sink.record_count("connects", 1);
                             Either::B(self.processor.preconnect(&self.address, self.noreply))
                         },
                     };
@@ -273,7 +273,7 @@ where
     health: BackendHealth,
     conns: Vec<BackendConnection<P>>,
     conns_index: usize,
-    sink: MetricSink<&'static str>,
+    sink: MetricSink,
 }
 
 impl<P> Backend<P>
@@ -283,7 +283,7 @@ where
 {
     pub fn new(
         address: SocketAddr, identifier: String, processor: P, mut options: HashMap<String, String>, noreply: bool,
-        sink: MetricSink<&'static str>,
+        sink: MetricSink,
     ) -> Result<Backend<P>, CreationError>
     where
         P: Processor + Clone + Send + 'static,

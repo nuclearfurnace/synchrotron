@@ -17,8 +17,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use hotmic::{Controller, Receiver, Sink};
+use futures::future::Future;
+use log::Level;
+use metrics::{Controller, Receiver, Sink};
+use metrics_recorder_text::TextRecorder;
+use metrics_exporter_stdout::StdoutExporter;
 use std::thread;
+use std::time::Duration;
 
 lazy_static! {
     static ref METRICS: MetricsFacade = {
@@ -34,25 +39,35 @@ lazy_static! {
 
 pub fn get_facade() -> &'static MetricsFacade { &METRICS }
 
-pub fn get_sink() -> Sink<&'static str> {
+pub fn get_sink() -> Sink {
     let facade = get_facade();
     facade.get_sink()
 }
 
 pub struct MetricsFacade {
-    sink: Sink<&'static str>,
+    sink: Sink,
     controller: Controller,
 }
 
 impl MetricsFacade {
-    pub fn new(receiver: &Receiver<&'static str>) -> MetricsFacade {
+    pub fn new(receiver: &Receiver) -> MetricsFacade {
         MetricsFacade {
             sink: receiver.get_sink(),
             controller: receiver.get_controller(),
         }
     }
 
-    pub fn get_sink(&self) -> Sink<&'static str> { self.sink.clone() }
+    pub fn get_sink(&self) -> Sink { self.sink.clone() }
 
     pub fn get_controller(&self) -> Controller { self.controller.clone() }
+
+    pub fn get_exporter(&self) -> impl Future<Item = (), Error = ()> {
+        let controller = self.controller.clone();
+        let exporter = StdoutExporter::new(controller, TextRecorder::new(), Level::Info);
+
+        exporter
+            .into_future(Duration::from_secs(1))
+            .map_err(|e| error!("caught error serving metrics: {:?}", e))
+            .map(|_| ())
+    }
 }

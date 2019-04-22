@@ -27,34 +27,13 @@
 #[macro_use]
 extern crate lazy_static;
 
-extern crate phf;
-
 #[macro_use]
 extern crate derivative;
 
-extern crate warp;
-
-extern crate config;
-extern crate crypto;
-extern crate pruefung;
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
-extern crate slab;
-
-extern crate libc;
-extern crate signal_hook;
-
-extern crate tokio;
-extern crate tokio_executor;
-extern crate tokio_io_pool;
-extern crate tower_buffer;
-extern crate tower_direct_service;
-extern crate tower_service;
 #[macro_use]
 extern crate futures;
-extern crate futures_turnstyle;
-extern crate net2;
 
 use futures::future::{lazy, ok};
 use futures_turnstyle::{Turnstyle, Waiter};
@@ -69,18 +48,8 @@ use tokio::{
 extern crate log;
 #[macro_use(slog_o)]
 extern crate slog;
-extern crate slog_async;
-extern crate slog_scope;
-extern crate slog_stdlog;
-extern crate slog_term;
 
 use slog::Drain;
-
-extern crate btoi;
-extern crate bytes;
-extern crate hotmic;
-extern crate itoa;
-extern crate rand;
 
 #[cfg(test)]
 extern crate test;
@@ -88,14 +57,12 @@ extern crate test;
 #[cfg(test)]
 extern crate spectral;
 
-extern crate tokio_evacuate;
-
 mod backend;
 mod common;
 mod conf;
 mod errors;
 mod listener;
-mod metrics;
+mod smetrics;
 mod protocol;
 mod routing;
 mod service;
@@ -165,7 +132,7 @@ fn main() {
 }
 
 fn launch_supervisor(supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, shutdown_tx: oneshot::Sender<()>) {
-    let sink = metrics::get_sink().scoped("supervisor");
+    let sink = smetrics::get_sink().scoped("supervisor");
 
     let turnstyle = Turnstyle::new();
     let supervisor = supervisor_rx
@@ -175,13 +142,13 @@ fn launch_supervisor(supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, 
                 SupervisorCommand::Launch => {
                     let (version, waiter) = ts.join();
                     launch_listeners(version, waiter)?;
-                    sink.increment("configuration_loads");
+                    sink.record_count("configuration_loads", 1);
                 },
                 SupervisorCommand::Reload => {
                     let (version, waiter) = ts.join();
                     launch_listeners(version, waiter)?;
                     ts.turn();
-                    sink.increment("configuration_loads");
+                    sink.record_count("configuration_loads", 1);
                 },
                 SupervisorCommand::Shutdown => {
                     ts.turn();
@@ -241,11 +208,21 @@ fn launch_listeners(version: usize, close: Waiter) -> Result<(), CreationError> 
 }
 
 fn launch_metrics(stats_addr: String, shutdown_rx: impl Future<Item = ()> + Send + 'static) {
-    let addr = stats_addr.parse().expect("failed to parse metrics listen address");
+    /*let addr = stats_addr.parse().expect("failed to parse metrics listen address");
     let facade = metrics::get_facade();
     let controller = facade.get_controller();
     let http = metrics::build_with_graceful_shutdown(addr, controller, shutdown_rx);
 
     tokio::spawn(http);
-    info!("[metrics] serving metric data on {}...", stats_addr);
+    info!("[metrics] serving metric data on {}...", stats_addr);*/
+
+    /*let facade = metrics::get_facade();
+    let controller = facade.get_controller();
+    let mut stdout = StdoutExporter::new(controller, Level::Info, Duration::from_secs(1));
+    thread::spawn(move || stdout.run());*/
+
+    let facade = smetrics::get_facade();
+    let metrics = facade.get_exporter()
+        .select2(shutdown_rx);
+    tokio::spawn(typeless(metrics));
 }
