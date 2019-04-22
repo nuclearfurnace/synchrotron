@@ -17,8 +17,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use futures::prelude::*;
 use crate::protocol::errors::ProtocolError;
+use futures::prelude::*;
 use tokio::net::tcp::TcpStream;
 
 /// Wraps any future that does protocol operations and hands back a TCP stream.

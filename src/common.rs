@@ -17,9 +17,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+use crate::util::Sizable;
 use bytes::BytesMut;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
-use crate::util::Sizable;
 
 pub trait Message: Sizable {
     fn key(&self) -> &[u8];

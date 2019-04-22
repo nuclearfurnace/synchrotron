@@ -17,14 +17,16 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+use crate::{
+    common::{EnqueuedRequests, Message},
+    protocol::errors::ProtocolError,
+    util::Sizable,
+};
 use btoi::btoi;
 use bytes::{BufMut, BytesMut};
-use crate::common::{EnqueuedRequests, Message};
 use futures::prelude::*;
 use itoa;
-use crate::protocol::errors::ProtocolError;
 use tokio::io::{write_all, AsyncRead, AsyncWrite, Error, ErrorKind};
-use crate::util::Sizable;
 
 mod filtering;
 use self::filtering::check_command_validity;

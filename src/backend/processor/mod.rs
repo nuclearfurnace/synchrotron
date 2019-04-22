@@ -20,13 +20,15 @@
 mod errors;
 pub use self::errors::ProcessorError;
 
-use crate::backend::message_queue::MessageState;
-use crate::common::{EnqueuedRequests, Message};
+use crate::{
+    backend::message_queue::MessageState,
+    common::{EnqueuedRequests, Message},
+    protocol::errors::ProtocolError,
+    util::ProcessFuture,
+};
 use futures::future::{Either, FutureResult};
-use crate::protocol::errors::ProtocolError;
 use std::{error::Error, net::SocketAddr};
 use tokio::net::tcp::TcpStream;
-use crate::util::ProcessFuture;
 
 /// An existing or pending TcpStream.
 pub type TcpStreamFuture = Either<FutureResult<TcpStream, ProtocolError>, ProcessFuture>;

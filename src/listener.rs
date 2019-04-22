@@ -17,33 +17,34 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use crate::backend::{
-    pool::{BackendPool, BackendPoolBuilder},
-    processor::Processor,
-    redis::RedisProcessor,
+use crate::{
+    backend::{
+        pool::{BackendPool, BackendPoolBuilder},
+        processor::Processor,
+        redis::RedisProcessor,
+    },
+    common::{AssignedRequests, AssignedResponse, EnqueuedRequests, Message},
+    conf::ListenerConfiguration,
+    errors::CreationError,
+    protocol::errors::ProtocolError,
+    routing::{FixedRouter, ShadowRouter},
+    service::{Pipeline, PipelineError},
+    util::FutureExt,
 };
 use bytes::BytesMut;
-use crate::common::{AssignedRequests, AssignedResponse, EnqueuedRequests, Message};
-use crate::conf::ListenerConfiguration;
-use crate::errors::CreationError;
 use futures::{
     future::{lazy, ok, Shared},
     prelude::*,
 };
 use futures_turnstyle::Waiter;
-use hotmic::Sink as MetricSink;
-use crate::metrics::get_sink;
+use metrics_runtime::Sink as MetricSink;
 use net2::TcpBuilder;
-use crate::protocol::errors::ProtocolError;
-use crate::routing::{FixedRouter, ShadowRouter};
-use crate::service::{Pipeline, PipelineError};
 use std::{collections::HashMap, fmt::Display, net::SocketAddr};
 use tokio::{io, net::TcpListener, reactor};
 use tokio_evacuate::{Evacuate, Warden};
 use tokio_executor::DefaultExecutor;
 use tower_buffer::{Buffer, DirectServiceRef};
 use tower_service::Service;
-use crate::util::typeless;
 
 type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
 type BufferedPool<T, M> = Buffer<DirectServiceRef<BackendPool<T>>, EnqueuedRequests<M>>;
@@ -54,7 +55,7 @@ type BufferedPool<T, M> = Buffer<DirectServiceRef<BackendPool<T>>, EnqueuedReque
 /// spawn a task to process all of the messages from that client until the client disconnects or
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
-    version: usize, name: String, config: ListenerConfiguration, close: Shared<Waiter>,
+    version: usize, name: String, config: ListenerConfiguration, close: Shared<Waiter>, sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
@@ -63,7 +64,7 @@ pub fn from_config(
     // Now build our handler: this is what's actually going to do the real work.
     let protocol = config.protocol.to_lowercase();
     let handler = match protocol.as_str() {
-        "redis" => routing_from_config(name, config, listener, close.clone(), RedisProcessor::new()),
+        "redis" => routing_from_config(name, config, listener, close.clone(), RedisProcessor::new(), sink),
         s => Err(CreationError::InvalidResource(format!("unknown cache protocol: {}", s))),
     }?;
 
@@ -83,7 +84,7 @@ pub fn from_config(
 }
 
 fn routing_from_config<P, C>(
-    name: String, config: ListenerConfiguration, listener: TcpListener, close: C, processor: P,
+    name: String, config: ListenerConfiguration, listener: TcpListener, close: C, processor: P, sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: Processor + Clone + Send + 'static,
@@ -99,7 +100,8 @@ where
     let closer = evacuate.shared();
 
     // Get our scoped metric sink.
-    let sink = get_sink().scoped(&["listeners", &name]);
+    let mut sink = sink.clone();
+    sink.add_default_labels(&[("listener", name)]);
 
     // Extract all the configured pools and build a backend pool for them.
     let mut pools = HashMap::new();
@@ -136,7 +138,7 @@ where
 
 fn get_fixed_router<P, C>(
     listener: TcpListener, pools: HashMap<String, BufferedPool<P, P::Message>>, processor: P, warden: Warden, close: C,
-    sink: MetricSink<&'static str>,
+    sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: Processor + Clone + Send + 'static,
@@ -157,7 +159,7 @@ where
 
 fn get_shadow_router<P, C>(
     listener: TcpListener, pools: HashMap<String, BufferedPool<P, P::Message>>, processor: P, warden: Warden, close: C,
-    sink: MetricSink<&'static str>,
+    sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: Processor + Clone + Send + 'static,
@@ -183,7 +185,7 @@ where
 }
 
 fn build_router_chain<P, R, C>(
-    listener: TcpListener, processor: P, router: R, warden: Warden, close: C, sink: MetricSink<&'static str>,
+    listener: TcpListener, processor: P, router: R, warden: Warden, close: C, mut sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
     P: Processor + Clone + Send + 'static,
@@ -201,18 +203,18 @@ where
         .incoming()
         .for_each(move |client| {
             warden.increment();
-            sink.increment("clients_connected");
+            sink.record_counter("clients_connected", 1);
 
             let router = router.clone();
             let processor = processor.clone();
             let close = close.clone();
             let warden2 = warden.clone();
-            let sink2 = sink.clone();
+            let mut sink2 = sink.clone();
             let client_addr = client.peer_addr().unwrap();
             debug!("[client] {} connected", client_addr);
 
             let transport = processor.get_transport(client);
-            let runner = Pipeline::new(transport, router, processor, sink.scoped("client"))
+            let task = Pipeline::new(transport, router, processor, sink.clone())
                 .then(move |result| {
                     match result {
                         Ok(_) => {
@@ -224,7 +226,7 @@ where
                                 // clients closing their connection is a normal thing.
                                 PipelineError::TransportReceive(ie) => {
                                     if !ie.client_closed() {
-                                        sink2.increment("client_errors");
+                                        sink2.record_counter("client_errors", 1);
                                         error!("[client] transport error from {}: {}", client_addr, ie);
                                     }
                                 },
@@ -234,20 +236,19 @@ where
                     }
 
                     warden2.decrement();
-                    sink2.decrement("clients_connected");
 
                     ok::<(), ()>(())
                 })
                 .select2(close);
 
-            tokio::spawn(typeless(runner));
+            tokio::spawn(task.untyped());
 
             ok(())
         })
         .map_err(|e| error!("[listener] caught error while accepting connections: {:?}", e))
         .select2(close2);
 
-    Ok(Box::new(typeless(task)))
+    Ok(Box::new(task.untyped()))
 }
 
 fn get_listener(addr_str: &str) -> io::Result<TcpListener> {

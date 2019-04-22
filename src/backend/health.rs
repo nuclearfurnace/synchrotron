@@ -17,10 +17,10 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+use crate::util::FutureExt;
 use futures::{future::ok, task, Future};
 use std::time::{Duration, Instant};
 use tokio::timer::Delay;
-use crate::util::typeless;
 
 pub struct BackendHealth {
     cooloff_enabled: bool,
@@ -91,13 +91,15 @@ impl BackendHealth {
         let deadline = Instant::now() + Duration::from_millis(self.cooloff_period_ms);
         self.cooloff_done_at = deadline;
 
-        let this = task::current();
-        let delay = Delay::new(deadline).then(move |_| {
-            debug!("[health] resetting cooloff");
-            this.notify();
-            ok::<_, ()>(())
-        });
+        let current_task = task::current();
+        let task = Delay::new(deadline)
+            .then(move |_| {
+                debug!("[health] resetting cooloff");
+                current_task.notify();
+                ok::<_, ()>(())
+            })
+            .untyped();
 
-        tokio::spawn(typeless(delay));
+        tokio::spawn(task);
     }
 }

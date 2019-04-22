@@ -17,24 +17,26 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use crate::backend::{
-    message_queue::MessageState,
-    processor::{Processor, ProcessorError, TcpStreamFuture},
+use crate::{
+    backend::{
+        message_queue::MessageState,
+        processor::{Processor, ProcessorError, TcpStreamFuture},
+    },
+    common::{EnqueuedRequests, Message},
+    protocol::{
+        errors::ProtocolError,
+        redis::{self, RedisMessage, RedisTransport},
+    },
+    util::ProcessFuture,
 };
 use bytes::BytesMut;
-use crate::common::{EnqueuedRequests, Message};
 use futures::{
     future::{ok, Either},
     prelude::*,
 };
 use itoa;
-use crate::protocol::{
-    errors::ProtocolError,
-    redis::{self, RedisMessage, RedisTransport},
-};
 use std::{borrow::Borrow, error::Error, net::SocketAddr};
 use tokio::net::TcpStream;
-use crate::util::ProcessFuture;
 
 const REDIS_DEL: &[u8] = b"del";
 const REDIS_SET: &[u8] = b"set";
