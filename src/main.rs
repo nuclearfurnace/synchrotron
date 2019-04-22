@@ -27,13 +27,32 @@
 #[macro_use]
 extern crate lazy_static;
 
+extern crate phf;
+
 #[macro_use]
 extern crate derivative;
 
+extern crate config;
+extern crate crypto;
+extern crate pruefung;
+extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+extern crate slab;
+
+extern crate libc;
+extern crate signal_hook;
+
+extern crate tokio;
+extern crate tokio_executor;
+extern crate tokio_io_pool;
+extern crate tower_buffer;
+extern crate tower_direct_service;
+extern crate tower_service;
 #[macro_use]
 extern crate futures;
+extern crate futures_turnstyle;
+extern crate net2;
 
 use futures::future::{lazy, ok};
 use futures_turnstyle::{Turnstyle, Waiter};
@@ -48,14 +67,29 @@ use tokio::{
 extern crate log;
 #[macro_use(slog_o)]
 extern crate slog;
+extern crate slog_async;
+extern crate slog_scope;
+extern crate slog_stdlog;
+extern crate slog_term;
 
 use slog::Drain;
+
+extern crate btoi;
+extern crate bytes;
+extern crate itoa;
+extern crate rand;
+
+extern crate metrics;
+extern crate metrics_exporter_stdout;
+extern crate metrics_recorder_text;
 
 #[cfg(test)]
 extern crate test;
 
 #[cfg(test)]
 extern crate spectral;
+
+extern crate tokio_evacuate;
 
 mod backend;
 mod common;
