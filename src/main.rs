@@ -27,32 +27,14 @@
 #[macro_use]
 extern crate lazy_static;
 
-extern crate phf;
-
 #[macro_use]
 extern crate derivative;
 
-extern crate config;
-extern crate crypto;
-extern crate pruefung;
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
-extern crate slab;
 
-extern crate libc;
-extern crate signal_hook;
-
-extern crate tokio;
-extern crate tokio_executor;
-extern crate tokio_io_pool;
-extern crate tower_buffer;
-extern crate tower_direct_service;
-extern crate tower_service;
 #[macro_use]
 extern crate futures;
-extern crate futures_turnstyle;
-extern crate net2;
 
 use futures::future::{lazy, ok};
 use futures_turnstyle::{Turnstyle, Waiter};
@@ -67,44 +49,32 @@ use tokio::{
 extern crate log;
 #[macro_use(slog_o)]
 extern crate slog;
-extern crate slog_async;
-extern crate slog_scope;
-extern crate slog_stdlog;
-extern crate slog_term;
+#[macro_use]
+extern crate metrics;
 
 use slog::Drain;
 
-extern crate btoi;
-extern crate bytes;
-extern crate itoa;
-extern crate rand;
-
-extern crate metrics;
-extern crate metrics_exporter_stdout;
-extern crate metrics_recorder_text;
-
 #[cfg(test)]
 extern crate test;
-
-#[cfg(test)]
-extern crate spectral;
-
-extern crate tokio_evacuate;
 
 mod backend;
 mod common;
 mod conf;
 mod errors;
 mod listener;
-mod smetrics;
 mod protocol;
 mod routing;
 mod service;
 mod util;
 
-use conf::{Configuration, LevelExt};
-use errors::CreationError;
-use util::typeless;
+use crate::{
+    conf::{Configuration, LevelExt},
+    errors::CreationError,
+    util::FutureExt,
+};
+use metrics_runtime::{
+    exporters::HttpExporter, recorders::PrometheusRecorder, Controller, Receiver, Sink as MetricSink,
+};
 
 enum SupervisorCommand {
     Launch,
@@ -154,10 +124,17 @@ fn main() {
     slog_stdlog::init().unwrap();
     info!("[core] logging configured");
 
+    // Configure our metrics.  We want to do this pretty early on before anything actually tries to
+    // record any metrics.
+    let receiver = Receiver::builder().build().expect("failed to build metrics receiver");
+    let controller = receiver.get_controller();
+    let sink = receiver.get_sink();
+    receiver.install();
+
     tokio_io_pool::run(lazy(move || {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        launch_metrics(configuration.stats_addr, shutdown_rx);
-        launch_supervisor(supervisor_rx, shutdown_tx);
+        launch_metrics(configuration.stats_addr, controller, shutdown_rx);
+        launch_supervisor(supervisor_rx, shutdown_tx, sink);
 
         info!("[core] synchrotron running");
 
@@ -165,9 +142,9 @@ fn main() {
     }))
 }
 
-fn launch_supervisor(supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, shutdown_tx: oneshot::Sender<()>) {
-    let sink = smetrics::get_sink().scoped("supervisor");
-
+fn launch_supervisor(
+    supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, shutdown_tx: oneshot::Sender<()>, sink: MetricSink,
+) {
     let turnstyle = Turnstyle::new();
     let supervisor = supervisor_rx
         .map_err(|_| CreationError::ListenerSpawnFailed)
@@ -175,14 +152,14 @@ fn launch_supervisor(supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, 
             match command {
                 SupervisorCommand::Launch => {
                     let (version, waiter) = ts.join();
-                    launch_listeners(version, waiter)?;
-                    sink.record_count("configuration_loads", 1);
+                    launch_listeners(version, waiter, sink.clone())?;
+                    counter!("supervisor.configuration_loads", 1);
                 },
                 SupervisorCommand::Reload => {
                     let (version, waiter) = ts.join();
-                    launch_listeners(version, waiter)?;
+                    launch_listeners(version, waiter, sink.clone())?;
                     ts.turn();
-                    sink.record_count("configuration_loads", 1);
+                    counter!("supervisor.configuration_loads", 1);
                 },
                 SupervisorCommand::Shutdown => {
                     ts.turn();
@@ -197,12 +174,13 @@ fn launch_supervisor(supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, 
             }
 
             shutdown_tx.send(())
-        });
+        })
+        .untyped();
 
-    tokio::spawn(typeless(supervisor));
+    tokio::spawn(supervisor);
 }
 
-fn launch_listeners(version: usize, close: Waiter) -> Result<(), CreationError> {
+fn launch_listeners(version: usize, close: Waiter, sink: MetricSink) -> Result<(), CreationError> {
     let configuration = Configuration::new().expect("failed to parse configuration");
     let closer = close.shared();
     let listeners = configuration
@@ -211,7 +189,7 @@ fn launch_listeners(version: usize, close: Waiter) -> Result<(), CreationError> 
         .map(|(name, config)| {
             let close = closer.clone();
 
-            listener::from_config(version, name, config, close)
+            listener::from_config(version, name, config, close, sink.clone())
         })
         .collect::<Vec<_>>();
 
@@ -241,22 +219,9 @@ fn launch_listeners(version: usize, close: Waiter) -> Result<(), CreationError> 
     Ok(())
 }
 
-fn launch_metrics(stats_addr: String, shutdown_rx: impl Future<Item = ()> + Send + 'static) {
-    /*let addr = stats_addr.parse().expect("failed to parse metrics listen address");
-    let facade = metrics::get_facade();
-    let controller = facade.get_controller();
-    let http = metrics::build_with_graceful_shutdown(addr, controller, shutdown_rx);
-
-    tokio::spawn(http);
-    info!("[metrics] serving metric data on {}...", stats_addr);*/
-
-    /*let facade = metrics::get_facade();
-    let controller = facade.get_controller();
-    let mut stdout = StdoutExporter::new(controller, Level::Info, Duration::from_secs(1));
-    thread::spawn(move || stdout.run());*/
-
-    let facade = smetrics::get_facade();
-    let metrics = facade.get_exporter()
-        .select2(shutdown_rx);
-    tokio::spawn(typeless(metrics));
+fn launch_metrics(stats_addr: String, controller: Controller, shutdown_rx: impl Future<Item = ()> + Send + 'static) {
+    let addr = stats_addr.parse().expect("failed to parse metrics listen address");
+    let exporter = HttpExporter::new(controller, PrometheusRecorder::new(), addr);
+    let task = exporter.into_future().select2(shutdown_rx).untyped();
+    tokio::spawn(task);
 }

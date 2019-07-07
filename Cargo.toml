@@ -1,5 +1,6 @@
 [package]
 name = "synchrotron"
+edition = "2018"
 version = "0.1.0"
 authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
 
@@ -39,9 +40,6 @@ rand = "^0.6"
 rust-crypto = "^0.2"
 pruefung = "^0.2"
 fnv = "^1.0"
-metrics = { path = "../metrics/metrics" }
-metrics-exporter-stdout = { path = "../metrics/metrics-exporter-stdout" }
-metrics-recorder-text = { path = "../metrics/metrics-recorder-text" }
 slab = "^0.4"
 tokio-evacuate = "^1.1"
 warp = "^0.1"
@@ -49,6 +47,8 @@ tower = { git = "https://github.com/nuclearfurnace/tower" }
 tower-service = { git = "https://github.com/nuclearfurnace/tower" }
 tower-direct-service = { git = "https://github.com/nuclearfurnace/tower" }
 tower-buffer = { git = "https://github.com/nuclearfurnace/tower" }
+metrics = { path = "../metrics/metrics" }
+metrics-runtime = { path = "../metrics/metrics-runtime" }
 
 [dependencies.config]
 version = "^0.9"

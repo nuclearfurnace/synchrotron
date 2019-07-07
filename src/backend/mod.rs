@@ -28,15 +28,18 @@ pub mod redis;
 
 pub use self::errors::{BackendError, PoolError};
 
-use backend::{distributor::BackendDescriptor, health::BackendHealth, processor::Processor};
-use common::{AssignedResponses, EnqueuedRequests, Message, PendingResponses};
-use errors::CreationError;
+use crate::{
+    backend::{distributor::BackendDescriptor, health::BackendHealth, processor::Processor},
+    common::{AssignedResponses, EnqueuedRequests, Message, PendingResponses},
+    errors::CreationError,
+    util::ProcessFuture,
+};
 use futures::{
     future::{join_all, ok, Either, JoinAll},
     prelude::*,
     Poll,
 };
-use metrics::Sink as MetricSink;
+use metrics_runtime::{data::Counter, Sink as MetricSink};
 use std::{
     collections::{HashMap, VecDeque},
     marker::PhantomData,
@@ -50,7 +53,6 @@ use tokio::{
     timer::{timeout::Error as TimeoutError, Timeout},
 };
 use tower_direct_service::DirectService;
-use util::ProcessFuture;
 
 type MaybeTimeout<F> = Either<NotTimeout<F>, Timeout<F>>;
 
@@ -94,7 +96,7 @@ where
     pending: VecDeque<EnqueuedRequests<P::Message>>,
     pending_len: usize,
 
-    sink: MetricSink,
+    connects: Counter,
 }
 
 impl<P> BackendConnection<P>
@@ -103,7 +105,7 @@ where
     P::Message: Message + Clone + Send + 'static,
 {
     pub fn new(
-        address: SocketAddr, processor: P, timeout_ms: u64, noreply: bool, sink: MetricSink,
+        address: SocketAddr, processor: P, timeout_ms: u64, noreply: bool, mut sink: MetricSink,
     ) -> BackendConnection<P> {
         BackendConnection {
             processor,
@@ -114,7 +116,7 @@ where
             current: None,
             pending: VecDeque::new(),
             pending_len: 0,
-            sink,
+            connects: sink.counter("connects"),
         }
     }
 
@@ -199,7 +201,7 @@ where
                     let stream = match self.stream.take() {
                         Some(stream) => Either::A(ok(stream)),
                         None => {
-                            self.sink.record_count("connects", 1);
+                            self.connects.record(1);
                             Either::B(self.processor.preconnect(&self.address, self.noreply))
                         },
                     };

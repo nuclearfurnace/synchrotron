@@ -20,7 +20,9 @@
 use futures::{future::Future, stream::Stream};
 
 mod batch;
-pub use self::batch::Batch;
+mod timed;
+mod untyped;
+pub use self::{batch::Batch, timed::Timed, untyped::Untyped};
 
 mod helpers;
 pub use self::helpers::ProcessFuture;
@@ -45,20 +47,31 @@ pub trait StreamExt: Stream {
     ///
     /// If the underlying stream signals that it is not ready, and no items have been batched, then
     /// the stream will emit nothing.
-    fn batch(self, capacity: usize) -> batch::Batch<Self>
+    fn batch(self, capacity: usize) -> Batch<Self>
     where
         Self: Sized,
         Self::Item: Sizable,
     {
-        batch::Batch::new(self, capacity)
+        Batch::new(self, capacity)
     }
 }
 
-pub fn typeless<F>(f: F) -> impl Future<Item = (), Error = ()>
-where
-    F: Future,
-{
-    f.map(|_| ()).map_err(|_| ())
+impl<T: ?Sized> FutureExt for T where T: Future {}
+
+pub trait FutureExt: Future {
+    fn timed(self, start: u64) -> Timed<Self>
+    where
+        Self: Sized,
+    {
+        Timed::new(self, start)
+    }
+
+    fn untyped(self) -> Untyped<Self>
+    where
+        Self: Sized,
+    {
+        Untyped::new(self)
+    }
 }
 
 pub trait Sizable {

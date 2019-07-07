@@ -17,16 +17,20 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use backend::{message_queue::MessageQueue, processor::Processor};
+use crate::{
+    backend::{message_queue::MessageQueue, processor::Processor},
+    common::{AssignedRequests, AssignedResponse, Message},
+    service::PipelineError,
+    util::{Batch, FutureExt, Timed},
+};
 use bytes::BytesMut;
-use common::{AssignedRequests, AssignedResponse, Message};
 use futures::prelude::*;
-use metrics::Sink as MetricSink;
-use service::PipelineError;
+use metrics_runtime::{
+    data::{Counter, Histogram},
+    Sink as MetricSink,
+};
 use std::collections::VecDeque;
 use tower_service::Service;
-use util::Batch;
-use smetrics::Timed;
 
 /// Pipeline-capable service base.
 ///
@@ -50,6 +54,11 @@ where
     finish: bool,
 
     sink: MetricSink,
+    bytes_sent: Counter,
+    bytes_received: Counter,
+    messages_sent: Counter,
+    messages_received: Counter,
+    client_e2e: Histogram,
 }
 
 impl<T, S, P> Pipeline<T, S, P>
@@ -61,7 +70,13 @@ where
     P::Message: Message + Clone,
 {
     /// Creates a new `Pipeline`.
-    pub fn new(transport: T, service: S, processor: P, sink: MetricSink) -> Self {
+    pub fn new(transport: T, service: S, processor: P, mut sink: MetricSink) -> Self {
+        let bytes_sent = sink.counter("bytes_sent");
+        let bytes_received = sink.counter("bytes_received");
+        let messages_sent = sink.counter("messages_sent");
+        let messages_received = sink.counter("messages_received");
+        let client_e2e = sink.histogram("client_e2e");
+
         Pipeline {
             responses: VecDeque::new(),
             transport: Batch::new(transport, 128),
@@ -70,6 +85,11 @@ where
             send_buf: None,
             finish: false,
             sink,
+            bytes_sent,
+            bytes_received,
+            messages_sent,
+            messages_received,
+            client_e2e,
         }
     }
 }
@@ -95,7 +115,7 @@ where
                     Ok(Async::Ready((start, rsp))) => {
                         self.queue.fulfill(rsp);
                         let end = self.sink.now();
-                        self.sink.record_timing("client_e2e", start, end);
+                        self.client_e2e.record_timing(start, end);
                     },
                     Ok(Async::NotReady) => {
                         self.responses.push_front(f);
@@ -120,8 +140,8 @@ where
                     return Ok(Async::NotReady);
                 }
 
-                self.sink.record_count("messages_sent", count);
-                self.sink.record_count("bytes_sent", buf_len as u64);
+                self.messages_sent.record(count);
+                self.bytes_sent.record(buf_len as u64);
             }
 
             let mut msgs_sent = 0;
@@ -133,8 +153,8 @@ where
                     self.transport.start_send(buf).map_err(PipelineError::from_sink_error)?
                 {
                     self.send_buf = Some((buf, count));
-                    self.sink.record_count("messages_sent", msgs_sent);
-                    self.sink.record_count("bytes_sent", bytes_sent as u64);
+                    self.messages_sent.record(msgs_sent);
+                    self.bytes_sent.record(bytes_sent as u64);
                     return Ok(Async::NotReady);
                 }
 
@@ -142,8 +162,8 @@ where
                 bytes_sent += buf_len;
             }
 
-            self.sink.record_count("messages_sent", msgs_sent);
-            self.sink.record_count("bytes_sent", bytes_sent as u64);
+            self.messages_sent.record(msgs_sent);
+            self.bytes_sent.record(bytes_sent as u64);
 
             // Drive our transport to flush any buffers we have.
             if let Async::Ready(()) = self.transport.poll_complete().map_err(PipelineError::from_sink_error)? {
@@ -165,13 +185,13 @@ where
             // See if we can pull a batch from the transport.
             match try_ready!(self.transport.poll().map_err(PipelineError::from_stream_error)) {
                 Some((batch, batch_size)) => {
-                    self.sink.record_count("messages_received", batch.len() as u64);
-                    self.sink.record_count("bytes_received", batch_size as u64);
+                    self.messages_received.record(batch.len() as u64);
+                    self.bytes_received.record(batch_size as u64);
                     let batch = self.queue.enqueue(batch)?;
                     if !batch.is_empty() {
                         let fut = self.service.call(batch);
                         let start = self.sink.now();
-                        self.responses.push_back(Timed(start, fut));
+                        self.responses.push_back(fut.timed(start));
                     }
                 },
                 None => {

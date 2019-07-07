@@ -140,8 +140,6 @@ pub fn check_command_validity(cmd: &[u8]) -> bool {
     let mut offset = 0;
 
     while offset < count {
-        // This is just a neat invariant of ASCII where lower/uppercase letters are only
-        // separated by 64 so we can mask it out to force uppercase.
         m[offset] = m[offset] & 0b11011111;
         offset += 1;
     }

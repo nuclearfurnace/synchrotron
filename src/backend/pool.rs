@@ -21,18 +21,20 @@ use super::{
     distributor::{configure_distributor, Distributor},
     hasher::{configure_hasher, KeyHasher},
 };
-use backend::{processor::Processor, Backend, BackendError, PoolError, ResponseFuture};
-use common::{AssignedResponses, EnqueuedRequests, Message};
-use conf::PoolConfiguration;
-use errors::CreationError;
+use crate::{
+    backend::{processor::Processor, Backend, BackendError, PoolError, ResponseFuture},
+    common::{AssignedResponses, EnqueuedRequests, Message},
+    conf::PoolConfiguration,
+    errors::CreationError,
+    util::IntegerMappedVec,
+};
 use futures::{
     future::{join_all, JoinAll},
     prelude::*,
 };
-use metrics::Sink as MetricSink;
+use metrics_runtime::Sink as MetricSink;
 use std::{collections::HashMap, marker::PhantomData};
 use tower_direct_service::DirectService;
-use util::IntegerMappedVec;
 
 type DistributorFutureSafe = Box<Distributor + Send + 'static>;
 type KeyHasherFutureSafe = Box<KeyHasher + Send + 'static>;
@@ -84,6 +86,7 @@ where
             .filter(|backend| backend.healthy)
             .collect();
         self.distributor.update(descriptors);
+        self.sink.record_counter("distribution_updated", 1);
     }
 }
 
@@ -184,10 +187,8 @@ where
     P: Processor + Clone + Send + 'static,
     P::Message: Message + Send + 'static,
 {
-    pub fn new(
-        name: String, processor: P, config: PoolConfiguration, sink: MetricSink,
-    ) -> BackendPoolBuilder<P> {
-        let sink = sink.scoped(&["pools", &name]);
+    pub fn new(name: String, processor: P, config: PoolConfiguration, mut sink: MetricSink) -> BackendPoolBuilder<P> {
+        sink.add_default_labels(&[("pool", name)]);
 
         BackendPoolBuilder {
             processor,
