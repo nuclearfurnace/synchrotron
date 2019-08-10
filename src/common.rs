@@ -23,7 +23,12 @@ use tokio::sync::oneshot::{channel, Receiver, Sender};
 
 pub trait Message: Sizable {
     fn key(&self) -> &[u8];
+
+    /// Whether or not a message is "inline", or already processed.  This typically disqualifies a
+    /// message from being altered, fragmented, etc, any further after parsing.
     fn is_inline(&self) -> bool;
+
+    /// Converts the message into a raw buffer suitable for sending over the network.
     fn into_buf(self) -> BytesMut;
 }
 

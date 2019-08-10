@@ -21,10 +21,9 @@
 #![feature(nll)]
 #![feature(never_type)]
 #![feature(proc_macro_hygiene)]
+#![feature(async_await)]
+#![feature(type_alias_impl_trait)]
 #![recursion_limit = "1024"]
-
-#[macro_use]
-extern crate lazy_static;
 
 #[macro_use]
 extern crate derivative;
@@ -35,12 +34,9 @@ extern crate serde_derive;
 #[macro_use]
 extern crate futures;
 
-use crate::{
-    futures_turnstyle::{Turnstyle, Waiter},
-    signal_hook::iterator::Signals,
-    libc::{SIGINT, SIGUSR1},
-};
-use futures::future::{lazy, ok};
+use futures_turnstyle::{Turnstyle, Waiter};
+use signal_hook::iterator::Signals;
+use libc::{SIGINT, SIGUSR1};
 use std::thread;
 
 extern crate tokio;
@@ -74,10 +70,9 @@ mod util;
 use crate::{
     conf::{Configuration, LevelExt},
     errors::CreationError,
-    util::FutureExt,
 };
 use metrics_runtime::{
-    exporters::HttpExporter, recorders::PrometheusRecorder, Controller, Receiver, Sink as MetricSink,
+    exporters::HttpExporter, observers::PrometheusBuilder, Controller, Receiver, Sink as MetricSink,
 };
 
 enum SupervisorCommand {
@@ -86,7 +81,8 @@ enum SupervisorCommand {
     Shutdown,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Set up our signal handling before anything else.
     let (mut supervisor_tx, supervisor_rx) = mpsc::unbounded_channel();
     let signals = Signals::new(&[SIGINT, SIGUSR1]).expect("failed to register signal handlers");
@@ -135,15 +131,11 @@ fn main() {
     let sink = receiver.get_sink();
     receiver.install();
 
-    tokio_io_pool::run(lazy(move || {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        launch_metrics(configuration.stats_addr, controller, shutdown_rx);
-        launch_supervisor(supervisor_rx, shutdown_tx, sink);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    launch_metrics(configuration.stats_addr, controller, shutdown_rx);
+    launch_supervisor(supervisor_rx, shutdown_tx, sink);
 
-        info!("[core] synchrotron running");
-
-        ok(())
-    }))
+    info!("[core] synchrotron running");
 }
 
 fn launch_supervisor(
@@ -223,9 +215,9 @@ fn launch_listeners(version: usize, close: Waiter, sink: MetricSink) -> Result<(
     Ok(())
 }
 
-fn launch_metrics(stats_addr: String, controller: Controller, shutdown_rx: impl Future<Item = ()> + Send + 'static) {
+fn launch_metrics(stats_addr: String, controller: Controller, shutdown_rx: impl Future) {
     let addr = stats_addr.parse().expect("failed to parse metrics listen address");
-    let exporter = HttpExporter::new(controller, PrometheusRecorder::new(), addr);
+    let exporter = HttpExporter::new(controller, PrometheusBuilder::new(), addr);
     let task = exporter.into_future().select2(shutdown_rx).untyped();
     tokio::spawn(task);
 }

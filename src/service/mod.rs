@@ -18,6 +18,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 mod errors;
+mod svc;
 mod pipeline;
+mod facade;
 
-pub use self::{errors::PipelineError, pipeline::Pipeline};
+pub use self::errors::PipelineError;
+pub use self::svc::{Service, DrivenService};
+pub use self::pipeline::Pipeline;
+pub use self::facade::Facade;

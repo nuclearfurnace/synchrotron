@@ -61,14 +61,14 @@ impl<T: ?Sized> FutureExt for T where T: Future {}
 pub trait FutureExt: Future {
     fn timed(self, start: u64) -> Timed<Self>
     where
-        Self: Sized,
+        Self: Sized + Unpin,
     {
         Timed::new(self, start)
     }
 
     fn untyped(self) -> Untyped<Self>
     where
-        Self: Sized,
+        Self: Sized + Unpin,
     {
         Untyped::new(self)
     }

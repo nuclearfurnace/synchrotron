@@ -18,26 +18,29 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use crate::protocol::errors::ProtocolError;
-use futures::prelude::*;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::net::tcp::TcpStream;
 
 /// Wraps any future that does protocol operations and hands back a TCP stream.
 pub struct ProcessFuture {
-    inner: Box<Future<Item = TcpStream, Error = ProtocolError> + Send + 'static>,
+    inner: Box<dyn Future<Output = Result<TcpStream, ProtocolError>>>,
 }
 
 impl ProcessFuture {
     pub fn new<F>(inner: F) -> ProcessFuture
     where
-        F: Future<Item = TcpStream, Error = ProtocolError> + Send + 'static,
+        F: Future<Output = Result<TcpStream, ProtocolError>>,
     {
         ProcessFuture { inner: Box::new(inner) }
     }
 }
 
 impl Future for ProcessFuture {
-    type Error = ProtocolError;
-    type Item = TcpStream;
+    type Output = Result<TcpStream, ProtocolError>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> { self.inner.poll() }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        self.inner.poll(cx)
+    }
 }

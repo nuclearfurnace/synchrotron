@@ -19,9 +19,10 @@
 // SOFTWARE.
 use crate::{
     backend::{message_queue::MessageQueue, processor::Processor},
-    common::{AssignedRequests, AssignedResponse, Message},
+    common::{EnqueuedRequests, PendingResponse, Message},
     service::PipelineError,
-    util::{Batch, FutureExt, Timed},
+    util::{FutureExt, Timed, Sizable},
+    protocol::errors::ProtocolError,
 };
 use bytes::BytesMut;
 use futures::prelude::*;
@@ -31,26 +32,26 @@ use metrics_runtime::{
 };
 use std::collections::VecDeque;
 use tower_service::Service;
+use std::task::Poll;
+use crate::service::DrivenService;
 
 /// Pipeline-capable service base.
 ///
-/// `Pipeline` can simultaenously drive a `Transport` and an underlying `Service`,
+/// `Pipeline` can simultaneously drive a `Transport` and an underlying `Service`,
 /// opportunistically batching messages from the client transport and handing them off for
 /// processing while waiting to send back to the responses.
 pub struct Pipeline<T, S, P>
 where
-    T: Sink + Stream<Item = P::Message>,
-    S: Service<AssignedRequests<P::Message>>,
-    S::Response: IntoIterator<Item = AssignedResponse<P::Message>>,
+    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>> + Unpin,
+    S: DrivenService<EnqueuedRequests<P::Message>>,
     P: Processor,
     P::Message: Message + Clone,
 {
-    responses: VecDeque<Timed<S::Future>>,
-    transport: Batch<T>,
+    responses: VecDeque<Timed<PendingResponse<P::Message>>>,
+    transport: T,
     service: S,
     queue: MessageQueue<P>,
 
-    send_buf: Option<(BytesMut, u64)>,
     finish: bool,
 
     sink: MetricSink,
@@ -63,11 +64,10 @@ where
 
 impl<T, S, P> Pipeline<T, S, P>
 where
-    T: Sink<SinkItem = BytesMut> + Stream<Item = P::Message>,
-    S: Service<AssignedRequests<P::Message>>,
-    S::Response: IntoIterator<Item = AssignedResponse<P::Message>>,
+    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>> + Unpin,
+    S: DrivenService<EnqueuedRequests<P::Message>>,
     P: Processor,
-    P::Message: Message + Clone,
+    P::Message: Message + Clone + Unpin,
 {
     /// Creates a new `Pipeline`.
     pub fn new(transport: T, service: S, processor: P, mut sink: MetricSink) -> Self {
@@ -79,10 +79,9 @@ where
 
         Pipeline {
             responses: VecDeque::new(),
-            transport: Batch::new(transport, 128),
+            transport,
             service,
             queue: MessageQueue::new(processor),
-            send_buf: None,
             finish: false,
             sink,
             bytes_sent,
@@ -92,114 +91,86 @@ where
             client_e2e,
         }
     }
-}
 
-impl<T, S, P> Future for Pipeline<T, S, P>
-where
-    T: Sink<SinkItem = BytesMut> + Stream<Item = P::Message>,
-    S: Service<AssignedRequests<P::Message>>,
-    S::Response: IntoIterator<Item = AssignedResponse<P::Message>>,
-    P: Processor,
-    P::Message: Message + Clone,
-{
-    type Error = PipelineError<T, S, AssignedRequests<P::Message>>;
-    type Item = ();
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    pub async fn drive(&mut self) -> Result<(), PipelineError<T, S, P>> {
         loop {
-            // In order, drive the response futures we're waiting on.  Keep pulling from the
-            // front to keep things in order, and as soon as we hit something that isn't ready or
-            // isn't ready to flush to the message queue.
+            // The pipeline follows three logical steps: poll the transport for any new requests,
+            // process those requests concurrently, and 
+            // We follow three logical stages: poll the transport for any requests, process those
+            // requests, and return the response.
+            //
+            // We flip the script, however, and poll for new requests last, which gives us a chance
+            // to drive requests to completion and send the response before we pull in new requests
+            // to process.
             while let Some(mut f) = self.responses.pop_front() {
-                match f.poll() {
-                    Ok(Async::Ready((start, rsp))) => {
-                        self.queue.fulfill(rsp);
+                match poll!(f) {
+                    Poll::Ready((start, result)) => {
+                        let response = result.map_err(PipelineError::internal)?;
+                        self.queue.fulfill(response);
                         let end = self.sink.now();
                         self.client_e2e.record_timing(start, end);
                     },
-                    Ok(Async::NotReady) => {
+                    Poll::Pending => {
                         self.responses.push_front(f);
                         break;
                     },
-                    Err(e) => {
-                        return Err(PipelineError::from_service_error(e));
-                    },
                 }
             }
 
-            // Now that we've polled and fulfilled any completed batches, see if we have a buffer
-            // to send: first, we might be holding on to a buffer we got from the queue that
-            // hasn't been sendable, or we might be trying to get a buffer to send period.
-            if self.send_buf.is_some() {
-                let (buf, count) = self.send_buf.take().expect("left over send buffer not available");
+            // Now that we've polled and fulfilled any completed batches, try and drain the message
+            // queue to send any completed responses back to the client.
+            while let Some((buf, msg_count)) = self.queue.get_sendable_buf() {
                 let buf_len = buf.len();
-                if let AsyncSink::NotReady(buf) =
-                    self.transport.start_send(buf).map_err(PipelineError::from_sink_error)?
-                {
-                    self.send_buf = Some((buf, count));
-                    return Ok(Async::NotReady);
-                }
 
-                self.messages_sent.record(count);
+                // TODO: do we need to check for n == 0 here for error conditions? :bigthink:
+                self.transport.send(buf).await.map_err(PipelineError::send)?;
+                self.messages_sent.record(msg_count);
                 self.bytes_sent.record(buf_len as u64);
             }
 
-            let mut msgs_sent = 0;
-            let mut bytes_sent = 0;
-
-            while let Some((buf, count)) = self.queue.get_sendable_buf() {
-                let buf_len = buf.len();
-                if let AsyncSink::NotReady(buf) =
-                    self.transport.start_send(buf).map_err(PipelineError::from_sink_error)?
-                {
-                    self.send_buf = Some((buf, count));
-                    self.messages_sent.record(msgs_sent);
-                    self.bytes_sent.record(bytes_sent as u64);
-                    return Ok(Async::NotReady);
-                }
-
-                msgs_sent += count;
-                bytes_sent += buf_len;
-            }
-
-            self.messages_sent.record(msgs_sent);
-            self.bytes_sent.record(bytes_sent as u64);
-
-            // Drive our transport to flush any buffers we have.
-            if let Async::Ready(()) = self.transport.poll_complete().map_err(PipelineError::from_sink_error)? {
-                // If we're finished and have nothing else to send, then we're done!
-                if self.finish && self.responses.is_empty() {
-                    return Ok(Async::Ready(()));
-                }
-            }
-
             // Don't try and grab anything else from the transport if we're finished, we just need
-            // to flush the rest of our responses and that's it.
+            // to flush the rest of our responses and that's it.  If we have no more responses,
+            // though, then we're actually done and we can return entirely.
             if self.finish {
-                return Ok(Async::NotReady);
+                if self.responses.is_empty() {
+                    return Ok(());
+                }
             }
 
             // Make sure the underlying service is ready to be called.
-            try_ready!(self.service.poll_ready().map_err(PipelineError::from_service_error));
+            self.service.ready().await.map_err(PipelineError::service)?;
 
-            // See if we can pull a batch from the transport.
-            match try_ready!(self.transport.poll().map_err(PipelineError::from_stream_error)) {
-                Some((batch, batch_size)) => {
-                    self.messages_received.record(batch.len() as u64);
-                    self.bytes_received.record(batch_size as u64);
-                    let batch = self.queue.enqueue(batch)?;
-                    if !batch.is_empty() {
-                        let fut = self.service.call(batch);
-                        let start = self.sink.now();
-                        self.responses.push_back(fut.timed(start));
-                    }
-                },
-                None => {
-                    // Our transport has signalled no more messages are going to come in, so mark
-                    // ourselves as finished so we can begin the closing process.
-                    assert!(!self.finish);
-                    self.finish = true;
-                },
+            if let Some(result) = self.transport.next().await {
+                let request = result.map_err(PipelineError::receive)?;
+                self.messages_received.increment();
+                self.bytes_received.record(request.size() as u64);
+
+                // Enqueue the message. This may generate multiple subrequests. We check to see if
+                // we actually got anything back, because in the case of commands like PING, we do
+                // a sort of request hairpinning maneuver which shoves the response directly into
+                // the message queue, but obviously it has no request to send to a backend so we
+                // don't get back a request object to actually send off.
+                let subrequests = self.queue.enqueue(request).map_err(PipelineError::internal)?;
+                if !subrequests.is_empty() {
+                    // Split out the response channel from the enqueued requests we got back so we
+                    // can store them/drive them.
+                    let start = self.sink.now();
+                    let responses = subrequests
+                        .as_mut_slice()
+                        .iter_mut()
+                        .map(|x| x.get_response_rx())
+                        .filter(|x| x.is_some())
+                        .map(|x| x.unwrap().timed(start))
+                        .collect::<Vec<_>>();
+
+                    self.service.call(subrequests);
+                    self.responses.extend(responses);
+                }
+            } else {
+                // Our transport has signalled no more messages are going to come in, so mark
+                // ourselves as finished so we can begin the closing process.
+                assert!(!self.finish);
+                self.finish = true;
             }
         }
     }

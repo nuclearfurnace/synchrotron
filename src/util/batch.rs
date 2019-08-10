@@ -18,7 +18,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use super::Sizable;
-use futures::{prelude::*, stream::Fuse};
+use futures::prelude::*;
+use futures::stream::Fuse;
+use std::task::{Context, Poll};
+use std::pin::Pin;
 use std::mem;
 
 /// An adapter for batching up items in a stream opportunistically.
@@ -36,8 +39,7 @@ where
 {
     items: Vec<S::Item>,
     size: usize,
-    err: Option<S::Error>,
-    stream: Fuse<S>,
+    inner: Fuse<S>,
 }
 
 impl<S> Batch<S>
@@ -51,12 +53,11 @@ where
         Batch {
             items: Vec::with_capacity(capacity),
             size: 0,
-            err: None,
-            stream: s.fuse(),
+            inner: s.fuse(),
         }
     }
 
-    fn take(&mut self) -> (Vec<S::Item>, usize) {
+    fn consume(&mut self) -> (Vec<S::Item>, usize) {
         let cap = self.items.capacity();
         let items = mem::replace(&mut self.items, Vec::with_capacity(cap));
         let size = mem::replace(&mut self.size, 0);
@@ -70,25 +71,20 @@ where
     S: Stream,
     S::Item: Sizable,
 {
-    type Error = S::Error;
     type Item = (Vec<S::Item>, usize);
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        if let Some(err) = self.err.take() {
-            return Err(err);
-        }
-
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let cap = self.items.capacity();
         loop {
-            match self.stream.poll() {
+            match self.inner.poll_next(cx) {
                 // If the underlying stream isn't ready any more, and we have items queued up,
                 // simply return them to the caller and zero out our internal buffer.  If we have
                 // no items, then tell the caller we aren't ready.
-                Ok(Async::NotReady) => {
+                Poll::Pending => {
                     return if self.items.is_empty() {
-                        Ok(Async::NotReady)
+                        Poll::Pending
                     } else {
-                        Ok(Some(self.take()).into())
+                        Poll::Ready(Some(self.consume()))
                     };
                 },
 
@@ -98,51 +94,49 @@ where
                 // Generally, the capacity should be high enough that we consume every
                 // possible item available to us at the time of a given `poll`, maximixing the
                 // batching effect.
-                Ok(Async::Ready(Some(item))) => {
+                Poll::Ready(Some(item)) => {
                     let size = item.size();
                     self.items.push(item);
                     self.size += size;
                     if self.items.len() >= cap {
-                        return Ok(Some(self.take()).into());
+                        return Poll::Ready(Some(self.consume()));
                     }
                 },
 
                 // Since the underlying stream ran out of values, return what we have buffered, if
                 // we have anything at all.
-                Ok(Async::Ready(None)) => {
+                Poll::Ready(None) => {
                     return if !self.items.is_empty() {
-                        Ok(Some(self.take()).into())
+                        Poll::Ready(Some(self.consume()))
                     } else {
-                        Ok(Async::Ready(None))
+                        Poll::Ready(None)
                     };
-                },
-
-                // If we've got buffered items be sure to return them first, we'll defer our error
-                // for later.
-                Err(e) => {
-                    if self.items.is_empty() {
-                        return Err(e);
-                    } else {
-                        self.err = Some(e);
-                        return Ok(Some(self.take()).into());
-                    }
                 },
             }
         }
     }
 }
 
-impl<S> Sink for Batch<S>
+impl<S, T> Sink<T> for Batch<S>
 where
-    S: Sink + Stream,
+    S: Sink<T> + Stream,
     <S as Stream>::Item: Sizable,
 {
-    type SinkError = S::SinkError;
-    type SinkItem = S::SinkItem;
+    type Error = S::Error;
 
-    fn start_send(&mut self, item: S::SinkItem) -> StartSend<S::SinkItem, S::SinkError> { self.stream.start_send(item) }
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
 
-    fn poll_complete(&mut self) -> Poll<(), S::SinkError> { self.stream.poll_complete() }
+    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        self.inner.start_send(item)
+    }
 
-    fn close(&mut self) -> Poll<(), S::SinkError> { self.stream.close() }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_close(cx)
+    }
 }

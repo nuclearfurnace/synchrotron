@@ -30,7 +30,7 @@ pub trait KeyHasher {
     fn hash(&self, buf: &[u8]) -> u64;
 }
 
-pub fn configure_hasher(hash_type: &str) -> Result<Box<KeyHasher + Send + Sync>, CreationError> {
+pub fn configure_hasher(hash_type: &str) -> Result<Box<dyn KeyHasher + Send + Sync>, CreationError> {
     match hash_type {
         "md5" => Ok(Box::new(MD5Hasher::new())),
         "fnv1a_64" => Ok(Box::new(Fnv64aHasher::new())),

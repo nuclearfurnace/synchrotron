@@ -17,77 +17,93 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use crate::backend::processor::ProcessorError;
-use futures::prelude::*;
+use std::error::Error;
+use bytes::BytesMut;
+use crate::common::EnqueuedRequests;
+use crate::protocol::errors::ProtocolError;
 use std::fmt;
-use tower_service::Service;
+use crate::service::DrivenService;
+use crate::backend::processor::Processor;
+use futures::{Sink, Stream};
 
 /// Error type for `Pipeline`.
-pub enum PipelineError<T, S, R>
+pub enum PipelineError<T, S, P>
 where
-    T: Sink + Stream,
-    S: Service<R>,
+    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
+    S: DrivenService<EnqueuedRequests<P::Message>>,
+    P: Processor,
 {
-    /// The underlying transport failed to produce a request.
-    TransportReceive(<T as Stream>::Error),
+    /// An error occurred while reading from the transport.
+    TransportReceive(ProtocolError),
 
-    /// The underlying transport failed while attempting to send a response.
-    TransportSend(<T as Sink>::SinkError),
+    /// An error occurred while writing to the transport.
+    TransportSend(<T as Sink<BytesMut>>::Error),
 
     /// The underlying service failed to process a request.
     Service(S::Error),
+
+    /// An internal Synchrotron error occurred while servicing a request.
+    Internal(Box<dyn Error + Send + Sync + 'static>),
 }
 
-impl<T, S, R> fmt::Display for PipelineError<T, S, R>
+impl<T, S, P> PipelineError<T, S, P>
 where
-    T: Sink + Stream,
-    <T as Sink>::SinkError: fmt::Display,
-    <T as Stream>::Error: fmt::Display,
-    S: Service<R>,
-    <S as Service<R>>::Error: fmt::Display,
+    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
+    S: DrivenService<EnqueuedRequests<P::Message>>,
+    P: Processor,
+{
+    pub fn receive(e: ProtocolError) -> PipelineError<T, S, P> {
+        PipelineError::TransportReceive(e)
+    }
+
+    pub fn send(e: <T as Sink<BytesMut>>::Error) -> PipelineError<T, S, P> {
+        PipelineError::TransportSend(e)
+    }
+
+    pub fn service(e: S::Error) -> PipelineError<T, S, P> {
+        PipelineError::Service(e)
+    }
+
+    pub fn internal<E>(e: E) -> PipelineError<T, S, P>
+    where
+        E: Into<Box<dyn Error + Send + Sync + 'static>>,
+    {
+        PipelineError::Internal(e.into())
+    }
+}
+
+impl<T, S, P> fmt::Display for PipelineError<T, S, P>
+where
+    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
+    <T as Sink<BytesMut>>::Error: fmt::Display,
+    S: DrivenService<EnqueuedRequests<P::Message>>,
+    S::Error: fmt::Display,
+    P: Processor,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            PipelineError::TransportReceive(ref se) => fmt::Display::fmt(se, f),
+            PipelineError::TransportReceiver(ref se) => fmt::Display::fmt(se, f),
             PipelineError::TransportSend(ref se) => fmt::Display::fmt(se, f),
             PipelineError::Service(ref se) => fmt::Display::fmt(se, f),
+            PipelineError::Internal(ref se) => fmt::Display::fmt(se, f),
         }
     }
 }
 
-impl<T, S, R> fmt::Debug for PipelineError<T, S, R>
+impl<T, S, P> fmt::Debug for PipelineError<T, S, P>
 where
-    T: Sink + Stream,
-    <T as Sink>::SinkError: fmt::Debug,
-    <T as Stream>::Error: fmt::Debug,
-    S: Service<R>,
-    <S as Service<R>>::Error: fmt::Debug,
+    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
+    <T as Sink<BytesMut>>::Error: fmt::Debug,
+    S: DrivenService<EnqueuedRequests<P::Message>>,
+    S::Error: fmt::Debug,
+    P: Processor,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            PipelineError::TransportReceive(ref se) => write!(f, "TransportRecv({:?})", se),
+            PipelineError::TransportReceive(ref se) => write!(f, "TransportReceive({:?})", se),
             PipelineError::TransportSend(ref se) => write!(f, "TransportSend({:?})", se),
             PipelineError::Service(ref se) => write!(f, "Service({:?})", se),
+            PipelineError::Internal(ref se) => write!(f, "Internal({:?})", se),
         }
     }
-}
-
-impl<T, S, R> PipelineError<T, S, R>
-where
-    T: Sink + Stream,
-    S: Service<R>,
-{
-    pub fn from_sink_error(e: <T as Sink>::SinkError) -> Self { PipelineError::TransportSend(e) }
-
-    pub fn from_stream_error(e: <T as Stream>::Error) -> Self { PipelineError::TransportReceive(e) }
-
-    pub fn from_service_error(e: <S as Service<R>>::Error) -> Self { PipelineError::Service(e) }
-}
-
-impl<T, S, R> From<ProcessorError> for PipelineError<T, S, R>
-where
-    T: Sink + Stream,
-    S: Service<R>,
-{
-    fn from(e: ProcessorError) -> PipelineError<T, S, R> { e.into() }
 }

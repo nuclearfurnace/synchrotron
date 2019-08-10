@@ -21,13 +21,13 @@ use crate::{
     backend::processor::Processor,
     common::{AssignedRequests, EnqueuedRequest, EnqueuedRequests, Message},
 };
-use futures::prelude::*;
 use tower_service::Service;
+use std::task::{Context, Poll};
 
 #[derive(Clone)]
 pub struct FixedRouter<P, S>
 where
-    P: Processor + Clone + Send + 'static,
+    P: Processor + Unpin + Clone + Send,
     P::Message: Message + Send,
     S: Service<EnqueuedRequests<P::Message>> + Clone,
 {
@@ -37,7 +37,7 @@ where
 
 impl<P, S> FixedRouter<P, S>
 where
-    P: Processor + Clone + Send + 'static,
+    P: Processor + Unpin + Clone + Send,
     P::Message: Message + Send,
     S: Service<EnqueuedRequests<P::Message>> + Clone,
 {
@@ -46,7 +46,7 @@ where
 
 impl<P, S> Service<AssignedRequests<P::Message>> for FixedRouter<P, S>
 where
-    P: Processor + Clone + Send + 'static,
+    P: Processor + Unpin + Clone + Send,
     P::Message: Message + Send,
     S: Service<EnqueuedRequests<P::Message>> + Clone,
 {
@@ -54,7 +54,9 @@ where
     type Future = S::Future;
     type Response = S::Response;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> { self.inner.poll_ready() }
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
 
     fn call(&mut self, req: AssignedRequests<P::Message>) -> Self::Future {
         let transformed = req.into_iter().map(|(id, msg)| EnqueuedRequest::new(id, msg)).collect();

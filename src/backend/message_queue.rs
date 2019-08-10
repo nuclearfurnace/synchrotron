@@ -19,7 +19,7 @@
 // SOFTWARE.
 use crate::{
     backend::processor::{Processor, ProcessorError},
-    common::{AssignedRequests, AssignedResponse, Message, MessageResponse},
+    common::{EnqueuedRequest, EnqueuedRequests, AssignedResponse, Message, MessageResponse},
 };
 use bytes::BytesMut;
 use slab::Slab;
@@ -173,14 +173,14 @@ where
             fragments.push((state, msg));
         }
 
-        let msg = self.processor.defragment_messages(fragments)?;
+        let msg = self.processor.defragment_message(fragments)?;
         Ok(Some((msg.into_buf(), 1)))
     }
 
-    pub fn enqueue(&mut self, msgs: Vec<P::Message>) -> Result<AssignedRequests<P::Message>, ProcessorError> {
-        let fmsgs = self.processor.fragment_messages(msgs)?;
+    pub fn enqueue(&mut self, msg: P::Message) -> Result<EnqueuedRequests<P::Message>, ProcessorError> {
+        let fmsgs = self.processor.fragment_message(msg)?;
 
-        let mut amsgs = Vec::new();
+        let mut emsgs = Vec::new();
         for (msg_state, msg) in fmsgs {
             if msg_state == MessageState::Inline {
                 let slot_id = self.slots.insert(Some(msg));
@@ -188,28 +188,25 @@ where
             } else {
                 let slot_id = self.slots.insert(None);
                 self.slot_order.push_back((slot_id, msg_state));
-                amsgs.push((slot_id, msg));
+                let emsg = EnqueuedRequest::new(slot_id, msg);
+                emsgs.push(emsg);
             }
         }
 
-        Ok(amsgs)
+        Ok(emsgs)
     }
 
-    pub fn fulfill<I>(&mut self, batch: I)
-    where
-        I: IntoIterator<Item = AssignedResponse<P::Message>>,
-    {
-        for (slot, response) in batch.into_iter() {
-            let slot = self.slots.get_mut(slot).unwrap();
-            match response {
-                MessageResponse::Complete(msg) => {
-                    slot.replace(msg);
-                },
-                MessageResponse::Failed => {
-                    let err = self.processor.get_error_message_str("failed to receive response");
-                    slot.replace(err);
-                },
-            }
+    pub fn fulfill(&mut self, resp: AssignedResponse<P::Message>) {
+        let (slot_id, response) = resp;
+        let slot = self.slots.get_mut(slot_id).unwrap();
+        match response {
+            MessageResponse::Complete(msg) => {
+                slot.replace(msg);
+            },
+            MessageResponse::Failed => {
+                let err = self.processor.get_error_message_str("failed to receive response");
+                slot.replace(err);
+            },
         }
     }
 

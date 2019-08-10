@@ -20,23 +20,22 @@
 use crate::{
     backend::{
         message_queue::MessageState,
-        processor::{Processor, ProcessorError, TcpStreamFuture},
+        processor::{Processor, ProcessorError},
     },
     common::{EnqueuedRequests, Message},
     protocol::{
         errors::ProtocolError,
         redis::{self, RedisMessage, RedisTransport},
     },
-    util::ProcessFuture,
 };
 use bytes::BytesMut;
 use futures::{
-    future::{ok, Either},
     prelude::*,
 };
 use itoa;
 use std::{borrow::Borrow, error::Error, net::SocketAddr};
 use tokio::net::TcpStream;
+use async_trait::async_trait;
 
 const REDIS_DEL: &[u8] = b"del";
 const REDIS_SET: &[u8] = b"set";
@@ -48,6 +47,8 @@ impl RedisProcessor {
     pub fn new() -> RedisProcessor { RedisProcessor {} }
 }
 
+
+#[async_trait]
 impl Processor for RedisProcessor {
     type Message = RedisMessage;
     type Transport = RedisTransport<TcpStream>;
@@ -62,32 +63,26 @@ impl Processor for RedisProcessor {
         redis_defragment_messages(msgs)
     }
 
-    fn get_error_message(&self, e: Box<Error>) -> Self::Message { RedisMessage::from_error(e) }
+    fn get_error_message(&self, e: Box<dyn Error>) -> Self::Message { RedisMessage::from_error(e) }
 
     fn get_error_message_str(&self, e: &str) -> Self::Message { RedisMessage::from_error_str(e) }
 
     fn get_transport(&self, client: TcpStream) -> Self::Transport { RedisTransport::new(client) }
 
-    fn preconnect(&self, addr: &SocketAddr, noreply: bool) -> ProcessFuture {
-        let inner = TcpStream::connect(addr)
-            .map_err(ProtocolError::IoError)
-            .and_then(move |conn| {
-                if noreply {
-                    let noreply_req = RedisMessage::from_inline("CLIENT REPLY OFF");
-                    Either::A(redis::write_raw_message(conn, noreply_req).map(|(server, _n)| server))
-                } else {
-                    Either::B(ok(conn))
-                }
-            });
-        ProcessFuture::new(inner)
+    async fn preconnect(&self, addr: &SocketAddr, noreply: bool) -> Result<TcpStream, ProtocolError> {
+        let conn = TcpStream::connect(addr).await?;
+        if noreply {
+            let noreply_req = RedisMessage::from_inline("CLIENT REPLY OFF");
+            redis::write_raw_message(conn, noreply_req).await?;
+        }
+
+        Ok(conn)
     }
 
-    fn process(&self, req: EnqueuedRequests<Self::Message>, stream: TcpStreamFuture) -> ProcessFuture {
-        let inner = stream
-            .and_then(move |server| redis::write_messages(server, req))
-            .and_then(move |(server, msgs, _n)| redis::read_messages(server, msgs))
-            .and_then(move |(server, _n)| ok(server));
-        ProcessFuture::new(inner)
+    async fn process(&self, req: EnqueuedRequests<Self::Message>, conn: TcpStream) -> Result<TcpStream, ProtocolError> {
+        let (conn, msgs, _n) = redis::write_messages(conn, req).await?;
+        let (conn, _n) = redis::read_messages(conn, msgs).await?;
+        Ok(conn)
     }
 }
 

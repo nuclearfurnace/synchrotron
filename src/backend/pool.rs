@@ -22,31 +22,28 @@ use super::{
     hasher::{configure_hasher, KeyHasher},
 };
 use crate::{
-    backend::{processor::Processor, Backend, BackendError, PoolError, ResponseFuture},
-    common::{AssignedResponses, EnqueuedRequests, Message},
+    backend::{processor::Processor, Backend, PoolError},
+    common::{EnqueuedRequests, Message},
     conf::PoolConfiguration,
     errors::CreationError,
     util::IntegerMappedVec,
+    service::DrivenService,
 };
-use futures::{
-    future::{join_all, JoinAll},
-    prelude::*,
-};
+use futures::prelude::*;
+use std::task::Poll;
 use metrics_runtime::Sink as MetricSink;
-use std::{collections::HashMap, marker::PhantomData};
-use tower_direct_service::DirectService;
-
-type DistributorFutureSafe = Box<Distributor + Send + 'static>;
-type KeyHasherFutureSafe = Box<KeyHasher + Send + 'static>;
+use std::collections::{HashMap, VecDeque};
+use async_trait::async_trait;
 
 pub struct BackendPool<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Send + 'static,
+    P: Processor + Clone + Send,
+    P::Message: Message + Send,
 {
-    distributor: DistributorFutureSafe,
-    key_hasher: KeyHasherFutureSafe,
+    distributor: Box<dyn Distributor>,
+    key_hasher: Box<dyn KeyHasher>,
     backends: Vec<Backend<P>>,
+    pending_req: VecDeque<EnqueuedRequests<P::Message>>,
     noreply: bool,
     epoch: u64,
     sink: MetricSink,
@@ -54,17 +51,18 @@ where
 
 impl<P> BackendPool<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Send + 'static,
+    P: Processor + Clone + Send,
+    P::Message: Message + Send,
 {
     pub fn new(
-        backends: Vec<Backend<P>>, distributor: DistributorFutureSafe, key_hasher: KeyHasherFutureSafe, noreply: bool,
+        backends: Vec<Backend<P>>, distributor: Box<dyn Distributor>, key_hasher: Box<dyn KeyHasher>, noreply: bool,
         sink: MetricSink,
     ) -> BackendPool<P> {
         let mut pool = BackendPool {
             distributor,
             key_hasher,
             backends,
+            pending_req: VecDeque::new(),
             noreply,
             epoch: 0,
             sink,
@@ -90,34 +88,30 @@ where
     }
 }
 
-impl<P> DirectService<EnqueuedRequests<P::Message>> for BackendPool<P>
+#[async_trait]
+impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendPool<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Send + 'static,
+    P: Processor + Clone + Send,
+    P::Message: Message + Send,
 {
-    type Error = PoolError;
-    type Future = PoolResponse<P>;
     type Response = AssignedResponses<P::Message>;
+    type Error = PoolError;
+    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        // Not every backend will be ready all the time, especially if they're knocked out of the
-        // pool temporarily, but as long as one is ready, then we're ready.  If any of them are in
-        // a bad enough state to throw an error, though, then something is very wrong and we need
-        // to bubble that up.
+    async fn ready(&mut self) -> Result<(), Self::Error> {
         let mut any_ready = false;
         let mut epoch = 0;
         for backend in &mut self.backends {
-            match backend.poll_ready() {
-                Ok(Async::Ready(_)) => any_ready = true,
-                Ok(Async::NotReady) => {},
-                Err(e) => return Err(PoolError::Backend(e)),
+            match poll!(backend.ready()) {
+                Poll::Ready(Ok(())) => any_ready = true,
+                Poll::Pending => {},
             }
 
             epoch += backend.health().epoch();
         }
 
         if !any_ready {
-            return Ok(Async::NotReady);
+            pending!();
         }
 
         if self.epoch != epoch {
@@ -126,55 +120,48 @@ where
             self.epoch = epoch;
         }
 
-        Ok(Async::Ready(()))
+        Ok(())
     }
 
-    fn poll_service(&mut self) -> Poll<(), Self::Error> {
+    async fn drive(&mut self) -> Result<(), Self::Error> {
+        // Drive each backend to actually start processing.
         for backend in &mut self.backends {
-            // not clear if it actually makes sense to pre-emptively return notready without
-            // driving all services.. poll_ready should cover the "am i knocked out of the pool
-            // temporarily?" case but would this ever actually return notready when driving the
-            // underlying service? unclear
-            try_ready!(backend.poll_service());
+            backend.drive().await?;
         }
 
-        Ok(Async::Ready(()))
-    }
-
-    fn poll_close(&mut self) -> Poll<(), Self::Error> {
-        for backend in &mut self.backends {
-            try_ready!(backend.poll_close());
-        }
-
-        Ok(Async::Ready(()))
+        Ok(())
     }
 
     fn call(&mut self, req: EnqueuedRequests<P::Message>) -> Self::Future {
-        let mut futs = Vec::new();
-        let mut batches = IntegerMappedVec::new();
+        // Dispatch all requests to their respective backends.
+        let mut futs = FuturesUnordered::new();
 
-        for msg in req {
-            let msg_key = msg.key();
-            let msg_hashed = self.key_hasher.hash(msg_key);
-            let backend_idx = self.distributor.choose(msg_hashed);
+        for req in self.pending_req {
+            let mut batches = IntegerMappedVec::new();
 
-            batches.push(backend_idx, msg);
+            for msg in req {
+                let msg_key = msg.key();
+                let msg_hashed = self.key_hasher.hash(msg_key);
+                let backend_idx = self.distributor.choose(msg_hashed);
+
+                batches.push(backend_idx, msg);
+            }
+
+            for (backend_idx, batch) in batches {
+                let fut = self.backends[backend_idx].call(batch);
+                futs.push(fut);
+            }
         }
 
-        // make the batch calls to each relevant backend, and collect them
-        for (backend_idx, batch) in batches {
-            let fut = self.backends[backend_idx].call(batch);
-            futs.push(fut);
-        }
-
-        PoolResponse::new(futs)
+        futs.collect::<Vec<_>>()
+            .map(|xs| xs.flatten())
     }
 }
 
 pub struct BackendPoolBuilder<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Send + 'static,
+    P: Processor + Clone + Send,
+    P::Message: Message + Send,
 {
     processor: P,
     config: PoolConfiguration,
@@ -184,8 +171,8 @@ where
 
 impl<P> BackendPoolBuilder<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Send + 'static,
+    P: Processor + Clone + Send,
+    P::Message: Message + Send,
 {
     pub fn new(name: String, processor: P, config: PoolConfiguration, mut sink: MetricSink) -> BackendPoolBuilder<P> {
         sink.add_default_labels(&[("pool", name)]);
@@ -205,8 +192,8 @@ where
 
     pub fn build(self) -> Result<BackendPool<P>, CreationError>
     where
-        P: Processor + Clone + Send + 'static,
-        P::Message: Message + Send + 'static,
+        P: Processor + Clone + Send,
+        P::Message: Message + Send,
     {
         let mut options = self.config.options.unwrap_or_else(HashMap::new);
         let dist_type = options
@@ -238,42 +225,5 @@ where
         }
 
         Ok(BackendPool::new(backends, distributor, hasher, self.noreply, self.sink))
-    }
-}
-
-pub struct PoolResponse<P>
-where
-    P: Processor + Send + 'static,
-    P::Message: Message + Send + 'static,
-{
-    responses: JoinAll<Vec<ResponseFuture<P, BackendError>>>,
-    _processor: PhantomData<P>,
-}
-
-impl<P> PoolResponse<P>
-where
-    P: Processor + Send + 'static,
-    P::Message: Message + Send + 'static,
-{
-    pub fn new(responses: Vec<ResponseFuture<P, BackendError>>) -> PoolResponse<P> {
-        PoolResponse {
-            responses: join_all(responses),
-            _processor: PhantomData,
-        }
-    }
-}
-
-impl<P> Future for PoolResponse<P>
-where
-    P: Processor + Send + 'static,
-    P::Message: Message + Send + 'static,
-{
-    type Error = PoolError;
-    type Item = AssignedResponses<P::Message>;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let result = try_ready!(self.responses.poll());
-        let flattened = result.into_iter().flatten().collect::<Vec<_>>();
-        Ok(Async::Ready(flattened))
     }
 }

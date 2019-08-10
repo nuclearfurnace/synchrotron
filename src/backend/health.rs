@@ -17,8 +17,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use crate::util::FutureExt;
-use futures::{future::ok, task, Future};
 use std::time::{Duration, Instant};
 use tokio::timer::Delay;
 
@@ -80,26 +78,14 @@ impl BackendHealth {
             debug!("[health] error count over limit, setting cooloff");
             self.in_cooloff = true;
             self.epoch += 1;
-            self.fire_cooloff_check();
+            let deadline = Instant::now() + Duration::from_millis(self.cooloff_period_ms);
+            self.cooloff_done_at = deadline;
         }
     }
 
-    fn fire_cooloff_check(&mut self) {
-        // Mark when our cooloff period should be lifted, and trigger a task notification to fire
-        // once that deadline has passed: our health will be checked, and thus we can reenable
-        // ourselves.
-        let deadline = Instant::now() + Duration::from_millis(self.cooloff_period_ms);
-        self.cooloff_done_at = deadline;
-
-        let current_task = task::current();
-        let task = Delay::new(deadline)
-            .then(move |_| {
-                debug!("[health] resetting cooloff");
-                current_task.notify();
-                ok::<_, ()>(())
-            })
-            .untyped();
-
-        tokio::spawn(task);
+    pub async fn healthy(&mut self) {
+        if !self.is_healthy() {
+            Delay::new(self.cooloff_done_at).await;
+        }
     }
 }

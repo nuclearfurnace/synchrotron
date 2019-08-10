@@ -28,10 +28,11 @@ use crate::{
     errors::CreationError,
     protocol::errors::ProtocolError,
     routing::{FixedRouter, ShadowRouter},
-    service::{Pipeline, PipelineError},
+    service::{Pipeline, PipelineError, Facade},
     util::FutureExt,
 };
 use bytes::BytesMut;
+use std::future::Future;
 use futures::{
     future::{lazy, ok, Shared},
     prelude::*,
@@ -43,11 +44,10 @@ use std::{collections::HashMap, fmt::Display, net::SocketAddr};
 use tokio::{io, net::TcpListener, reactor};
 use tokio_evacuate::{Evacuate, Warden};
 use tokio_executor::DefaultExecutor;
-use tower_buffer::{Buffer, DirectServiceRef};
 use tower_service::Service;
 
-type GenericRuntimeFuture = Box<Future<Item = (), Error = ()> + Send + 'static>;
-type BufferedPool<T, M> = Buffer<DirectServiceRef<BackendPool<T>>, EnqueuedRequests<M>>;
+type GenericRuntimeFuture = Box<dyn Future<Output = ()>>;
+type BufferedPool<T, M> = Facade<BackendPool<T>, EnqueuedRequests<M>>;
 
 /// Creates a listener from the given configuration.
 ///
@@ -89,8 +89,7 @@ fn routing_from_config<P, C>(
 where
     P: Processor + Clone + Send + 'static,
     P::Message: Message + Clone + Send + 'static,
-    P::Transport:
-        Sink<SinkItem = BytesMut, SinkError = std::io::Error> + Stream<Item = P::Message, Error = ProtocolError> + Send,
+    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     C: Future + Clone + Send + 'static,
 {
     let reload_timeout_ms = config.reload_timeout_ms.unwrap_or_else(|| 5000);
@@ -114,7 +113,7 @@ where
         );
 
         let pool = BackendPoolBuilder::new(pool_name.clone(), processor.clone(), pool_config, sink.clone()).build()?;
-        let buffered_pool = Buffer::new_direct(pool, 32, &DefaultExecutor::current()).map_err(|_| {
+        let buffered_pool = Facade::new(pool, &DefaultExecutor::current(), 32).map_err(|_| {
             CreationError::InvalidResource(format!(
                 "error while building pool '{}': failed to spawn task",
                 pool_name
@@ -143,8 +142,7 @@ fn get_fixed_router<P, C>(
 where
     P: Processor + Clone + Send + 'static,
     P::Message: Message + Clone + Send + 'static,
-    P::Transport:
-        Sink<SinkItem = BytesMut, SinkError = std::io::Error> + Stream<Item = P::Message, Error = ProtocolError> + Send,
+    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     C: Future + Clone + Send + 'static,
 {
     // Construct an instance of our router.
@@ -164,8 +162,7 @@ fn get_shadow_router<P, C>(
 where
     P: Processor + Clone + Send + 'static,
     P::Message: Message + Clone + Send + 'static,
-    P::Transport:
-        Sink<SinkItem = BytesMut, SinkError = std::io::Error> + Stream<Item = P::Message, Error = ProtocolError> + Send,
+    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     C: Future + Clone + Send + 'static,
 {
     // Construct an instance of our router.
@@ -190,8 +187,7 @@ fn build_router_chain<P, R, C>(
 where
     P: Processor + Clone + Send + 'static,
     P::Message: Message + Clone + Send + 'static,
-    P::Transport:
-        Sink<SinkItem = BytesMut, SinkError = std::io::Error> + Stream<Item = P::Message, Error = ProtocolError> + Send,
+    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     R: Service<AssignedRequests<P::Message>> + Clone + Send + 'static,
     R::Error: Display + Send + Sync,
     R::Response: IntoIterator<Item = AssignedResponse<P::Message>> + Send,

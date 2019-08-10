@@ -30,79 +30,50 @@ pub use self::errors::{BackendError, PoolError};
 
 use crate::{
     backend::{distributor::BackendDescriptor, health::BackendHealth, processor::Processor},
-    common::{AssignedResponses, EnqueuedRequests, Message, PendingResponses},
+    common::{EnqueuedRequests, Message},
     errors::CreationError,
-    util::ProcessFuture,
+    service::DrivenService,
 };
-use futures::{
-    future::{join_all, ok, Either, JoinAll},
-    prelude::*,
-    Poll,
-};
+use futures::prelude::*;
 use metrics_runtime::{data::Counter, Sink as MetricSink};
 use std::{
     collections::{HashMap, VecDeque},
-    marker::PhantomData,
     net::SocketAddr,
     str::FromStr,
-    time::Duration,
 };
 use tokio::{
     net::tcp::TcpStream,
-    sync::oneshot,
-    timer::{timeout::Error as TimeoutError, Timeout},
 };
-use tower_direct_service::DirectService;
+use async_trait::async_trait;
 
-type MaybeTimeout<F> = Either<NotTimeout<F>, Timeout<F>>;
-
-pub struct NotTimeout<F>
-where
-    F: Future,
-{
-    inner: F,
-}
-
-impl<F> Future for NotTimeout<F>
-where
-    F: Future,
-{
-    type Error = TimeoutError<F::Error>;
-    type Item = F::Item;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> { self.inner.poll().map_err(TimeoutError::inner) }
-}
+// Don't talk to me about this, I don't wanna talk about it.
+const LONG_ASS_TIME: u64 = 5 * 365 * 24 * 60 * 60;
 
 /// A backend connection.
 ///
 /// This represents a one-to-one mapping with a TCP connection to the given backend server.  This
 /// connection will independently poll the work queue for the backend and run requests when
 /// available.
-///
-/// If a backend connection encounters an error, it will terminate and notify its backend
-/// supervisor, so that it can be replaced.
 pub struct BackendConnection<P>
 where
-    P: Processor + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
+    P: Processor,
+    P::Message: Message + Clone,
 {
     processor: P,
     address: SocketAddr,
     timeout_ms: u64,
     noreply: bool,
 
-    stream: Option<TcpStream>,
-    current: Option<MaybeTimeout<ProcessFuture>>,
+    conn: Option<TcpStream>,
     pending: VecDeque<EnqueuedRequests<P::Message>>,
-    pending_len: usize,
 
     connects: Counter,
 }
 
 impl<P> BackendConnection<P>
 where
-    P: Processor + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
+    P: Processor,
+    P::Message: Message + Clone,
 {
     pub fn new(
         address: SocketAddr, processor: P, timeout_ms: u64, noreply: bool, mut sink: MetricSink,
@@ -112,146 +83,77 @@ where
             address,
             timeout_ms,
             noreply,
-            stream: None,
-            current: None,
+            conn: None,
             pending: VecDeque::new(),
-            pending_len: 0,
             connects: sink.counter("connects"),
         }
     }
-
-    pub fn enqueue(&mut self, batch: EnqueuedRequests<P::Message>) {
-        self.pending_len += batch.len();
-        self.pending.push_back(batch);
-    }
 }
 
-impl<P> DirectService<EnqueuedRequests<P::Message>> for BackendConnection<P>
+#[async_trait]
+impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendConnection<P>
 where
-    P: Processor + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
+    P: Processor,
+    P::Message: Message + Clone,
 {
-    type Error = BackendError;
-    type Future = ResponseFuture<P, Self::Error>;
     type Response = AssignedResponses<P::Message>;
+    type Error = BackendError;
+    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> { Ok(Async::Ready(())) }
+    async fn ready(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
-    fn poll_service(&mut self) -> Poll<(), Self::Error> {
-        loop {
-            // First, check if we have an operation running.  If we do, poll it to drive it towards
-            // completion.  If it's done, we'll reclaim the socket and then fallthrough to trying to
-            // find another piece of work to run.
-            if let Some(task) = self.current.as_mut() {
-                match task.poll() {
-                    Ok(Async::Ready(stream)) => {
-                        // The operation finished, and gave us the connection back.
-                        self.stream = Some(stream);
-                        self.current = None;
-                    },
-                    Ok(Async::NotReady) => return Ok(Async::NotReady),
-                    Err(e) => {
-                        // If we caught any sort of error, it means this batch has implicitly
-                        // failed.  Some callers may have gotten the data they requested, depending
-                        // on what step in the process failed.  All requests are protected by a
-                        // drop guard that fulfills the response channel if it hasn't been
-                        // fulfilled yet, so that we can at least hand back an error saying that
-                        // something broke internally.
-                        self.current = None;
-
-                        // If this is specifically an inner error, and not a timeout, then the
-                        // connection to the backend is also likely compromised, so we'll drop that
-                        // as well, giving us a new connection when we go to process our next
-                        // batch.
-                        if e.is_inner() {
-                            self.stream = None;
-                            return Err(e.into_inner().unwrap().into());
-                        }
-                    },
-                }
-            }
-
-            // If we're here, we have no current operation to drive, so see if anything is in our work
-            // queue that we can grab.
-            let mut batch: Option<EnqueuedRequests<P::Message>> = None;
-            loop {
-                if let Some(batch2) = batch.as_ref() {
-                    if batch2.len() > 256 {
-                        break;
-                    }
-                }
-
-                match self.pending.pop_front() {
-                    Some(batch2) => {
-                        if let Some(batch3) = batch.as_mut() {
-                            batch3.extend(batch2);
-                        } else {
-                            batch = Some(batch2);
-                        }
-                    },
-                    None => break,
-                }
-            }
-
-            match batch {
-                Some(batch) => {
-                    self.pending_len -= batch.len();
-
-                    // Get our stream, which we either already have or we'll just get a future for.
-                    let stream = match self.stream.take() {
-                        Some(stream) => Either::A(ok(stream)),
-                        None => {
-                            self.connects.record(1);
-                            Either::B(self.processor.preconnect(&self.address, self.noreply))
-                        },
-                    };
-
-                    // Get the response future from the processor.
-                    let inner = self.processor.process(batch, stream);
-
-                    // Wrap it up to handle any configured timeouts.
-                    let work = if self.timeout_ms == 0 {
-                        Either::A(NotTimeout { inner })
-                    } else {
-                        Either::B(Timeout::new(inner, Duration::from_millis(self.timeout_ms)))
-                    };
-
-                    self.current = Some(work);
+    async fn drive(&mut self) -> Result<(), Self::Error> {
+        while !self.pending.is_empty() {
+            // Get the underlying connection to the backend.
+            let conn = match self.conn.take() {
+                // We still have an existing connection, so reuse it.
+                Some(conn) => conn,
+                // We haven't connected yet, or the old connection was faulty, so reconnect.
+                None => {
+                    let conn = self.processor.preconnect(&self.address, self.noreply).await?;
+                    self.connects.increment();
+                    conn
                 },
-                None => return Ok(Async::Ready(())),
+            };
+
+            // Extract a batch.
+            let batch = self.pending.pop_front().expect("self.pending should not be empty");
+
+            // Actually process this batch and then give back the connection.
+            let timeout_ms = if self.timeout_ms == 0 { LONG_ASS_TIME } else { self.timeout_ms };
+            let result = self.processor.process(batch, conn)
+                .timeout(Duration::from_millis(timeout_ms)).await;
+            match result {
+                Ok(Ok(conn)) => self.conn = Some(conn),
+                Ok(Err(e)) => return Err(e.into()),
+                _ => {}
             }
         }
+
+        Ok(())
     }
 
-    fn poll_close(&mut self) -> Poll<(), Self::Error> {
-        if self.current.is_some() || !self.pending.is_empty() {
-            return Ok(Async::NotReady);
-        }
-
-        Ok(Async::Ready(()))
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.drive().await
     }
 
-    fn call(&mut self, mut req: EnqueuedRequests<P::Message>) -> Self::Future {
-        // This is weird, but imagine: our requests are actually (request, response channel).
-        //
-        // We send this around via `EnqueuedRequest` because we need to be able to send back a
-        // future from the leaf service in this stack -- us, `BackendConnection` -- when we get
-        // called.
-        //
-        // Since some requests don't actually have or require a responseo to the client, though,
-        // the response channel isn't always there.  Thus, we check each request and extract its
-        // response channel if it has one.  The requests are then queued up for processing, and the
-        // response channels wrapped in a future that can be shipped back to the caller.
-        let response = req
+    fn call(&mut self, batch: EnqueuedRequests<P::Message>) -> Self::Future {
+        let fut = batch
             .as_mut_slice()
             .iter_mut()
             .map(|x| x.get_response_rx())
             .filter(|x| x.is_some())
             .map(|x| x.unwrap())
-            .collect::<Vec<_>>();
+            .fold(FuturesUnordered::new(), |xs, x| {
+                xs.push(x);
+                xs
+            });
 
-        self.enqueue(req);
-        ResponseFuture::new(response)
+        self.pending.push_back(batch);
+
+        fut
     }
 }
 
@@ -268,8 +170,8 @@ where
 /// states, recycling connections and pausing work when required.
 pub struct Backend<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
+    P: Processor + Clone,
+    P::Message: Message + Clone,
 {
     identifier: String,
     health: BackendHealth,
@@ -280,16 +182,16 @@ where
 
 impl<P> Backend<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
+    P: Processor + Clone + Send,
+    P::Message: Message + Clone + Send,
 {
     pub fn new(
         address: SocketAddr, identifier: String, processor: P, mut options: HashMap<String, String>, noreply: bool,
         sink: MetricSink,
     ) -> Result<Backend<P>, CreationError>
     where
-        P: Processor + Clone + Send + 'static,
-        P::Message: Message + Send + 'static,
+        P: Processor + Clone + Send,
+        P::Message: Message + Send,
     {
         let sink = sink.scoped("backend");
 
@@ -343,79 +245,52 @@ where
     }
 }
 
-impl<P> DirectService<EnqueuedRequests<P::Message>> for Backend<P>
+#[async_trait]
+impl<P> DrivenService<EnqueuedRequests<P::Message>> for Backend<P>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
+    P: Processor + Clone + Send,
+    P::Message: Message + Clone + Send,
 {
-    type Error = BackendError;
-    type Future = ResponseFuture<P, Self::Error>;
     type Response = AssignedResponses<P::Message>;
+    type Error = BackendError;
+    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        if self.health.is_healthy() {
-            Ok(Async::Ready(()))
-        } else {
-            Ok(Async::NotReady)
-        }
+    async fn ready(&mut self) -> Result<(), Self::Error> {
+        self.health.healthy()
     }
 
-    fn poll_service(&mut self) -> Poll<(), Self::Error> {
-        for conn in &mut self.conns {
-            if conn.poll_service().is_err() {
+    async fn drive(&mut self) -> Result<(), Self::Error> {
+        // TODO: we may want to precisely examine the protocol error and behave differently
+        // for i/o errors vs actual protocol errors, but not sure yet....
+        //
+        // TODO 2: we also may want to enqueue all the batches at the backend level, and pass one
+        // in to BackendConnection::drive every time we call it.  we might want to do something
+        // like one future per conn (or less if not enough batches) to drive it, stored in a
+        // futuresunoredered, and then await on that to try and drive them all pseudo simultaenously
+        // that way hopefully we can avoid a slow connection blocking other i/o and keep latency
+        // down
+        for conn in self.conns {
+            if let Err(_) = conn.drive().await {
                 self.health.increment_error();
             }
         }
 
-        Ok(Async::Ready(()))
+        Ok(())
     }
 
-    fn poll_close(&mut self) -> Poll<(), Self::Error> { Ok(Async::Ready(())) }
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        for conn in self.conns {
+            conn.drive().await?;
+        }
+
+        Ok(())
+    }
 
     fn call(&mut self, req: EnqueuedRequests<P::Message>) -> Self::Future {
-        let result = self.conns[self.conns_index].call(req);
+        let fut = self.conns[self.conns_index].call(req);
 
         self.conns_index += 1;
         self.conns_index %= self.conns.len();
-
-        result
+        fut
     }
-}
-
-pub struct ResponseFuture<P, E>
-where
-    P: Processor + Send + 'static,
-    P::Message: Message + Send + 'static,
-    E: From<oneshot::error::RecvError>,
-{
-    responses: JoinAll<PendingResponses<P::Message>>,
-    _processor: PhantomData<P>,
-    _error: PhantomData<E>,
-}
-
-impl<P, E> ResponseFuture<P, E>
-where
-    P: Processor + Send + 'static,
-    P::Message: Message + Send + 'static,
-    E: From<oneshot::error::RecvError>,
-{
-    pub fn new(responses: PendingResponses<P::Message>) -> ResponseFuture<P, E> {
-        ResponseFuture {
-            responses: join_all(responses),
-            _processor: PhantomData,
-            _error: PhantomData,
-        }
-    }
-}
-
-impl<P, E> Future for ResponseFuture<P, E>
-where
-    P: Processor + Send + 'static,
-    P::Message: Message + Send + 'static,
-    E: From<oneshot::error::RecvError>,
-{
-    type Error = E;
-    type Item = AssignedResponses<P::Message>;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> { self.responses.poll().map_err(|e| e.into()) }
 }

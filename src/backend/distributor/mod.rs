@@ -37,7 +37,7 @@ pub trait Distributor {
     fn choose(&self, point: u64) -> usize;
 }
 
-pub fn configure_distributor(dist_type: &str) -> Result<Box<Distributor + Send + Sync>, CreationError> {
+pub fn configure_distributor(dist_type: &str) -> Result<Box<dyn Distributor + Send + Sync>, CreationError> {
     match dist_type {
         "random" => Ok(Box::new(RandomDistributor::new())),
         "modulo" => Ok(Box::new(ModuloDistributor::new())),

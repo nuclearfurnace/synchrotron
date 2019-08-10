@@ -18,10 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use crate::{backend::processor::ProcessorError, protocol::errors::ProtocolError};
-use std::{
-    error::{self, Error},
-    fmt, io,
-};
+use std::{error, fmt, io};
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -83,13 +80,11 @@ impl error::Error for BackendError {
         }
     }
 
-    fn cause(&self) -> Option<&error::Error> { None }
+    fn cause(&self) -> Option<&dyn error::Error> { None }
 }
 
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use std::error::Error;
-
         match self {
             BackendError::Internal(s) => write!(f, "internal error: {}", s.as_str()),
             BackendError::Protocol(pe) => write!(f, "protocol: {}", pe),

@@ -59,7 +59,7 @@ impl error::Error for RouterError {
         }
     }
 
-    fn cause(&self) -> Option<&error::Error> { None }
+    fn cause(&self) -> Option<&dyn error::Error> { None }
 }
 
 impl fmt::Display for RouterError {
