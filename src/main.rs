@@ -21,7 +21,7 @@
 #![feature(nll)]
 #![feature(never_type)]
 #![feature(proc_macro_hygiene)]
-#![feature(async_await)]
+#![feature(async_closure)]
 #![feature(type_alias_impl_trait)]
 #![recursion_limit = "1024"]
 
@@ -35,14 +35,15 @@ extern crate serde_derive;
 extern crate futures;
 
 use futures_turnstyle::{Turnstyle, Waiter};
-use signal_hook::iterator::Signals;
 use libc::{SIGINT, SIGUSR1};
+use signal_hook::iterator::Signals;
 use std::thread;
 
 extern crate tokio;
 use tokio::{
     prelude::*,
     sync::{mpsc, oneshot},
+    runtime::Builder,
 };
 
 #[macro_use]
@@ -75,14 +76,17 @@ use metrics_runtime::{
     exporters::HttpExporter, observers::PrometheusBuilder, Controller, Receiver, Sink as MetricSink,
 };
 
+use tracing::Dispatch;
+use tracing_fmt::FmtSubscriber;
+
+#[derive(Debug)]
 enum SupervisorCommand {
     Launch,
     Reload,
     Shutdown,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Set up our signal handling before anything else.
     let (mut supervisor_tx, supervisor_rx) = mpsc::unbounded_channel();
     let signals = Signals::new(&[SIGINT, SIGUSR1]).expect("failed to register signal handlers");
@@ -107,6 +111,10 @@ async fn main() {
         }
     });
 
+    let fmt = FmtSubscriber::new();
+    let dispatch = Dispatch::new(fmt);
+    let _ = tracing::dispatcher::set_global_default(dispatch).expect("failed to set tracing subscriber");
+
     let configuration = Configuration::new().expect("failed to parse configuration");
 
     // Configure our logging.  This gives us fully asynchronous logging to the terminal
@@ -114,7 +122,9 @@ async fn main() {
     // and pulled in helper macros that correspond to the various logging levels.
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
+    let drain = slog_async::Async::new(drain)
+        .chan_size(4096)
+        .build().fuse();
     let logger = slog::Logger::root(
         slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
         slog_o!("version" => env!("GIT_HASH")),
@@ -131,49 +141,56 @@ async fn main() {
     let sink = receiver.get_sink();
     receiver.install();
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    launch_metrics(configuration.stats_addr, controller, shutdown_rx);
-    launch_supervisor(supervisor_rx, shutdown_tx, sink);
+    let runtime = Builder::new()
+        .name_prefix("synchrotron-thread-pool-")
+        .build()
+        .unwrap();
 
-    info!("[core] synchrotron running");
+    runtime.spawn(async move {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        launch_metrics(configuration.stats_addr, controller, shutdown_rx);
+        launch_supervisor(supervisor_rx, shutdown_tx, sink);
+
+        info!("[core] synchrotron running");
+    });
+    runtime.shutdown_on_idle();
 }
 
 fn launch_supervisor(
-    supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>, shutdown_tx: oneshot::Sender<()>, sink: MetricSink,
+    mut supervisor_rx: mpsc::UnboundedReceiver<SupervisorCommand>,
+    shutdown_tx: oneshot::Sender<()>,
+    sink: MetricSink,
 ) {
     let turnstyle = Turnstyle::new();
-    let supervisor = supervisor_rx
-        .map_err(|_| CreationError::ListenerSpawnFailed)
-        .fold(turnstyle, move |ts, command| {
+    tokio::spawn(async move {
+        while let Some(command) = supervisor_rx.next().await {
+            debug!("got supervisor cmd: {:?}", command);
             match command {
                 SupervisorCommand::Launch => {
-                    let (version, waiter) = ts.join();
-                    launch_listeners(version, waiter, sink.clone())?;
+                    let (version, waiter) = turnstyle.join();
+                    if let Err(e) = launch_listeners(version, waiter, sink.clone()) {
+                        error!("[core supervisor] caught an error during launch/reload: {}", e);
+                        break
+                    }
                     counter!("supervisor.configuration_loads", 1);
                 },
                 SupervisorCommand::Reload => {
-                    let (version, waiter) = ts.join();
-                    launch_listeners(version, waiter, sink.clone())?;
-                    ts.turn();
+                    let (version, waiter) = turnstyle.join();
+                    if let Err(e) = launch_listeners(version, waiter, sink.clone()) {
+                        error!("[core supervisor] caught an error during launch/reload: {}", e);
+                        break
+                    }
+                    turnstyle.turn();
                     counter!("supervisor.configuration_loads", 1);
                 },
                 SupervisorCommand::Shutdown => {
-                    ts.turn();
+                    turnstyle.turn();
                 },
             }
+        }
 
-            Ok(ts)
-        })
-        .then(move |result| {
-            if let Err(e) = result {
-                error!("[core supervisor] caught an error during launch/reload: {}", e);
-            }
-
-            shutdown_tx.send(())
-        })
-        .untyped();
-
-    tokio::spawn(supervisor);
+       let _ = shutdown_tx.send(());
+    });
 }
 
 fn launch_listeners(version: usize, close: Waiter, sink: MetricSink) -> Result<(), CreationError> {
@@ -215,9 +232,17 @@ fn launch_listeners(version: usize, close: Waiter, sink: MetricSink) -> Result<(
     Ok(())
 }
 
-fn launch_metrics(stats_addr: String, controller: Controller, shutdown_rx: impl Future) {
-    let addr = stats_addr.parse().expect("failed to parse metrics listen address");
+fn launch_metrics(stats_addr: String, controller: Controller, shutdown_rx: impl Future + Send + Unpin + 'static) {
+    /*let addr = stats_addr.parse().expect("failed to parse metrics listen address");
     let exporter = HttpExporter::new(controller, PrometheusBuilder::new(), addr);
-    let task = exporter.into_future().select2(shutdown_rx).untyped();
-    tokio::spawn(task);
+
+    tokio::spawn(async move {
+        let mut server = exporter.into_future().fuse();
+        let mut shutdown = shutdown_rx.fuse();
+
+        select! {
+            _ = server => {},
+            _ = shutdown => {},
+        }
+    });*/
 }

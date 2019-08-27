@@ -19,7 +19,7 @@
 // SOFTWARE.
 use crate::{
     backend::processor::{Processor, ProcessorError},
-    common::{EnqueuedRequest, EnqueuedRequests, AssignedResponse, Message, MessageResponse},
+    common::{AssignedRequests, AssignedResponse, Message, MessageResponse},
 };
 use bytes::BytesMut;
 use slab::Slab;
@@ -177,10 +177,10 @@ where
         Ok(Some((msg.into_buf(), 1)))
     }
 
-    pub fn enqueue(&mut self, msg: P::Message) -> Result<EnqueuedRequests<P::Message>, ProcessorError> {
+    pub fn enqueue(&mut self, msg: P::Message) -> Result<AssignedRequests<P::Message>, ProcessorError> {
         let fmsgs = self.processor.fragment_message(msg)?;
 
-        let mut emsgs = Vec::new();
+        let mut amsgs = Vec::new();
         for (msg_state, msg) in fmsgs {
             if msg_state == MessageState::Inline {
                 let slot_id = self.slots.insert(Some(msg));
@@ -188,12 +188,11 @@ where
             } else {
                 let slot_id = self.slots.insert(None);
                 self.slot_order.push_back((slot_id, msg_state));
-                let emsg = EnqueuedRequest::new(slot_id, msg);
-                emsgs.push(emsg);
+                amsgs.push((slot_id, msg));
             }
         }
 
-        Ok(emsgs)
+        Ok(amsgs)
     }
 
     pub fn fulfill(&mut self, resp: AssignedResponse<P::Message>) {

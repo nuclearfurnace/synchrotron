@@ -18,159 +18,145 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use crate::{
-    backend::{message_queue::MessageQueue, processor::Processor},
-    common::{EnqueuedRequests, PendingResponse, Message},
-    service::PipelineError,
-    util::{FutureExt, Timed, Sizable},
     protocol::errors::ProtocolError,
+    service::{PipelineError, Service},
 };
-use bytes::BytesMut;
-use futures::prelude::*;
-use metrics_runtime::{
-    data::{Counter, Histogram},
-    Sink as MetricSink,
+use std::{
+    future::Future,
+    task::{Context, Poll},
+    pin::Pin,
+    collections::VecDeque,
 };
-use std::collections::VecDeque;
-use tower_service::Service;
-use std::task::Poll;
-use crate::service::DrivenService;
+use futures::{
+    future::FutureExt,
+    stream::{Stream, FuturesOrdered},
+    sink::Sink,
+};
+use pin_project::pin_project;
 
 /// Pipeline-capable service base.
 ///
-/// `Pipeline` can simultaneously drive a `Transport` and an underlying `Service`,
-/// opportunistically batching messages from the client transport and handing them off for
-/// processing while waiting to send back to the responses.
-pub struct Pipeline<T, S, P>
+/// Simultaneously drives a `Transport` and an underlying `Service`, pulling requests off of the
+/// transport, submitting them to the service, and sending back the responses.
+#[pin_project]
+pub struct Pipeline<T, S, Request>
 where
-    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>> + Unpin,
-    S: DrivenService<EnqueuedRequests<P::Message>>,
-    P: Processor,
-    P::Message: Message + Clone,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    S: Service<Request>,
+    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
 {
-    responses: VecDeque<Timed<PendingResponse<P::Message>>>,
+    #[pin]
+    pending: FuturesOrdered<S::Future>,
+    responses: VecDeque<S::Response>,
+    #[pin]
     transport: T,
     service: S,
-    queue: MessageQueue<P>,
-
     finish: bool,
-
-    sink: MetricSink,
-    bytes_sent: Counter,
-    bytes_received: Counter,
-    messages_sent: Counter,
-    messages_received: Counter,
-    client_e2e: Histogram,
 }
 
-impl<T, S, P> Pipeline<T, S, P>
+impl<T, S, Request> Pipeline<T, S, Request>
 where
-    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>> + Unpin,
-    S: DrivenService<EnqueuedRequests<P::Message>>,
-    P: Processor,
-    P::Message: Message + Clone + Unpin,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    S: Service<Request>,
+    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
 {
     /// Creates a new `Pipeline`.
-    pub fn new(transport: T, service: S, processor: P, mut sink: MetricSink) -> Self {
-        let bytes_sent = sink.counter("bytes_sent");
-        let bytes_received = sink.counter("bytes_received");
-        let messages_sent = sink.counter("messages_sent");
-        let messages_received = sink.counter("messages_received");
-        let client_e2e = sink.histogram("client_e2e");
-
+    pub fn new(transport: T, service: S) -> Self {
         Pipeline {
+            pending: FuturesOrdered::new(),
             responses: VecDeque::new(),
             transport,
             service,
-            queue: MessageQueue::new(processor),
             finish: false,
-            sink,
-            bytes_sent,
-            bytes_received,
-            messages_sent,
-            messages_received,
-            client_e2e,
         }
     }
+}
 
-    pub async fn drive(&mut self) -> Result<(), PipelineError<T, S, P>> {
+impl<T, S, Request> Future for Pipeline<T, S, Request>
+where
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    S: Service<Request>,
+    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
+{
+    type Output = Result<(), PipelineError<T, S, Request>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        debug!("inside poll for pipeline");
+        let mut this = self.project();
         loop {
-            // The pipeline follows three logical steps: poll the transport for any new requests,
-            // process those requests concurrently, and 
-            // We follow three logical stages: poll the transport for any requests, process those
-            // requests, and return the response.
-            //
-            // We flip the script, however, and poll for new requests last, which gives us a chance
-            // to drive requests to completion and send the response before we pull in new requests
-            // to process.
-            while let Some(mut f) = self.responses.pop_front() {
-                match poll!(f) {
-                    Poll::Ready((start, result)) => {
-                        let response = result.map_err(PipelineError::internal)?;
-                        self.queue.fulfill(response);
-                        let end = self.sink.now();
-                        self.client_e2e.record_timing(start, end);
+            // Drive all of our pending responses, collecting any available responses.
+            while let Poll::Ready(Some(result)) = this.pending.as_mut().poll_next(cx) {
+                match result {
+                    Ok(response) => {
+                        this.responses.push_back(response);
+                        debug!("got response back from pending");
                     },
+                    Err(e) => return Poll::Ready(Err(PipelineError::service(e))),
+                }
+            }
+
+            // Try and push any responses we have into the transport.
+            while let Some(response) = this.responses.pop_front() {
+                let ready = this.transport.as_mut().poll_ready(cx);
+                match ready {
                     Poll::Pending => {
-                        self.responses.push_front(f);
-                        break;
+                        debug!("transport not ready to send, push back resp");
+                        this.responses.push_front(response);
+                        break
+                    },
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(PipelineError::send(e))),
+                    Poll::Ready(Ok(())) => {
+                        if let Err(e) = this.transport.as_mut().start_send(response) {
+                            return Poll::Ready(Err(PipelineError::send(e)))
+                        }
+
+                        debug!("start send for resp to transport");
                     },
                 }
             }
 
-            // Now that we've polled and fulfilled any completed batches, try and drain the message
-            // queue to send any completed responses back to the client.
-            while let Some((buf, msg_count)) = self.queue.get_sendable_buf() {
-                let buf_len = buf.len();
-
-                // TODO: do we need to check for n == 0 here for error conditions? :bigthink:
-                self.transport.send(buf).await.map_err(PipelineError::send)?;
-                self.messages_sent.record(msg_count);
-                self.bytes_sent.record(buf_len as u64);
-            }
-
-            // Don't try and grab anything else from the transport if we're finished, we just need
-            // to flush the rest of our responses and that's it.  If we have no more responses,
-            // though, then we're actually done and we can return entirely.
-            if self.finish {
-                if self.responses.is_empty() {
-                    return Ok(());
+            // Try and flush our transport in case we pushed anything into it just now.
+            if let Poll::Ready(Ok(())) = this.transport.as_mut().poll_flush(cx) {
+                debug!("transport flushed");
+                // We have no more finished/pending responses to worry about, and we've flushed
+                // everything, so we're done!
+                if *this.finish && this.responses.is_empty() && this.pending.is_empty() {
+                    return Poll::Ready(Ok(()))
                 }
             }
+
+            // We've sent back all the responses we could during this poll, and nothing else was
+            // ready yet, so yield back if we're supposed to be closing up shop.
+            if *this.finish {
+                return Poll::Pending
+            }
+
+            debug!("checking svc readiness");
 
             // Make sure the underlying service is ready to be called.
-            self.service.ready().await.map_err(PipelineError::service)?;
+            if let Err(e) = ready!(this.service.ready().as_mut().poll(cx)) {
+                return Poll::Ready(Err(PipelineError::service(e)))
+            }
 
-            if let Some(result) = self.transport.next().await {
-                let request = result.map_err(PipelineError::receive)?;
-                self.messages_received.increment();
-                self.bytes_received.record(request.size() as u64);
+            debug!("svc is ready, polling transport");
 
-                // Enqueue the message. This may generate multiple subrequests. We check to see if
-                // we actually got anything back, because in the case of commands like PING, we do
-                // a sort of request hairpinning maneuver which shoves the response directly into
-                // the message queue, but obviously it has no request to send to a backend so we
-                // don't get back a request object to actually send off.
-                let subrequests = self.queue.enqueue(request).map_err(PipelineError::internal)?;
-                if !subrequests.is_empty() {
-                    // Split out the response channel from the enqueued requests we got back so we
-                    // can store them/drive them.
-                    let start = self.sink.now();
-                    let responses = subrequests
-                        .as_mut_slice()
-                        .iter_mut()
-                        .map(|x| x.get_response_rx())
-                        .filter(|x| x.is_some())
-                        .map(|x| x.unwrap().timed(start))
-                        .collect::<Vec<_>>();
-
-                    self.service.call(subrequests);
-                    self.responses.extend(responses);
+            // Since we're ready, try and see if there's a request from the transport.
+            if let Some(result) = ready!(this.transport.as_mut().poll_next(cx)) {
+                match result {
+                    Ok(request) => {
+                        debug!("transport had message, calling svc");
+                        let mut span = tracing::span!(tracing::Level::DEBUG, "pipeline request");
+                        let _guard = span.enter();
+                        let response = this.service.call(request);
+                        this.pending.push(response);
+                    },
+                    Err(e) => return Poll::Ready(Err(PipelineError::receive(e))),
                 }
             } else {
                 // Our transport has signalled no more messages are going to come in, so mark
                 // ourselves as finished so we can begin the closing process.
-                assert!(!self.finish);
-                self.finish = true;
+                assert!(!*this.finish);
+                *this.finish = true;
             }
         }
     }

@@ -30,7 +30,7 @@ pub struct BackendDescriptor {
 }
 
 /// Distributes items amongst a set of backends.
-pub trait Distributor {
+pub trait Distributor: Send + Sync {
     fn update(&mut self, backends: Vec<BackendDescriptor>);
 
     /// Chooses a backend based on the given point.

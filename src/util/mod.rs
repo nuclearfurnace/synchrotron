@@ -17,44 +17,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use futures::{future::Future, stream::Stream};
+use std::future::Future;
 
-mod batch;
 mod timed;
 mod untyped;
-pub use self::{batch::Batch, timed::Timed, untyped::Untyped};
-
-mod helpers;
-pub use self::helpers::ProcessFuture;
+pub use self::{timed::Timed, untyped::Untyped};
 
 mod container;
 pub use self::container::IntegerMappedVec;
-
-impl<T: ?Sized> StreamExt for T where T: Stream {}
-
-/// An extension trait for `Stream`s that provides necessary combinators specific to synchrotron.
-pub trait StreamExt: Stream {
-    /// Converts this stream into a batched stream.
-    ///
-    /// Items from the underlying stream will be batched, up to `capacity`, and returned as a
-    /// `Vec<T>`.
-    ///
-    /// Unlike standard combinators that perform grouping, batches are collected opportunistically.
-    /// The combinator will take up to `capacity` items from the underlying stream in a single
-    /// `poll`, but will return the currently batched items -- if any have been batched since the
-    /// last batch was emitted -- either when capacity is reached or the underlying stream reports
-    /// that it is no longer ready.
-    ///
-    /// If the underlying stream signals that it is not ready, and no items have been batched, then
-    /// the stream will emit nothing.
-    fn batch(self, capacity: usize) -> Batch<Self>
-    where
-        Self: Sized,
-        Self::Item: Sizable,
-    {
-        Batch::new(self, capacity)
-    }
-}
 
 impl<T: ?Sized> FutureExt for T where T: Future {}
 

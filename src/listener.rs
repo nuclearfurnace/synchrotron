@@ -23,31 +23,30 @@ use crate::{
         processor::Processor,
         redis::RedisProcessor,
     },
-    common::{AssignedRequests, AssignedResponse, EnqueuedRequests, Message},
+    common::{EnqueuedRequests, Message, Response, GenericError},
     conf::ListenerConfiguration,
     errors::CreationError,
     protocol::errors::ProtocolError,
     routing::{FixedRouter, ShadowRouter},
-    service::{Pipeline, PipelineError, Facade},
-    util::FutureExt,
+    service::{Service, Facade, Pipeline, Fragment, PipelineError},
 };
-use bytes::BytesMut;
-use std::future::Future;
 use futures::{
-    future::{lazy, ok, Shared},
-    prelude::*,
+    future::{Shared, FutureExt},
+    sink::Sink,
+    stream::{Stream, StreamExt},
 };
 use futures_turnstyle::Waiter;
 use metrics_runtime::Sink as MetricSink;
 use net2::TcpBuilder;
-use std::{collections::HashMap, fmt::Display, net::SocketAddr};
-use tokio::{io, net::TcpListener, reactor};
+use std::{collections::HashMap, future::Future, task::Poll, net::SocketAddr};
+use tokio::{io, net::TcpListener};
+use tokio_net::driver::Handle;
 use tokio_evacuate::{Evacuate, Warden};
 use tokio_executor::DefaultExecutor;
-use tower_service::Service;
+use std::pin::Pin;
 
-type GenericRuntimeFuture = Box<dyn Future<Output = ()>>;
-type BufferedPool<T, M> = Facade<BackendPool<T>, EnqueuedRequests<M>>;
+type GenericRuntimeFuture = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+type BufferedPool<P, T> = Facade<BackendPool<P>, EnqueuedRequests<T>>;
 
 /// Creates a listener from the given configuration.
 ///
@@ -55,7 +54,11 @@ type BufferedPool<T, M> = Facade<BackendPool<T>, EnqueuedRequests<M>>;
 /// spawn a task to process all of the messages from that client until the client disconnects or
 /// there is an unrecoverable connection/protocol error.
 pub fn from_config(
-    version: usize, name: String, config: ListenerConfiguration, close: Shared<Waiter>, sink: MetricSink,
+    version: usize,
+    name: String,
+    config: ListenerConfiguration,
+    close: Shared<Waiter>,
+    sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError> {
     // Create the actual listener proper.
     let listen_address = config.address.clone();
@@ -69,33 +72,35 @@ pub fn from_config(
     }?;
 
     // Make sure our handlers close out when told.
-    let listen_address2 = listen_address.clone();
-    let wrapped = lazy(move || {
+    let task = async move {
         info!("[listener] starting listener '{}' (v{})", listen_address, version);
-        ok(())
-    })
-    .and_then(|_| handler)
-    .select2(close)
-    .then(move |_| {
-        info!("[listener] shutting down listener '{}' (v{})", listen_address2, version);
-        ok(())
-    });
-    Ok(Box::new(wrapped))
+        handler.await;
+        info!("[listener] shutting down listener '{}' (v{})", listen_address, version);
+    };
+
+    Ok(Box::pin(task))
 }
 
 fn routing_from_config<P, C>(
-    name: String, config: ListenerConfiguration, listener: TcpListener, close: C, processor: P, sink: MetricSink,
+    name: String,
+    config: ListenerConfiguration,
+    listener: TcpListener,
+    close: C,
+    processor: P,
+    sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
-    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
-    C: Future + Clone + Send + 'static,
+    P: Processor + Clone + Send + Sync + Unpin + 'static,
+    P::Message: Message + Clone + Send + Sync + Unpin + 'static,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Sync + Unpin,
+    <P::Transport as Sink<P::Message>>::Error: std::error::Error,
+    C: Future + Clone + Send + Sync + Unpin + 'static,
 {
     let reload_timeout_ms = config.reload_timeout_ms.unwrap_or_else(|| 5000);
 
     // Build our evacuator and wrap it as shared.  This lets us soft close everything.
-    let (warden, evacuate) = Evacuate::new(close, reload_timeout_ms);
+    let (warden, evacuate, runner) = Evacuate::new(close, reload_timeout_ms);
+    tokio::spawn(runner);
     let closer = evacuate.shared();
 
     // Get our scoped metric sink.
@@ -113,7 +118,7 @@ where
         );
 
         let pool = BackendPoolBuilder::new(pool_name.clone(), processor.clone(), pool_config, sink.clone()).build()?;
-        let buffered_pool = Facade::new(pool, &DefaultExecutor::current(), 32).map_err(|_| {
+        let buffered_pool = Facade::new(pool, DefaultExecutor::current(), 32).map_err(|_| {
             CreationError::InvalidResource(format!(
                 "error while building pool '{}': failed to spawn task",
                 pool_name
@@ -136,45 +141,55 @@ where
 }
 
 fn get_fixed_router<P, C>(
-    listener: TcpListener, pools: HashMap<String, BufferedPool<P, P::Message>>, processor: P, warden: Warden, close: C,
+    listener: TcpListener,
+    pools: HashMap<String, BufferedPool<P, P::Message>>,
+    processor: P,
+    warden: Warden,
+    close: C,
     sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
-    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
-    C: Future + Clone + Send + 'static,
+    P: Processor + Clone + Send + Sync + Unpin + 'static,
+    P::Message: Message + Clone + Send + Sync + Unpin + 'static,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Sync + Unpin,
+    <P::Transport as Sink<P::Message>>::Error: std::error::Error,
+    C: Future + Clone + Send + Sync + Unpin + 'static,
 {
     // Construct an instance of our router.
     let default_pool = pools
         .get("default")
-        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for fixed router".to_string()))?
-        .clone();
+        .cloned()
+        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for fixed router".to_string()))?;
     let router = FixedRouter::new(processor.clone(), default_pool);
 
     build_router_chain(listener, processor, router, warden, close, sink)
 }
 
 fn get_shadow_router<P, C>(
-    listener: TcpListener, pools: HashMap<String, BufferedPool<P, P::Message>>, processor: P, warden: Warden, close: C,
+    listener: TcpListener,
+    pools: HashMap<String, BufferedPool<P, P::Message>>,
+    processor: P,
+    warden: Warden,
+    close: C,
     sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
-    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
-    C: Future + Clone + Send + 'static,
+    P: Processor + Clone + Send + Sync + Unpin + 'static,
+    P::Message: Message + Clone + Send + Sync + Unpin + 'static,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Sync + Unpin,
+    <P::Transport as Sink<P::Message>>::Error: std::error::Error,
+    C: Future + Clone + Send + Sync + Unpin + 'static,
 {
     // Construct an instance of our router.
     let default_pool = pools
         .get("default")
-        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for shadow router".to_string()))?
-        .clone();
+        .cloned()
+        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for shadow router".to_string()))?;
 
     let shadow_pool = pools
         .get("shadow")
-        .ok_or_else(|| CreationError::InvalidResource("no shadow pool configured for shadow router".to_string()))?
-        .clone();
+        .cloned()
+        .ok_or_else(|| CreationError::InvalidResource("no shadow pool configured for shadow router".to_string()))?;
 
     let router = ShadowRouter::new(processor.clone(), default_pool, shadow_pool);
 
@@ -182,69 +197,88 @@ where
 }
 
 fn build_router_chain<P, R, C>(
-    listener: TcpListener, processor: P, router: R, warden: Warden, close: C, mut sink: MetricSink,
+    listener: TcpListener,
+    processor: P,
+    router: R,
+    warden: Warden,
+    mut close: C,
+    mut sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Send + 'static,
-    P::Message: Message + Clone + Send + 'static,
-    P::Transport: Sink<BytesMut, Error = std::io::Error> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
-    R: Service<AssignedRequests<P::Message>> + Clone + Send + 'static,
-    R::Error: Display + Send + Sync,
-    R::Response: IntoIterator<Item = AssignedResponse<P::Message>> + Send,
-    R::Future: Future + Send,
-    C: Future + Clone + Send + 'static,
+    P: Processor + Clone + Unpin + 'static,
+    P::Message: Message + Clone + Unpin + 'static,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Unpin,
+    <P::Transport as Sink<P::Message>>::Error: std::error::Error,
+    R: Service<Vec<P::Message>> + Clone + Send + Sync + 'static,
+    R::Error: Into<GenericError> + Send + Sync,
+    R::Response: IntoIterator<Item = Response<P::Message>> + Send,
+    R::Future: Future + Send + Unpin,
+    C: Future + Clone + Send + Sync + Unpin + 'static,
 {
-    let close2 = close.clone();
-    let task = listener
-        .incoming()
-        .for_each(move |client| {
-            warden.increment();
-            sink.record_counter("clients_connected", 1);
+    let task = async move {
+        let close2 = close.clone();
+        let mut close = close.fuse();
+        let mut incoming = listener.incoming().fuse();
 
-            let router = router.clone();
-            let processor = processor.clone();
-            let close = close.clone();
-            let warden2 = warden.clone();
-            let mut sink2 = sink.clone();
-            let client_addr = client.peer_addr().unwrap();
-            debug!("[client] {} connected", client_addr);
-
-            let transport = processor.get_transport(client);
-            let task = Pipeline::new(transport, router, processor, sink.clone())
-                .then(move |result| {
-                    match result {
-                        Ok(_) => {
-                            debug!("[client] {} disconnected", client_addr);
-                        },
+        loop {
+            // Stop ourselves if need be.
+            select! {
+                _ = close => {
+                    debug!("listener should close, breaking");
+                    break
+                },
+                r = incoming.next() => match r {
+                    // Our listener is gone, so we're done here.
+                    None => break,
+                    Some(conn) => match conn {
                         Err(e) => {
-                            match e {
-                                // If we got a protocol error from a client, that's bad.  Otherwise,
-                                // clients closing their connection is a normal thing.
-                                PipelineError::TransportReceive(ie) => {
-                                    if !ie.client_closed() {
-                                        sink2.record_counter("client_errors", 1);
-                                        error!("[client] transport error from {}: {}", client_addr, ie);
-                                    }
-                                },
-                                e => error!("[client] error from {}: {}", client_addr, e),
-                            }
+                            debug!("[client] error while accepting connection: {}", e);
+                        },
+                        Ok(client) => {
+                            warden.increment();
+                            sink.record_counter("clients_connected", 1);
+
+                            let router = router.clone();
+                            let processor = processor.clone();
+                            let close = close2.clone().fuse();
+                            let warden = warden.clone();
+                            let mut sink2 = sink.clone();
+                            let client_addr = client.peer_addr().unwrap();
+                            debug!("[client] {} connected", client_addr);
+
+                            let transport = processor.get_transport(client);
+                            let fragment = Fragment::new(router, processor);
+                            let mut pipeline = Pipeline::new(transport, fragment);
+
+                            tokio::spawn(async move {
+                                let mut pf = pipeline.boxed().fuse();
+                                select! {
+                                    r = pf => if let Err(e) = r {
+                                        match e {
+                                            PipelineError::TransportReceive(ie) => {
+                                                if !ie.client_closed() {
+                                                    sink2.record_counter("client_errors", 1);
+                                                    error!("[client] transport error from {}: {}", client_addr, ie);
+                                                }
+                                            },
+                                            e => error!("[client] error from {}: {}", client_addr, e),
+                                        }
+                                    },
+                                    _ = close.fuse() => {
+                                    },
+                                };
+
+                                debug!("[client] {} disconnected", client_addr);
+                                warden.decrement();
+                            });
                         },
                     }
+                }
+            }
+        }
+    };
 
-                    warden2.decrement();
-
-                    ok::<(), ()>(())
-                })
-                .select2(close);
-
-            tokio::spawn(task.untyped());
-
-            ok(())
-        })
-        .map_err(|e| error!("[listener] caught error while accepting connections: {:?}", e))
-        .select2(close2);
-
-    Ok(Box::new(task.untyped()))
+    Ok(Box::pin(task))
 }
 
 fn get_listener(addr_str: &str) -> io::Result<TcpListener> {
@@ -258,7 +292,7 @@ fn get_listener(addr_str: &str) -> io::Result<TcpListener> {
     builder.bind(addr)?;
     builder
         .listen(1024)
-        .and_then(|l| TcpListener::from_std(l, &reactor::Handle::default()))
+        .and_then(|l| TcpListener::from_std(l, &Handle::default()))
 }
 
 #[cfg(unix)]

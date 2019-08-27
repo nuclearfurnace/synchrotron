@@ -22,28 +22,30 @@ use super::{
     hasher::{configure_hasher, KeyHasher},
 };
 use crate::{
-    backend::{processor::Processor, Backend, PoolError},
-    common::{EnqueuedRequests, Message},
+    backend::{processor::Processor, Backend},
+    common::{EnqueuedRequests, Message, Responses, GenericError},
     conf::PoolConfiguration,
     errors::CreationError,
-    util::IntegerMappedVec,
     service::DrivenService,
+    util::IntegerMappedVec,
 };
-use futures::prelude::*;
-use std::task::Poll;
-use metrics_runtime::Sink as MetricSink;
-use std::collections::{HashMap, VecDeque};
 use async_trait::async_trait;
+use futures::prelude::*;
+use futures::stream::FuturesOrdered;
+use metrics_runtime::Sink as MetricSink;
+use std::{
+    collections::HashMap,
+    task::Poll,
+};
 
 pub struct BackendPool<P>
 where
-    P: Processor + Clone + Send,
-    P::Message: Message + Send,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Send + Sync,
 {
     distributor: Box<dyn Distributor>,
     key_hasher: Box<dyn KeyHasher>,
     backends: Vec<Backend<P>>,
-    pending_req: VecDeque<EnqueuedRequests<P::Message>>,
     noreply: bool,
     epoch: u64,
     sink: MetricSink,
@@ -51,18 +53,20 @@ where
 
 impl<P> BackendPool<P>
 where
-    P: Processor + Clone + Send,
-    P::Message: Message + Send,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Send + Sync,
 {
     pub fn new(
-        backends: Vec<Backend<P>>, distributor: Box<dyn Distributor>, key_hasher: Box<dyn KeyHasher>, noreply: bool,
+        backends: Vec<Backend<P>>,
+        distributor: Box<dyn Distributor>,
+        key_hasher: Box<dyn KeyHasher>,
+        noreply: bool,
         sink: MetricSink,
     ) -> BackendPool<P> {
         let mut pool = BackendPool {
             distributor,
             key_hasher,
             backends,
-            pending_req: VecDeque::new(),
             noreply,
             epoch: 0,
             sink,
@@ -91,12 +95,12 @@ where
 #[async_trait]
 impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendPool<P>
 where
-    P: Processor + Clone + Send,
-    P::Message: Message + Send,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Send + Sync + 'static,
 {
-    type Response = AssignedResponses<P::Message>;
-    type Error = PoolError;
-    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
+    type Error = GenericError;
+    type Future = Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync + Unpin>;
+    type Response = Responses<P::Message>;
 
     async fn ready(&mut self) -> Result<(), Self::Error> {
         let mut any_ready = false;
@@ -104,7 +108,11 @@ where
         for backend in &mut self.backends {
             match poll!(backend.ready()) {
                 Poll::Ready(Ok(())) => any_ready = true,
-                Poll::Pending => {},
+                // Catch everything else.  We don't immediately return an error because
+                // we need to be able to update the state of the pool.
+                //
+                // TODO: should we return an error if no backends are ready?
+                _ => {},
             }
 
             epoch += backend.health().epoch();
@@ -124,44 +132,59 @@ where
     }
 
     async fn drive(&mut self) -> Result<(), Self::Error> {
+        debug!("driving pool");
         // Drive each backend to actually start processing.
         for backend in &mut self.backends {
+            debug!("driving individual backend");
             backend.drive().await?;
         }
 
         Ok(())
     }
 
-    fn call(&mut self, req: EnqueuedRequests<P::Message>) -> Self::Future {
-        // Dispatch all requests to their respective backends.
-        let mut futs = FuturesUnordered::new();
-
-        for req in self.pending_req {
-            let mut batches = IntegerMappedVec::new();
-
-            for msg in req {
-                let msg_key = msg.key();
-                let msg_hashed = self.key_hasher.hash(msg_key);
-                let backend_idx = self.distributor.choose(msg_hashed);
-
-                batches.push(backend_idx, msg);
-            }
-
-            for (backend_idx, batch) in batches {
-                let fut = self.backends[backend_idx].call(batch);
-                futs.push(fut);
-            }
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        for backend in &mut self.backends {
+            backend.close().await?;
         }
 
-        futs.collect::<Vec<_>>()
-            .map(|xs| xs.flatten())
+        Ok(())
+    }
+
+    fn call(&mut self, msgs: EnqueuedRequests<P::Message>) -> Self::Future {
+        // Dispatch all requests to their respective backends.
+        let mut futs = FuturesOrdered::new();
+        let mut batches = IntegerMappedVec::new();
+
+        for msg in msgs {
+            let msg_key = msg.key();
+            let msg_hashed = self.key_hasher.hash(msg_key);
+            let backend_idx = self.distributor.choose(msg_hashed);
+
+            batches.push(backend_idx, msg);
+        }
+
+        for (backend_idx, batch) in batches {
+            let fut = self.backends[backend_idx].call(batch);
+            futs.push(fut);
+        }
+
+        Box::new(futs.collect::<Vec<_>>().map(|xs| {
+            let mut responses = Vec::new();
+            for x in xs {
+                match x {
+                    Ok(resp) => responses.extend(resp),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(responses)
+        }))
     }
 }
 
 pub struct BackendPoolBuilder<P>
 where
-    P: Processor + Clone + Send,
-    P::Message: Message + Send,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Send + Sync,
 {
     processor: P,
     config: PoolConfiguration,
@@ -171,8 +194,8 @@ where
 
 impl<P> BackendPoolBuilder<P>
 where
-    P: Processor + Clone + Send,
-    P::Message: Message + Send,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Send + Sync,
 {
     pub fn new(name: String, processor: P, config: PoolConfiguration, mut sink: MetricSink) -> BackendPoolBuilder<P> {
         sink.add_default_labels(&[("pool", name)]);
@@ -192,8 +215,8 @@ where
 
     pub fn build(self) -> Result<BackendPool<P>, CreationError>
     where
-        P: Processor + Clone + Send,
-        P::Message: Message + Send,
+        P: Processor + Clone + Send + Sync,
+        P::Message: Message + Send + Sync,
     {
         let mut options = self.config.options.unwrap_or_else(HashMap::new);
         let dist_type = options

@@ -24,13 +24,16 @@ use crate::{
 };
 use btoi::btoi;
 use bytes::{BufMut, BytesMut};
-use futures::prelude::*;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use futures::ready;
+use futures::{ready, stream::Stream, sink::Sink};
 use itoa;
+use std::{
+    io,
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Error, ErrorKind};
+use pin_project::pin_project;
 
 mod filtering;
 use self::filtering::check_command_validity;
@@ -53,21 +56,23 @@ const REDIS_CRLF: [u8; 2] = [b'\r', b'\n'];
 const REDIS_BACKEND_CLOSED: &str = "backend closed prematurely";
 
 /// A Redis-specific transport.
+#[pin_project]
 pub struct RedisTransport<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
+    #[pin]
     transport: T,
     rbuf: BytesMut,
     wbuf: BytesMut,
     closed: bool,
 }
 
-pub struct RedisMultipleMessages<T>
+pub struct RedisMultipleMessages<'a, T>
 where
-    T: AsyncRead,
+    T: AsyncRead + Unpin,
 {
-    transport: Option<T>,
+    transport: &'a mut T,
     rbuf: BytesMut,
     bytes_read: usize,
     msgs: EnqueuedRequests<RedisMessage>,
@@ -275,7 +280,7 @@ impl Message for RedisMessage {
 
 impl<T> RedisTransport<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
     pub fn new(transport: T) -> Self {
         RedisTransport {
@@ -286,13 +291,15 @@ where
         }
     }
 
-    fn fill_read_buf(&mut self, cx: &mut Context) -> Poll<()> {
+    fn fill_read_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             self.rbuf.reserve(8192);
 
-            let n = ready!(self.transport.poll_read_buf(cx, &mut self.rbuf));
-            if n == 0 {
-                return Poll::Ready(());
+            let transport = unsafe { Pin::new_unchecked(&mut self.transport) };
+            match ready!(transport.poll_read_buf(cx, &mut self.rbuf)) {
+                Ok(0) => return Poll::Ready(Ok(())),
+                Ok(_) => continue,
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
     }
@@ -300,19 +307,19 @@ where
 
 impl<T> Stream for RedisTransport<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
     type Item = Result<RedisMessage, ProtocolError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.closed {
-            return Ok(Poll::Ready(None));
+            return Poll::Ready(None);
         }
 
         let socket_closed = self.fill_read_buf(cx).is_ready();
 
         match read_message(&mut self.rbuf) {
-            Ok(Poll::Ready((bytes_read, cmd))) => {
+            Poll::Ready(Ok((bytes_read, cmd))) => {
                 trace!("[protocol] got message from client! ({} bytes)", bytes_read);
 
                 // If client has quit, mark the stream closed so that we return Ready(None) on the
@@ -337,7 +344,7 @@ where
 
                 Poll::Ready(Some(Ok(cmd)))
             },
-            Err(e) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
             _ => {
                 if socket_closed {
                     // If the socket is closed, let's also close up shop.
@@ -350,93 +357,95 @@ where
     }
 }
 
-impl<T> Sink<BytesMut> for RedisTransport<T>
+impl<T> Sink<RedisMessage> for RedisTransport<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // keep this as a no-op for now; in the future, maybe we hold the actual TCP stream halves
         // and do poll_write_ready or some shit
-        if self.wbuf.len() >= MAX_OUTSTANDING_WBUF {
-            ready!(self.poll_flush());
+        let this = self.project();
+        if this.wbuf.len() >= MAX_OUTSTANDING_WBUF {
+            ready!(this.transport.poll_flush(cx));
 
-            if self.wbuf.len() >= MAX_OUTSTANDING_WBUF {
+            if this.wbuf.len() >= MAX_OUTSTANDING_WBUF {
                 return Poll::Pending;
             }
         }
 
-        Poll::Ready(())
+        Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, item: BytesMut) -> Result<(), Self::Error> {
-        self.wbuf.unsplit(item);
+    fn start_send(mut self: Pin<&mut Self>, item: RedisMessage) -> Result<(), Self::Error> {
+        self.wbuf.unsplit(item.into_buf());
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
-        while !self.wbuf.is_empty() {
-            let n = ready!(self.transport.poll_write(cx, &self.wbuf));
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut this = self.project();
+        while !this.wbuf.is_empty() {
+            let n = ready!(this.transport.as_mut().poll_write(cx, &this.wbuf))?;
             if n == 0 {
-                return Err(ErrorKind::WriteZero.into());
+                return Poll::Ready(Err(ErrorKind::WriteZero.into()));
             }
-            let _ = self.wbuf.split_to(n);
+            let _ = this.wbuf.split_to(n);
         }
 
-        self.transport.poll_flush(cx)
+        this.transport.poll_flush(cx)
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(())
-    }
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { Poll::Ready(Ok(())) }
 }
 
-impl<T> RedisMultipleMessages<T>
+impl<'a, T> RedisMultipleMessages<'a, T>
 where
-    T: AsyncRead,
+    T: AsyncRead + Unpin,
 {
-    pub fn new(transport: T, msgs: EnqueuedRequests<RedisMessage>) -> Self {
+    pub fn new(transport: &'a mut T, msgs: EnqueuedRequests<RedisMessage>) -> Self {
         RedisMultipleMessages {
-            transport: Some(transport),
+            transport,
             rbuf: BytesMut::new(),
             bytes_read: 0,
             msgs,
         }
     }
 
-
-    fn fill_read_buf(&mut self, cx: &mut Context) -> Poll<()> {
+    fn fill_read_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             self.rbuf.reserve(16384);
 
-            let n = ready!(self.transport.as_mut().unwrap().poll_read_buf(cx, &mut self.rbuf));
-            self.bytes_read += n;
-
-            if n == 0 {
-                return Poll::Ready(());
+            let transport = unsafe { Pin::new_unchecked(&mut self.transport) };
+            match ready!(transport.poll_read_buf(cx, &mut self.rbuf)) {
+                Ok(0) => return Poll::Ready(Ok(())),
+                Ok(n) => {
+                    self.bytes_read += n;
+                    continue
+                },
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
     }
 }
 
-impl<T> Future for RedisMultipleMessages<T>
+impl<'a, T> Future for RedisMultipleMessages<'a, T>
 where
-    T: AsyncRead,
+    T: AsyncRead + Unpin,
 {
-    type Output = Result<(T, usize), ProtocolError>;
+    type Output = Result<usize, ProtocolError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let socket_closed = self.fill_read_buf(cx).is_ready();
 
         loop {
             // We've collected all the messages, time to return.
             if self.msgs.is_empty() {
-                return Poll::Ready((self.transport.take().unwrap(), self.bytes_read));
+                return Poll::Ready(Ok(self.bytes_read));
             }
 
             match read_message(&mut self.rbuf) {
-                Poll::Ready(Ok(bytes_read, msg)) => {
+                Poll::Ready(Ok((bytes_read, msg))) => {
                     trace!("[protocol] got message from server! ({} bytes)", bytes_read);
 
                     let mut qmsg = self.msgs.remove(0);
@@ -462,9 +471,9 @@ where
     }
 }
 
-pub fn read_messages<T>(rx: T, msgs: EnqueuedRequests<RedisMessage>) -> RedisMultipleMessages<T>
+pub fn read_messages<T>(rx: &mut T, msgs: EnqueuedRequests<RedisMessage>) -> RedisMultipleMessages<T>
 where
-    T: AsyncRead,
+    T: AsyncRead + Unpin,
 {
     RedisMultipleMessages::new(rx, msgs)
 }
@@ -555,8 +564,8 @@ fn read_line(rd: &BytesMut) -> Poll<usize> {
         .map(|(i, _)| i);
 
     match result {
-        Some(v) => Ok(Poll::Ready(v)),
-        None => Ok(Poll::Pending),
+        Some(v) => Poll::Ready(v),
+        None => Poll::Pending,
     }
 }
 
@@ -567,7 +576,7 @@ fn read_bulk_count(rd: &mut BytesMut) -> Poll<Result<(usize, usize), ProtocolErr
     // Try to extract the bulk count integer, leaving the rest.
     let buf = rd.split_to(pos + 2);
     match btoi::<usize>(&buf[1..pos]) {
-        Ok(count) => Poll::Ready(Ok(pos + 2, count)),
+        Ok(count) => Poll::Ready(Ok((pos + 2, count))),
         Err(_) => Poll::Ready(Err(ProtocolError::InvalidProtocol)),
     }
 }
@@ -645,7 +654,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolEr
     let mut buf = rd.clone();
 
     // Get the number of items in the command.
-    let (n, count) = ready!(read_bulk_count(&mut buf));
+    let (n, count) = ready!(read_bulk_count(&mut buf))?;
     if count < 1 {
         return Poll::Ready(Err(ProtocolError::InvalidProtocol));
     }
@@ -655,7 +664,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolEr
     // This can legitimately fail because, at this point, buf might not contain the full message.
     let mut args = Vec::new();
     for _ in 0..count {
-        let (n, msg) = ready!(read_message_internal(&mut buf));
+        let (n, msg) = ready!(read_message_internal(&mut buf))?;
         total += n;
 
         args.push(msg);
@@ -666,22 +675,23 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolEr
     Poll::Ready(Ok((total, RedisMessage::Bulk(buf, args))))
 }
 
-pub fn write_raw_message<T>(tx: T, msg: RedisMessage) -> impl Future<Output = Result<(T, usize), ProtocolError>>
+pub async fn write_raw_message<T>(tx: &mut T, msg: RedisMessage) -> Result<usize, ProtocolError>
 where
-    T: AsyncWrite,
+    T: AsyncWrite + Unpin,
 {
     let buf = msg.into_resp();
     let buf_len = buf.len();
-    tx.write_all(buf)
-        .map(move |(tx, _buf)| (tx, buf_len))
-        .map_err(|e| e.into())
+    tx.write_all(&buf).await
+        .map(move |_| buf_len)
+        .map_err(Into::into)
 }
 
-pub fn write_messages<T>(
-    transport: T, mut msgs: EnqueuedRequests<RedisMessage>,
-) -> impl Future<Output = Result<(T, EnqueuedRequests<RedisMessage>, usize), ProtocolError>>
+pub async fn write_messages<T>(
+    tx: &mut T,
+    mut msgs: EnqueuedRequests<RedisMessage>,
+) -> Result<(EnqueuedRequests<RedisMessage>, usize), ProtocolError>
 where
-    T: AsyncWrite,
+    T: AsyncWrite + Unpin,
 {
     let msgs_len = msgs.len();
     let buf = match msgs_len {
@@ -700,9 +710,9 @@ where
     };
 
     let buf_len = buf.len();
-    transport.write_all(buf)
-        .map(move |(transport, _buf)| (transport, msgs, buf_len))
-        .map_err(|e| e.into())
+    tx.write_all(&buf).await
+        .map(move |_| (msgs, buf_len))
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

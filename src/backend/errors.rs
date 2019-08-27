@@ -19,6 +19,7 @@
 // SOFTWARE.
 use crate::{backend::processor::ProcessorError, protocol::errors::ProtocolError};
 use std::{error, fmt, io};
+use std::error::Error;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]

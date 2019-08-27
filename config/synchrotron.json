@@ -1,6 +1,6 @@
 {
   "logging": {
-    "level": "info"
+    "level": "trace"
   },
   "listeners": {
     "fixed": {

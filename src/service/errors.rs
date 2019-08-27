@@ -17,93 +17,82 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use std::error::Error;
-use bytes::BytesMut;
-use crate::common::EnqueuedRequests;
-use crate::protocol::errors::ProtocolError;
-use std::fmt;
-use crate::service::DrivenService;
-use crate::backend::processor::Processor;
+use crate::{
+    protocol::errors::ProtocolError,
+    service::Service,
+};
+use std::future::Future;
 use futures::{Sink, Stream};
+use std::fmt;
+
+pub type ServiceError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Error type for `Pipeline`.
-pub enum PipelineError<T, S, P>
+pub enum PipelineError<T, S, Request>
 where
-    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
-    S: DrivenService<EnqueuedRequests<P::Message>>,
-    P: Processor,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    S: Service<Request>,
+    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
 {
     /// An error occurred while reading from the transport.
     TransportReceive(ProtocolError),
 
     /// An error occurred while writing to the transport.
-    TransportSend(<T as Sink<BytesMut>>::Error),
+    TransportSend(<T as Sink<S::Response>>::Error),
 
     /// The underlying service failed to process a request.
     Service(S::Error),
-
-    /// An internal Synchrotron error occurred while servicing a request.
-    Internal(Box<dyn Error + Send + Sync + 'static>),
 }
 
-impl<T, S, P> PipelineError<T, S, P>
+impl<T, S, Request> PipelineError<T, S, Request>
 where
-    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
-    S: DrivenService<EnqueuedRequests<P::Message>>,
-    P: Processor,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    S: Service<Request>,
+    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
 {
-    pub fn receive(e: ProtocolError) -> PipelineError<T, S, P> {
+    pub fn receive(e: ProtocolError) -> PipelineError<T, S, Request> {
         PipelineError::TransportReceive(e)
     }
 
-    pub fn send(e: <T as Sink<BytesMut>>::Error) -> PipelineError<T, S, P> {
+    pub fn send(e: <T as Sink<S::Response>>::Error) -> PipelineError<T, S, Request> {
         PipelineError::TransportSend(e)
     }
 
-    pub fn service(e: S::Error) -> PipelineError<T, S, P> {
+    pub fn service(e: S::Error) -> PipelineError<T, S, Request> {
         PipelineError::Service(e)
-    }
-
-    pub fn internal<E>(e: E) -> PipelineError<T, S, P>
-    where
-        E: Into<Box<dyn Error + Send + Sync + 'static>>,
-    {
-        PipelineError::Internal(e.into())
     }
 }
 
-impl<T, S, P> fmt::Display for PipelineError<T, S, P>
+impl<T, S, Request> fmt::Display for PipelineError<T, S, Request>
 where
-    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
-    <T as Sink<BytesMut>>::Error: fmt::Display,
-    S: DrivenService<EnqueuedRequests<P::Message>>,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    <T as Sink<S::Response>>::Error: fmt::Display,
+    S: Service<Request>,
+    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
     S::Error: fmt::Display,
-    P: Processor,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            PipelineError::TransportReceiver(ref se) => fmt::Display::fmt(se, f),
+            PipelineError::TransportReceive(ref se) => fmt::Display::fmt(se, f),
             PipelineError::TransportSend(ref se) => fmt::Display::fmt(se, f),
             PipelineError::Service(ref se) => fmt::Display::fmt(se, f),
-            PipelineError::Internal(ref se) => fmt::Display::fmt(se, f),
         }
     }
 }
 
-impl<T, S, P> fmt::Debug for PipelineError<T, S, P>
+impl<T, S, Request> fmt::Debug for PipelineError<T, S, Request>
 where
-    T: Sink<BytesMut> + Stream<Item = Result<P::Message, ProtocolError>>,
-    <T as Sink<BytesMut>>::Error: fmt::Debug,
-    S: DrivenService<EnqueuedRequests<P::Message>>,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    <T as Sink<S::Response>>::Error: fmt::Debug,
+    S: Service<Request>,
+    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
     S::Error: fmt::Debug,
-    P: Processor,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             PipelineError::TransportReceive(ref se) => write!(f, "TransportReceive({:?})", se),
             PipelineError::TransportSend(ref se) => write!(f, "TransportSend({:?})", se),
             PipelineError::Service(ref se) => write!(f, "Service({:?})", se),
-            PipelineError::Internal(ref se) => write!(f, "Internal({:?})", se),
         }
     }
 }

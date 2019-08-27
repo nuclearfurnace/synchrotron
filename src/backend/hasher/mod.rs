@@ -26,7 +26,7 @@ use crate::errors::CreationError;
 ///
 /// The hash output is a 64-bit integer so that it can be used with mapping hashed keys to specific
 /// backend servers by index.
-pub trait KeyHasher {
+pub trait KeyHasher: Send + Sync {
     fn hash(&self, buf: &[u8]) -> u64;
 }
 

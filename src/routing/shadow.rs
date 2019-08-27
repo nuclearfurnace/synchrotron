@@ -19,22 +19,26 @@
 // SOFTWARE.
 use crate::{
     backend::processor::Processor,
-    common::{AssignedRequests, EnqueuedRequest, EnqueuedRequests, Message},
+    common::{EnqueuedRequest, EnqueuedRequests, Message},
 };
-use std::future::Future;
-use std::task::{Context, Poll};
-use std::pin::Pin;
-use futures::{stream::futures_unordered::FuturesUnordered};
-use std::marker::PhantomData;
+use futures::stream::{Stream, futures_unordered::FuturesUnordered};
+use std::{
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::sync::mpsc;
-use tower_service::Service;
+use crate::service::Service;
+use async_trait::async_trait;
+use pin_project::pin_project;
 
 #[derive(Derivative)]
 #[derivative(Clone)]
 pub struct ShadowRouter<P, S>
 where
-    P: Processor + Unpin + Clone + Send,
-    P::Message: Message + Clone + Send,
+    P: Processor + Clone + Unpin,
+    P::Message: Message + Clone,
     S: Service<EnqueuedRequests<P::Message>> + Clone,
     S::Future: Future + Send,
 {
@@ -44,12 +48,15 @@ where
     noops: mpsc::UnboundedSender<S::Future>,
 }
 
+#[pin_project]
 struct ShadowWorker<S, Request>
 where
     S: Service<Request>,
 {
+    #[pin]
     rx: mpsc::UnboundedReceiver<S::Future>,
-    should_close: bool,
+    finish: bool,
+    #[pin]
     inner: FuturesUnordered<S::Future>,
     _service: PhantomData<S>,
 }
@@ -61,7 +68,7 @@ where
     pub fn new(rx: mpsc::UnboundedReceiver<S::Future>) -> ShadowWorker<S, Request> {
         ShadowWorker {
             rx,
-            should_close: false,
+            finish: false,
             inner: FuturesUnordered::new(),
             _service: PhantomData,
         }
@@ -75,34 +82,33 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.should_close {
-            loop {
-                match self.rx.poll(cx) {
-                    Poll::Ready(Some(fut)) => self.inner.push(fut),
-                    Poll::Ready(None) => {
-                        self.should_close = true;
+        let mut this = self.project();
+        if !*this.finish {
+            while let Poll::Ready(result) = this.rx.as_mut().poll_next(cx) {
+                match result {
+                    Some(fut) => this.inner.push(fut),
+                    None => {
+                        *this.finish = true;
                         break;
                     },
-                    Poll::Pending => break,
                 }
             }
         }
 
         // Just drive our inner futures; we don't care about their return value.
-        loop {
-            match self.inner.poll(cx) {
+        while let Poll::Ready(result) = this.inner.as_mut().poll_next(cx) {
+            match result {
                 // These are successful results, so we just drop the value and keep on moving on.
-                Poll::Ready(Some(_)) => {},
+                Some(_) => {},
                 // If we have no more futures to drive, and we've been instructed to close, it's
                 // time to go.
-                Poll::Ready(None) => {
-                    if self.should_close {
+                None => {
+                    if *this.finish {
                         return Poll::Ready(());
                     } else {
                         break;
                     }
                 },
-                Poll::Pending => break,
             }
         }
 
@@ -112,9 +118,9 @@ where
 
 impl<P, S> ShadowRouter<P, S>
 where
-    P: Processor + Unpin + Clone + Send,
-    P::Message: Message + Clone + Send,
-    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
+    P: Processor + Clone + Unpin,
+    P::Message: Message + Clone + Send + 'static,
+    S: Service<EnqueuedRequests<P::Message>> + Clone + Send + 'static,
     S::Future: Future + Send,
 {
     pub fn new(processor: P, default_inner: S, shadow_inner: S) -> ShadowRouter<P, S> {
@@ -133,29 +139,32 @@ where
     }
 }
 
-impl<P, S> Service<AssignedRequests<P::Message>> for ShadowRouter<P, S>
+#[async_trait]
+impl<P, S> Service<Vec<P::Message>> for ShadowRouter<P, S>
 where
-    P: Processor + Unpin + Clone + Send,
-    P::Message: Message + Clone + Send,
-    S: Service<EnqueuedRequests<P::Message>> + Clone,
+    P: Processor + Clone + Unpin,
+    P::Message: Message + Clone,
+    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
     S::Future: Future + Send,
 {
     type Error = S::Error;
     type Future = S::Future;
     type Response = S::Response;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.default_inner.poll_ready(cx)
+    async fn ready(&mut self) -> Result<(), Self::Error> {
+        self.default_inner.ready().await
     }
 
-    fn call(&mut self, req: AssignedRequests<P::Message>) -> Self::Future {
+    fn call(&mut self, req: Vec<P::Message>) -> Self::Future {
         let shadow_reqs = req
             .clone()
             .into_iter()
-            .map(|(_, msg)| EnqueuedRequest::without_response(msg))
+            .map(EnqueuedRequest::without_response)
             .collect();
 
-        let default_reqs = req.into_iter().map(|(id, msg)| EnqueuedRequest::new(id, msg)).collect();
+        let default_reqs = req.into_iter()
+            .map(EnqueuedRequest::new)
+            .collect();
 
         let noop = self.shadow_inner.call(shadow_reqs);
         let _ = self.noops.try_send(noop);

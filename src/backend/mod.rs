@@ -21,7 +21,6 @@ pub mod distributor;
 mod errors;
 pub mod hasher;
 mod health;
-pub mod message_queue;
 pub mod pool;
 pub mod processor;
 pub mod redis;
@@ -30,21 +29,21 @@ pub use self::errors::{BackendError, PoolError};
 
 use crate::{
     backend::{distributor::BackendDescriptor, health::BackendHealth, processor::Processor},
-    common::{EnqueuedRequests, Message},
+    common::{EnqueuedRequests, Message, ResponseFuture, Responses, GenericError},
     errors::CreationError,
     service::DrivenService,
 };
-use futures::prelude::*;
+use async_trait::async_trait;
+use futures::stream::FuturesOrdered;
 use metrics_runtime::{data::Counter, Sink as MetricSink};
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     str::FromStr,
+    time::Duration,
 };
-use tokio::{
-    net::tcp::TcpStream,
-};
-use async_trait::async_trait;
+use tokio::net::tcp::TcpStream;
+use tokio::future::FutureExt;
 
 // Don't talk to me about this, I don't wanna talk about it.
 const LONG_ASS_TIME: u64 = 5 * 365 * 24 * 60 * 60;
@@ -56,8 +55,8 @@ const LONG_ASS_TIME: u64 = 5 * 365 * 24 * 60 * 60;
 /// available.
 pub struct BackendConnection<P>
 where
-    P: Processor,
-    P::Message: Message + Clone,
+    P: Processor + Send + Sync,
+    P::Message: Message + Clone + Send + Sync,
 {
     processor: P,
     address: SocketAddr,
@@ -72,11 +71,15 @@ where
 
 impl<P> BackendConnection<P>
 where
-    P: Processor,
-    P::Message: Message + Clone,
+    P: Processor + Send + Sync,
+    P::Message: Message + Clone + Send + Sync,
 {
     pub fn new(
-        address: SocketAddr, processor: P, timeout_ms: u64, noreply: bool, mut sink: MetricSink,
+        address: SocketAddr,
+        processor: P,
+        timeout_ms: u64,
+        noreply: bool,
+        mut sink: MetricSink,
     ) -> BackendConnection<P> {
         BackendConnection {
             processor,
@@ -93,21 +96,23 @@ where
 #[async_trait]
 impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendConnection<P>
 where
-    P: Processor,
-    P::Message: Message + Clone,
+    P: Processor + Send + Sync,
+    P::Message: Message + Clone + Send + Sync,
 {
-    type Response = AssignedResponses<P::Message>;
-    type Error = BackendError;
-    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
+    type Error = GenericError;
+    type Future = ResponseFuture<P::Message>;
+    type Response = Responses<P::Message>;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
+    async fn ready(&mut self) -> Result<(), Self::Error> { Ok(()) }
 
     async fn drive(&mut self) -> Result<(), Self::Error> {
+        debug!("trying to drive ourself as backend conn");
+
         while !self.pending.is_empty() {
+            debug!("conn still has msgs, getting connection");
+
             // Get the underlying connection to the backend.
-            let conn = match self.conn.take() {
+            let mut conn = match self.conn.take() {
                 // We still have an existing connection, so reuse it.
                 Some(conn) => conn,
                 // We haven't connected yet, or the old connection was faulty, so reconnect.
@@ -118,42 +123,55 @@ where
                 },
             };
 
+            debug!("got backend connection");
+
             // Extract a batch.
             let batch = self.pending.pop_front().expect("self.pending should not be empty");
 
             // Actually process this batch and then give back the connection.
-            let timeout_ms = if self.timeout_ms == 0 { LONG_ASS_TIME } else { self.timeout_ms };
-            let result = self.processor.process(batch, conn)
-                .timeout(Duration::from_millis(timeout_ms)).await;
-            match result {
-                Ok(Ok(conn)) => self.conn = Some(conn),
-                Ok(Err(e)) => return Err(e.into()),
-                _ => {}
-            }
+            let timeout_ms = if self.timeout_ms == 0 {
+                LONG_ASS_TIME
+            } else {
+                self.timeout_ms
+            };
+
+            debug!("about to run request on backend connection");
+
+            // Run the actual request, and bail out if we get an error.  This ensures that
+            // we don't give back the connection (since it's likely tainted) and that it
+            // will be recreated.
+            let _ = self.processor
+                .process(batch, &mut conn)
+                .timeout(Duration::from_millis(timeout_ms))
+                .await?;
+
+            debug!("done with request; yielding connection back to loop");
+
+            self.conn = Some(conn);
         }
 
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        self.drive().await
-    }
+    async fn close(&mut self) -> Result<(), Self::Error> { self.drive().await }
 
-    fn call(&mut self, batch: EnqueuedRequests<P::Message>) -> Self::Future {
+    fn call(&mut self, mut batch: EnqueuedRequests<P::Message>) -> Self::Future {
         let fut = batch
             .as_mut_slice()
             .iter_mut()
             .map(|x| x.get_response_rx())
             .filter(|x| x.is_some())
             .map(|x| x.unwrap())
-            .fold(FuturesUnordered::new(), |xs, x| {
+            .fold(FuturesOrdered::new(), |mut xs, x| {
                 xs.push(x);
                 xs
             });
 
+
+        debug!("backend call'd -> took in {} msgs", batch.len());
         self.pending.push_back(batch);
 
-        fut
+        ResponseFuture::new(fut)
     }
 }
 
@@ -170,8 +188,8 @@ where
 /// states, recycling connections and pausing work when required.
 pub struct Backend<P>
 where
-    P: Processor + Clone,
-    P::Message: Message + Clone,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Clone + Send + Sync,
 {
     identifier: String,
     health: BackendHealth,
@@ -182,16 +200,20 @@ where
 
 impl<P> Backend<P>
 where
-    P: Processor + Clone + Send,
-    P::Message: Message + Clone + Send,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Clone + Send + Sync,
 {
     pub fn new(
-        address: SocketAddr, identifier: String, processor: P, mut options: HashMap<String, String>, noreply: bool,
+        address: SocketAddr,
+        identifier: String,
+        processor: P,
+        mut options: HashMap<String, String>,
+        noreply: bool,
         sink: MetricSink,
     ) -> Result<Backend<P>, CreationError>
     where
-        P: Processor + Clone + Send,
-        P::Message: Message + Send,
+        P: Processor + Clone + Send + Sync,
+        P::Message: Message + Clone + Send + Sync,
     {
         let sink = sink.scoped("backend");
 
@@ -248,15 +270,16 @@ where
 #[async_trait]
 impl<P> DrivenService<EnqueuedRequests<P::Message>> for Backend<P>
 where
-    P: Processor + Clone + Send,
-    P::Message: Message + Clone + Send,
+    P: Processor + Clone + Send + Sync,
+    P::Message: Message + Clone + Send + Sync,
 {
-    type Response = AssignedResponses<P::Message>;
-    type Error = BackendError;
-    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
+    type Error = GenericError;
+    type Future = ResponseFuture<P::Message>;
+    type Response = Responses<P::Message>;
 
     async fn ready(&mut self) -> Result<(), Self::Error> {
-        self.health.healthy()
+        self.health.healthy().await;
+        Ok(())
     }
 
     async fn drive(&mut self) -> Result<(), Self::Error> {
@@ -269,7 +292,8 @@ where
         // futuresunoredered, and then await on that to try and drive them all pseudo simultaenously
         // that way hopefully we can avoid a slow connection blocking other i/o and keep latency
         // down
-        for conn in self.conns {
+        for conn in &mut self.conns {
+            debug!("driving individual backend connection");
             if let Err(_) = conn.drive().await {
                 self.health.increment_error();
             }
@@ -279,7 +303,7 @@ where
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        for conn in self.conns {
+        for conn in &mut self.conns {
             conn.drive().await?;
         }
 

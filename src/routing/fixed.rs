@@ -19,17 +19,17 @@
 // SOFTWARE.
 use crate::{
     backend::processor::Processor,
-    common::{AssignedRequests, EnqueuedRequest, EnqueuedRequests, Message},
+    common::{EnqueuedRequest, EnqueuedRequests, Message},
 };
-use tower_service::Service;
-use std::task::{Context, Poll};
+use crate::service::Service;
+use async_trait::async_trait;
 
 #[derive(Clone)]
 pub struct FixedRouter<P, S>
 where
-    P: Processor + Unpin + Clone + Send,
-    P::Message: Message + Send,
-    S: Service<EnqueuedRequests<P::Message>> + Clone,
+    P: Processor + Clone + Send + Sync + Unpin,
+    P::Message: Message + Send + Sync,
+    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
 {
     processor: P,
     inner: S,
@@ -37,29 +37,32 @@ where
 
 impl<P, S> FixedRouter<P, S>
 where
-    P: Processor + Unpin + Clone + Send,
-    P::Message: Message + Send,
-    S: Service<EnqueuedRequests<P::Message>> + Clone,
+    P: Processor + Clone + Send + Sync + Unpin,
+    P::Message: Message + Send + Sync,
+    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
 {
     pub fn new(processor: P, inner: S) -> FixedRouter<P, S> { FixedRouter { processor, inner } }
 }
 
-impl<P, S> Service<AssignedRequests<P::Message>> for FixedRouter<P, S>
+#[async_trait]
+impl<P, S> Service<Vec<P::Message>> for FixedRouter<P, S>
 where
-    P: Processor + Unpin + Clone + Send,
-    P::Message: Message + Send,
-    S: Service<EnqueuedRequests<P::Message>> + Clone,
+    P: Processor + Clone +  Send + Sync + Unpin,
+    P::Message: Message + Send + Sync,
+    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
 {
     type Error = S::Error;
     type Future = S::Future;
     type Response = S::Response;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+    async fn ready(&mut self) -> Result<(), Self::Error> {
+        self.inner.ready().await
     }
 
-    fn call(&mut self, req: AssignedRequests<P::Message>) -> Self::Future {
-        let transformed = req.into_iter().map(|(id, msg)| EnqueuedRequest::new(id, msg)).collect();
+    fn call(&mut self, req: Vec<P::Message>) -> Self::Future {
+        let transformed = req.into_iter()
+            .map(EnqueuedRequest::new)
+            .collect();
         self.inner.call(transformed)
     }
 }

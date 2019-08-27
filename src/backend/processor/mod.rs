@@ -21,21 +21,17 @@ mod errors;
 pub use self::errors::ProcessorError;
 
 use crate::{
-    backend::message_queue::MessageState,
-    common::{EnqueuedRequests, Message},
+    common::{EnqueuedRequests, Message, MessageState},
     protocol::errors::ProtocolError,
 };
+use async_trait::async_trait;
 use std::{error::Error, net::SocketAddr};
 use tokio::net::tcp::TcpStream;
-use async_trait::async_trait;
 
 /// Cache-specific logic for processing requests and interacting with backends.
 #[async_trait]
-pub trait Processor
-where
-    Self::Message: Message + Clone,
-{
-    type Message;
+pub trait Processor: Send + Sync {
+    type Message: Message + Clone + Send + Sync;
     type Transport;
 
     /// Fragments a client's request into, potentially, multiple subrequests.
@@ -67,5 +63,5 @@ where
 
     /// Processes a batch of requests, running the necessary operations against the given TCP
     /// stream.
-    async fn process(&self, _: EnqueuedRequests<Self::Message>, _: TcpStream) -> Result<TcpStream, ProtocolError>;
+    async fn process(&self, _: EnqueuedRequests<Self::Message>, _: &mut TcpStream) -> Result<(), ProtocolError>;
 }
