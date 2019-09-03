@@ -21,9 +21,8 @@ use crate::{
     backend::{
         processor::{Processor, ProcessorError},
     },
-    common::{EnqueuedRequests, Message, MessageState},
+    common::{EnqueuedRequests, Message, MessageState, ConnectionFuture},
     protocol::{
-        errors::ProtocolError,
         redis::{self, RedisMessage, RedisTransport},
     },
 };
@@ -62,23 +61,31 @@ impl Processor for RedisProcessor {
 
     fn get_transport(&self, client: TcpStream) -> Self::Transport { RedisTransport::new(client) }
 
-    async fn preconnect(&self, addr: &SocketAddr, noreply: bool) -> Result<TcpStream, ProtocolError> {
-        debug!("trying to establish redis connection");
-        let mut conn = TcpStream::connect(addr).await?;
-        debug!("got redis connection");
-        if noreply {
-            let noreply_req = RedisMessage::from_inline("CLIENT REPLY OFF");
-            debug!("about to configure redis noreply on new connection");
-            redis::write_raw_message(&mut conn, noreply_req).await?;
-        }
+    fn preconnect(&self, addr: SocketAddr, noreply: bool) -> ConnectionFuture {
+        let inner = async move {
+            tracing::debug!("trying to establish redis connection");
+            let mut conn = TcpStream::connect(&addr).await?;
+            tracing::debug!("got redis connection");
+            if noreply {
+                let noreply_req = RedisMessage::from_inline("CLIENT REPLY OFF");
+                tracing::debug!("about to configure redis noreply on new connection");
+                redis::write_raw_message(&mut conn, noreply_req).await?;
+            }
 
-        Ok(conn)
+            Ok(conn)
+        };
+
+        ConnectionFuture::new(inner)
     }
 
-    async fn process(&self, req: EnqueuedRequests<Self::Message>, conn: &mut TcpStream) -> Result<(), ProtocolError> {
-        let (msgs, _n) = redis::write_messages(conn, req).await?;
-        let _n = redis::read_messages(conn, msgs).await?;
-        Ok(())
+    fn process(&self, req: EnqueuedRequests<Self::Message>, mut conn: TcpStream) -> ConnectionFuture {
+        let inner = async move {
+            let (msgs, _n) = redis::write_messages(&mut conn, req).await?;
+            let _n = redis::read_messages(&mut conn, msgs).await?;
+            Ok(conn)
+        };
+
+        ConnectionFuture::new(inner)
     }
 }
 
@@ -186,10 +193,19 @@ fn redis_fragment_message(msg: RedisMessage) -> Result<Vec<(MessageState, RedisM
     Ok(fragments)
 }
 
-fn redis_defragment_message(fragments: Vec<(MessageState, RedisMessage)>) -> Result<RedisMessage, ProcessorError> {
+fn redis_defragment_message(mut fragments: Vec<(MessageState, RedisMessage)>) -> Result<RedisMessage, ProcessorError> {
     // This shouldn't happen but it's a simple invariant that lets me write slightly cleaner code.
     if fragments.is_empty() {
         return Ok(RedisMessage::Null);
+    }
+
+    // This handles inline and standalone messages.
+    //
+    // Invariant: if there's only a single response, then even though it may have been a message
+    // that is _capable_ of being fragmented, we know it wasn't _actually_ fragmented.
+    if fragments.len() == 1 {
+        let (_state, msg) = fragments.remove(0);
+        return Ok(msg);
     }
 
     // Peek at the metadata buffer on the first message.  If it's not a fragmented message, then

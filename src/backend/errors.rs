@@ -27,6 +27,7 @@ pub enum BackendError {
     Internal(String),
     Protocol(ProtocolError),
     Io(io::Error),
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -60,6 +61,7 @@ impl Into<io::Error> for BackendError {
                 }
             },
             BackendError::Io(e) => e,
+            BackendError::TimedOut => io::Error::from(io::ErrorKind::TimedOut),
         }
     }
 }
@@ -78,6 +80,7 @@ impl error::Error for BackendError {
             BackendError::Internal(s) => s.as_str(),
             BackendError::Protocol(e) => e.description(),
             BackendError::Io(e) => e.description(),
+            BackendError::TimedOut => "timed out",
         }
     }
 
@@ -90,6 +93,7 @@ impl fmt::Display for BackendError {
             BackendError::Internal(s) => write!(f, "internal error: {}", s.as_str()),
             BackendError::Protocol(pe) => write!(f, "protocol: {}", pe),
             BackendError::Io(e) => write!(f, "internal error: {}", e.description()),
+            BackendError::TimedOut => write!(f, "timed out"),
         }
     }
 }

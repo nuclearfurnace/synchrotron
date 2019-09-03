@@ -21,6 +21,7 @@ mod errors;
 mod facade;
 mod fragment;
 mod pipeline;
+mod timing;
 mod svc;
 
 pub use self::{
@@ -28,5 +29,6 @@ pub use self::{
     facade::Facade,
     pipeline::Pipeline,
     fragment::{Fragment, FragmentResponse},
+    timing::{Timing, TimingResponse},
     svc::{DrivenService, Service},
 };

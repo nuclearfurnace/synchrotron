@@ -27,33 +27,12 @@
 
 #[macro_use]
 extern crate derivative;
-
 #[macro_use]
 extern crate serde_derive;
-
 #[macro_use]
-extern crate futures;
-
-use futures_turnstyle::{Turnstyle, Waiter};
-use libc::{SIGINT, SIGUSR1};
-use signal_hook::iterator::Signals;
-use std::thread;
-
-extern crate tokio;
-use tokio::{
-    prelude::*,
-    sync::{mpsc, oneshot},
-    runtime::Builder,
-};
-
-#[macro_use]
-extern crate log;
-#[macro_use(slog_o)]
-extern crate slog;
+extern crate tracing;
 #[macro_use]
 extern crate metrics;
-
-use slog::Drain;
 
 #[cfg(test)]
 extern crate test;
@@ -68,10 +47,22 @@ mod routing;
 mod service;
 mod util;
 
+use futures_turnstyle::{Turnstyle, Waiter};
+use libc::{SIGINT, SIGUSR1};
+use signal_hook::iterator::Signals;
+use std::thread;
+
+use tokio::{
+    prelude::*,
+    sync::{mpsc, oneshot},
+    runtime::Builder,
+};
+
 use crate::{
-    conf::{Configuration, LevelExt},
+    conf::Configuration,
     errors::CreationError,
 };
+use futures::select;
 use metrics_runtime::{
     exporters::HttpExporter, observers::PrometheusBuilder, Controller, Receiver, Sink as MetricSink,
 };
@@ -111,28 +102,13 @@ fn main() {
         }
     });
 
+    let configuration = Configuration::new().expect("failed to parse configuration");
+
+    // Configure tracing and the default stdout subscriber.
     let fmt = FmtSubscriber::new();
     let dispatch = Dispatch::new(fmt);
     let _ = tracing::dispatcher::set_global_default(dispatch).expect("failed to set tracing subscriber");
-
-    let configuration = Configuration::new().expect("failed to parse configuration");
-
-    // Configure our logging.  This gives us fully asynchronous logging to the terminal
-    // which is also level filtered.  As well, we've replaced the global std logger
-    // and pulled in helper macros that correspond to the various logging levels.
-    let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain)
-        .chan_size(4096)
-        .build().fuse();
-    let logger = slog::Logger::root(
-        slog::LevelFilter::new(drain, slog::Level::from_str(&configuration.logging.level)).fuse(),
-        slog_o!("version" => env!("GIT_HASH")),
-    );
-
-    let _scope_guard = slog_scope::set_global_logger(logger);
-    slog_stdlog::init().unwrap();
-    info!("[core] logging configured");
+    info!("logging configured");
 
     // Configure our metrics.  We want to do this pretty early on before anything actually tries to
     // record any metrics.
@@ -141,19 +117,21 @@ fn main() {
     let sink = receiver.get_sink();
     receiver.install();
 
-    let runtime = Builder::new()
-        .name_prefix("synchrotron-thread-pool-")
-        .build()
-        .unwrap();
+    // Build our runtime, and spawn our metrics and our supervisor on to it.  The supervisor will
+    // actually spawn the configured listeners when it runs.
+    //let runtime = Builder::new()
+    //    .name_prefix("synchrotron-thread-pool-")
+    //    .build()
+    //    .unwrap();
 
+    let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
     runtime.spawn(async move {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         launch_metrics(configuration.stats_addr, controller, shutdown_rx);
         launch_supervisor(supervisor_rx, shutdown_tx, sink);
-
-        info!("[core] synchrotron running");
     });
-    runtime.shutdown_on_idle();
+    //runtime.shutdown_on_idle();
+    runtime.run().unwrap();
 }
 
 fn launch_supervisor(
@@ -163,13 +141,13 @@ fn launch_supervisor(
 ) {
     let turnstyle = Turnstyle::new();
     tokio::spawn(async move {
+        info!("supervisor running");
         while let Some(command) = supervisor_rx.next().await {
-            debug!("got supervisor cmd: {:?}", command);
             match command {
                 SupervisorCommand::Launch => {
                     let (version, waiter) = turnstyle.join();
                     if let Err(e) = launch_listeners(version, waiter, sink.clone()) {
-                        error!("[core supervisor] caught an error during launch/reload: {}", e);
+                        error!("caught an error during launch/reload: {}", e);
                         break
                     }
                     counter!("supervisor.configuration_loads", 1);
@@ -177,7 +155,7 @@ fn launch_supervisor(
                 SupervisorCommand::Reload => {
                     let (version, waiter) = turnstyle.join();
                     if let Err(e) = launch_listeners(version, waiter, sink.clone()) {
-                        error!("[core supervisor] caught an error during launch/reload: {}", e);
+                        error!("caught an error during launch/reload: {}", e);
                         break
                     }
                     turnstyle.turn();
@@ -216,9 +194,8 @@ fn launch_listeners(version: usize, close: Waiter, sink: MetricSink) -> Result<(
     }
 
     if !errors.is_empty() {
-        error!("[core] encountered errors while spawning listeners:");
-        for error in errors {
-            error!("[core] - {}", error);
+        for err in errors {
+            error!(message = "failed to spawn listener", error = ?err);
         }
 
         return Err(CreationError::ListenerSpawnFailed);
@@ -233,7 +210,7 @@ fn launch_listeners(version: usize, close: Waiter, sink: MetricSink) -> Result<(
 }
 
 fn launch_metrics(stats_addr: String, controller: Controller, shutdown_rx: impl Future + Send + Unpin + 'static) {
-    /*let addr = stats_addr.parse().expect("failed to parse metrics listen address");
+    let addr = stats_addr.parse().expect("failed to parse metrics listen address");
     let exporter = HttpExporter::new(controller, PrometheusBuilder::new(), addr);
 
     tokio::spawn(async move {
@@ -244,5 +221,5 @@ fn launch_metrics(stats_addr: String, controller: Controller, shutdown_rx: impl 
             _ = server => {},
             _ = shutdown => {},
         }
-    });*/
+    });
 }

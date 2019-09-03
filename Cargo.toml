@@ -19,21 +19,16 @@ phf = { version = "^0.7", features = ["macros"] }
 nom = "^5.0"
 derivative = "^1.0"
 log = { version = "^0.4", features = ["max_level_trace", "release_max_level_info"] }
-slog = "^2.4"
-slog-async = "^2.3"
-slog-scope = "^4.0"
-slog-stdlog = "^3.0"
-slog-term = "^2.4"
 serde = "^1.0"
 serde_derive = "^1.0"
 #tokio = { git = "https://github.com/tokio-rs/tokio", features = ["rt-full"] }
 #tokio-sync = { git = "https://github.com/tokio-rs/tokio", features = ["async-traits"] }
 #tokio-executor = { git = "https://github.com/tokio-rs/tokio" }
 #tokio-net = { git = "https://github.com/tokio-rs/tokio" }
-tokio = { version = "0.2.0-alpha.2", features = ["rt-full"] }
-tokio-sync = { version = "0.2.0-alpha.2", features = ["async-traits"] }
-tokio-executor = { version = "0.2.0-alpha.2" }
-tokio-net = { version = "0.2.0-alpha.2" }
+tokio = { version = "0.2.0-alpha.4", features = ["rt-full"] }
+tokio-sync = { version = "0.2.0-alpha.4", features = ["async-traits"] }
+tokio-executor = { version = "0.2.0-alpha.4" }
+tokio-net = { version = "0.2.0-alpha.4" }
 futures-preview = { version = "0.3.0-alpha.17", features = ["nightly", "async-await"] }
 async-trait = "^0.1"
 net2 = "^0.2"
@@ -49,13 +44,15 @@ pruefung = "^0.2"
 fnv = "^1.0"
 slab = "^0.4"
 tokio-evacuate = { path = "../tokio-evacuate" }
-warp = "^0.1"
 metrics = { path = "../metrics/metrics" }
 metrics-runtime = { path = "../metrics/metrics-runtime" }
 lazycell = "1.2"
-pin-project = { git = "https://github.com/taiki-e/pin-project", branch = "project-impl", features = ["project_attr"] }
+pin-project = { version = "0.4.0-alpha.5", features = ["project_attr"] }
 tracing = "0.1.6"
 tracing-fmt = "0.0.1-alpha.3"
+tracing-log = "0.0.1-alpha.1"
+tracing-futures = { path = "../tracing/tracing-futures", default-features = false, features = ["tokio-alpha"] }
+quanta = "^0.3"
 
 [dependencies.config]
 version = "^0.9"

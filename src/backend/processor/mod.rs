@@ -21,15 +21,12 @@ mod errors;
 pub use self::errors::ProcessorError;
 
 use crate::{
-    common::{EnqueuedRequests, Message, MessageState},
-    protocol::errors::ProtocolError,
+    common::{EnqueuedRequests, Message, MessageState, ConnectionFuture},
 };
-use async_trait::async_trait;
 use std::{error::Error, net::SocketAddr};
 use tokio::net::tcp::TcpStream;
 
 /// Cache-specific logic for processing requests and interacting with backends.
-#[async_trait]
 pub trait Processor: Send + Sync {
     type Message: Message + Clone + Send + Sync;
     type Transport;
@@ -59,9 +56,9 @@ pub trait Processor: Send + Sync {
 
     /// Connects to the given address via TCP and performs any necessary processor-specific
     /// initialization.
-    async fn preconnect(&self, _: &SocketAddr, _: bool) -> Result<TcpStream, ProtocolError>;
+    fn preconnect(&self, _: SocketAddr, _: bool) -> ConnectionFuture;
 
     /// Processes a batch of requests, running the necessary operations against the given TCP
     /// stream.
-    async fn process(&self, _: EnqueuedRequests<Self::Message>, _: &mut TcpStream) -> Result<(), ProtocolError>;
+    fn process(&self, _: EnqueuedRequests<Self::Message>, _: TcpStream) -> ConnectionFuture;
 }

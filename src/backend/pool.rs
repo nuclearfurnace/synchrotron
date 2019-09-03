@@ -29,13 +29,12 @@ use crate::{
     service::DrivenService,
     util::IntegerMappedVec,
 };
-use async_trait::async_trait;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use metrics_runtime::Sink as MetricSink;
 use std::{
     collections::HashMap,
-    task::Poll,
+    task::{Context, Poll},
 };
 
 pub struct BackendPool<P>
@@ -92,7 +91,6 @@ where
     }
 }
 
-#[async_trait]
 impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendPool<P>
 where
     P: Processor + Clone + Send + Sync,
@@ -102,11 +100,11 @@ where
     type Future = Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync + Unpin>;
     type Response = Responses<P::Message>;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut any_ready = false;
         let mut epoch = 0;
         for backend in &mut self.backends {
-            match poll!(backend.ready()) {
+            match backend.poll_ready(cx) {
                 Poll::Ready(Ok(())) => any_ready = true,
                 // Catch everything else.  We don't immediately return an error because
                 // we need to be able to update the state of the pool.
@@ -119,7 +117,7 @@ where
         }
 
         if !any_ready {
-            pending!();
+            return Poll::Pending
         }
 
         if self.epoch != epoch {
@@ -128,26 +126,41 @@ where
             self.epoch = epoch;
         }
 
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 
-    async fn drive(&mut self) -> Result<(), Self::Error> {
-        debug!("driving pool");
-        // Drive each backend to actually start processing.
+    fn poll_service(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut any_pending = false;
         for backend in &mut self.backends {
-            debug!("driving individual backend");
-            backend.drive().await?;
+            match backend.poll_service(cx) {
+                Poll::Pending => any_pending = true,
+                Poll::Ready(Ok(())) => {},
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            }
         }
 
-        Ok(())
+        if any_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut any_pending = false;
         for backend in &mut self.backends {
-            backend.close().await?;
+            match backend.poll_close(cx) {
+                Poll::Pending => any_pending = true,
+                Poll::Ready(Ok(())) => {},
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            }
         }
 
-        Ok(())
+        if any_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
     fn call(&mut self, msgs: EnqueuedRequests<P::Message>) -> Self::Future {

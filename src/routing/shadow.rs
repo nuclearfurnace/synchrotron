@@ -30,7 +30,6 @@ use std::{
 };
 use tokio::sync::mpsc;
 use crate::service::Service;
-use async_trait::async_trait;
 use pin_project::pin_project;
 
 #[derive(Derivative)]
@@ -81,7 +80,7 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         if !*this.finish {
             while let Poll::Ready(result) = this.rx.as_mut().poll_next(cx) {
@@ -139,7 +138,6 @@ where
     }
 }
 
-#[async_trait]
 impl<P, S> Service<Vec<P::Message>> for ShadowRouter<P, S>
 where
     P: Processor + Clone + Unpin,
@@ -151,8 +149,8 @@ where
     type Future = S::Future;
     type Response = S::Response;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> {
-        self.default_inner.ready().await
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.default_inner.poll_ready(cx)
     }
 
     fn call(&mut self, req: Vec<P::Message>) -> Self::Future {

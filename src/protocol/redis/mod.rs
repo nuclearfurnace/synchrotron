@@ -363,7 +363,7 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // keep this as a no-op for now; in the future, maybe we hold the actual TCP stream halves
         // and do poll_write_ready or some shit
         let this = self.project();
@@ -383,7 +383,7 @@ where
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut this = self.project();
         while !this.wbuf.is_empty() {
             let n = ready!(this.transport.as_mut().poll_write(cx, &this.wbuf))?;

@@ -19,9 +19,7 @@
 // SOFTWARE.
 use crate::common::GenericError;
 use crate::service::{DrivenService, Service};
-use async_trait::async_trait;
-use futures::future::poll_fn;
-use futures::stream::Stream;
+use futures::{ready, stream::Stream};
 use std::{
     fmt,
     future::Future,
@@ -149,7 +147,6 @@ where
     }
 }
 
-#[async_trait]
 impl<S, Request> Service<Request> for Facade<S, Request>
 where
     S: DrivenService<Request>,
@@ -161,11 +158,11 @@ where
     type Future = ResponseFuture<S::Future>;
     type Response = S::Response;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Readiness is based on the underlying worker: either it has room for a request (or not),
         // or the worker has failed permanently and all requests from this point on will fail.
-        let result = poll_fn(|cx| self.tx.poll_ready(cx)).await;
-        result.map_err(|_| self.get_worker_error())
+        self.tx.poll_ready(cx)
+            .map(|r| r.map_err(|_| self.get_worker_error()))
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
@@ -297,8 +294,9 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut any_outstanding = false;
+        tracing::debug!("starting facade worker poll");
 
         let mut this = self.project();
         loop {
@@ -317,7 +315,7 @@ where
                     tracing::debug!(
                         message = "worker received request; waiting for service readiness"
                     );
-                    let ready = this.service.ready().as_mut().poll(cx);
+                    let ready = this.service.poll_ready(cx);
                     match ready {
                         Poll::Ready(Ok(())) => {
                             tracing::debug!(service.ready = true, message = "processing request");
@@ -339,7 +337,7 @@ where
                         Poll::Ready(Err(e)) => {
                             this.mark_failed(e.into());
                             let err = this.last_error.as_ref().map(|a| a.clone()).unwrap();
-                            tracing::debug!({ %err }, "service ready failed");
+                            tracing::debug!(message = "service ready failed", error = ?err);
                             let _ = msg.tx.send(Err(err));
                         },
                         Poll::Pending => {
@@ -351,24 +349,22 @@ where
                     }
                 },
                 Poll::Ready(None) => {
+                    tracing::debug!("message source empty, marking as finished");
                     // No more more requests _ever_.
                     *this.finish = true;
                 },
-                Poll::Pending if !any_outstanding => {
-                    // If we have no pending requests, and no new requests, then put ourselves to
-                    // sleep.
-                    return Poll::Pending;
-                },
                 Poll::Pending => {
-                    // We have pending requests that require the service to be driven to process.
+                    // We may not have any more requests to send to the underlying service, but
+                    // there could be in-flight requests that require the underlying service to
+                    // be driven, so fallthrough and do that.
                 },
             }
 
-            let mut span = tracing::span!(tracing::Level::DEBUG, "worker svc");
+            let span = tracing::debug_span!("facade worker");
             let _guard = span.enter();
 
             if *this.finish {
-                let result = this.service.close().as_mut().poll(cx);
+                let result = this.service.poll_close(cx);
                 match result {
                     Poll::Pending => {
                         tracing::debug!(status = "pending", message = "close svc");
@@ -391,7 +387,7 @@ where
                 // more progress, or, we'll have freed up space and be able to queue more requests
                 // on the next iteration, continuing until we run out of the service can't accept.
                 any_outstanding = false;
-                let result = this.service.drive().as_mut().poll(cx);
+                let result = this.service.poll_service(cx);
                 match result {
                     Poll::Pending => {
                         tracing::debug!(status = "pending", message = "drive svc");
@@ -409,6 +405,8 @@ where
                 }
             }
         }
+
+        tracing::debug!("facade worker all done");
 
         // All senders are dropped... the task is no longer needed
         Poll::Ready(())

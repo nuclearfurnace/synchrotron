@@ -17,29 +17,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use slog::Level;
-
 mod config;
 pub use self::config::{Configuration, ListenerConfiguration, LoggingConfiguration, PoolConfiguration};
 
 mod backend_addr;
 pub use self::backend_addr::BackendAddress;
-
-pub trait LevelExt {
-    fn from_str(_: &str) -> Level;
-}
-
-impl LevelExt for Level {
-    fn from_str(raw: &str) -> Level {
-        match raw.to_string().to_lowercase().as_str() {
-            "trace" => Level::Trace,
-            "debug" => Level::Debug,
-            "info" => Level::Info,
-            "warn" => Level::Warning,
-            "error" => Level::Error,
-            "crit" => Level::Critical,
-            "critical" => Level::Critical,
-            _ => Level::Debug,
-        }
-    }
-}

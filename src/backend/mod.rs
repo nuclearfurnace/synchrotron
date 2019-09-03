@@ -29,12 +29,15 @@ pub use self::errors::{BackendError, PoolError};
 
 use crate::{
     backend::{distributor::BackendDescriptor, health::BackendHealth, processor::Processor},
-    common::{EnqueuedRequests, Message, ResponseFuture, Responses, GenericError},
+    common::{EnqueuedRequests, Message, ResponseFuture, Responses, GenericError, ConnectionFuture},
     errors::CreationError,
+    protocol::errors::ProtocolError,
     service::DrivenService,
 };
-use async_trait::async_trait;
-use futures::stream::FuturesOrdered;
+use std::future::Future;
+use std::task::{Context, Poll};
+use std::pin::Pin;
+use futures::{ready, stream::FuturesOrdered, future::FutureExt};
 use metrics_runtime::{data::Counter, Sink as MetricSink};
 use std::{
     collections::{HashMap, VecDeque},
@@ -43,10 +46,17 @@ use std::{
     time::Duration,
 };
 use tokio::net::tcp::TcpStream;
-use tokio::future::FutureExt;
+use tokio::future::FutureExt as TokioFutureExt;
 
 // Don't talk to me about this, I don't wanna talk about it.
 const LONG_ASS_TIME: u64 = 5 * 365 * 24 * 60 * 60;
+
+enum ConnectionState {
+    Disconnected,
+    Connecting(ConnectionFuture),
+    Connected(Option<TcpStream>),
+    Processing(Pin<Box<dyn Future<Output = Result<TcpStream, BackendError>> + Send>>),
+}
 
 /// A backend connection.
 ///
@@ -63,7 +73,7 @@ where
     timeout_ms: u64,
     noreply: bool,
 
-    conn: Option<TcpStream>,
+    state: ConnectionState,
     pending: VecDeque<EnqueuedRequests<P::Message>>,
 
     connects: Counter,
@@ -86,14 +96,13 @@ where
             address,
             timeout_ms,
             noreply,
-            conn: None,
+            state: ConnectionState::Disconnected,
             pending: VecDeque::new(),
             connects: sink.counter("connects"),
         }
     }
 }
 
-#[async_trait]
 impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendConnection<P>
 where
     P: Processor + Send + Sync,
@@ -103,57 +112,102 @@ where
     type Future = ResponseFuture<P::Message>;
     type Response = Responses<P::Message>;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> { Ok(()) }
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
 
-    async fn drive(&mut self) -> Result<(), Self::Error> {
-        debug!("trying to drive ourself as backend conn");
+    fn poll_service(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let span = tracing::trace_span!("poll service", backend.addr = ?self.address);
+        let _guard = span.enter();
 
-        while !self.pending.is_empty() {
-            debug!("conn still has msgs, getting connection");
+        loop {
+            let (state, err) = match &mut self.state {
+                ConnectionState::Disconnected => {
+                    // If we're disconnected, we only need to both connecting if we have requests.
+                    if self.pending.is_empty() {
+                        tracing::trace!("no requests to process; sleeping");
+                        return Poll::Ready(Ok(()));
+                    }
 
-            // Get the underlying connection to the backend.
-            let mut conn = match self.conn.take() {
-                // We still have an existing connection, so reuse it.
-                Some(conn) => conn,
-                // We haven't connected yet, or the old connection was faulty, so reconnect.
-                None => {
-                    let conn = self.processor.preconnect(&self.address, self.noreply).await?;
-                    self.connects.increment();
-                    conn
+                    tracing::trace!("pending requests, trying to connect to backend");
+                    // We have items to process, so we need to start by actually connecting.
+                    (ConnectionState::Connecting(self.processor.preconnect(self.address, self.noreply)), None)
+                },
+                ConnectionState::Connecting(ref mut f) => match Pin::new(f).poll(cx) {
+                    Poll::Pending => {
+                        debug!("connection to backend pending");
+                        return Poll::Pending
+                    },
+                    Poll::Ready(Ok(conn)) => {
+                        tracing::trace!("successfully connected");
+                        self.connects.increment();
+                        (ConnectionState::Connected(Some(conn)), None)
+                    },
+                    Poll::Ready(Err(e)) => {
+                        tracing::error!("error while connecting to backend; resetting state");
+                        (ConnectionState::Disconnected, Some(BackendError::Protocol(e)))
+                    },
+                },
+                ConnectionState::Connected(ref mut conn) => {
+                    if !self.pending.is_empty() {
+                        let next = self.pending.pop_front().expect("self.pending should not be empty");
+                        let timeout_ms = if self.timeout_ms == 0 {
+                            LONG_ASS_TIME
+                        } else {
+                            self.timeout_ms
+                        };
+
+                        let conn = conn.take().expect("conn should have been existing connection");
+                        let process = self.processor
+                            .process(next, conn)
+                            .timeout(Duration::from_millis(timeout_ms))
+                            .map(|r| {
+                                match r {
+                                    Ok(v) => match v {
+                                        Ok(conn) => Ok(conn),
+                                        Err(e) => Err(BackendError::Protocol(e)),
+                                    },
+                                    Err(_) => Err(BackendError::TimedOut),
+                                }
+                            })
+                            .boxed();
+
+                        tracing::trace!("took pending request, trying to process");
+
+                        (ConnectionState::Processing(process), None)
+                    } else {
+                        tracing::trace!("connected but no requests to process; sleeping");
+                        // We're connected but have no items to process; we're done for now.
+                        return Poll::Ready(Ok(()));
+                    }
+                },
+                ConnectionState::Processing(ref mut f) => match ready!(Pin::new(f).poll(cx)) {
+                    // We processed the request just fine, so reset ourselves by taking back the
+                    // connection and seeing if we have any more requests to process.
+                    Ok(conn) => {
+                        tracing::trace!("successfully processed request; resetting state");
+                        (ConnectionState::Connected(Some(conn)), None)
+                    },
+                    // We encountered an error while processing, which is _likely_ going to mean
+                    // the connection itself is dirty, so drop it and force a new connection.
+                    Err(e) => {
+                        tracing::error!("encountered error during processing; resetting state");
+                        (ConnectionState::Disconnected, Some(e))
+                    },
                 },
             };
 
-            debug!("got backend connection");
-
-            // Extract a batch.
-            let batch = self.pending.pop_front().expect("self.pending should not be empty");
-
-            // Actually process this batch and then give back the connection.
-            let timeout_ms = if self.timeout_ms == 0 {
-                LONG_ASS_TIME
-            } else {
-                self.timeout_ms
-            };
-
-            debug!("about to run request on backend connection");
-
-            // Run the actual request, and bail out if we get an error.  This ensures that
-            // we don't give back the connection (since it's likely tainted) and that it
-            // will be recreated.
-            let _ = self.processor
-                .process(batch, &mut conn)
-                .timeout(Duration::from_millis(timeout_ms))
-                .await?;
-
-            debug!("done with request; yielding connection back to loop");
-
-            self.conn = Some(conn);
+            self.state = state;
+            if let Some(e) = err {
+                return Poll::Ready(Err(e.into()))
+            }
         }
-
-        Ok(())
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> { self.drive().await }
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        tracing::trace!(message = "poll close", backend.addr = ?self.address);
+        self.poll_service(cx)
+    }
 
     fn call(&mut self, mut batch: EnqueuedRequests<P::Message>) -> Self::Future {
         let fut = batch
@@ -168,7 +222,7 @@ where
             });
 
 
-        debug!("backend call'd -> took in {} msgs", batch.len());
+        tracing::trace!(message = "call", backend.addr = ?self.address, count = batch.len(), pending = self.pending.len());
         self.pending.push_back(batch);
 
         ResponseFuture::new(fut)
@@ -267,7 +321,6 @@ where
     }
 }
 
-#[async_trait]
 impl<P> DrivenService<EnqueuedRequests<P::Message>> for Backend<P>
 where
     P: Processor + Clone + Send + Sync,
@@ -277,12 +330,13 @@ where
     type Future = ResponseFuture<P::Message>;
     type Response = Responses<P::Message>;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> {
-        self.health.healthy().await;
-        Ok(())
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Make this give us back a brand new future, maybe?  Gotta figure that out.
+        self.health.poll_health(cx)
+            .map(|_| Ok(()))
     }
 
-    async fn drive(&mut self) -> Result<(), Self::Error> {
+    fn poll_service(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // TODO: we may want to precisely examine the protocol error and behave differently
         // for i/o errors vs actual protocol errors, but not sure yet....
         //
@@ -292,22 +346,37 @@ where
         // futuresunoredered, and then await on that to try and drive them all pseudo simultaenously
         // that way hopefully we can avoid a slow connection blocking other i/o and keep latency
         // down
+        let mut any_pending = false;
         for conn in &mut self.conns {
-            debug!("driving individual backend connection");
-            if let Err(_) = conn.drive().await {
-                self.health.increment_error();
+            match conn.poll_service(cx) {
+                Poll::Pending => any_pending = true,
+                Poll::Ready(Ok(())) => {},
+                Poll::Ready(Err(_)) => self.health.increment_error(),
             }
         }
 
-        Ok(())
+        if any_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut any_pending = false;
         for conn in &mut self.conns {
-            conn.drive().await?;
+            match conn.poll_close(cx) {
+                Poll::Pending => any_pending = true,
+                Poll::Ready(Ok(())) => {},
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            }
         }
 
-        Ok(())
+        if any_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
     fn call(&mut self, req: EnqueuedRequests<P::Message>) -> Self::Future {

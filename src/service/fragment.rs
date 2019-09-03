@@ -5,8 +5,7 @@ use crate::common::{Response, MessageResponse, GenericError};
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::pin::Pin;
-use async_trait::async_trait;
-use futures::future::FutureExt;
+use futures::{ready, future::FutureExt};
 use crate::common::MessageState;
 
 const ERR_INTERNAL_RECV: &str = "failed to receive internal message (SSF12)";
@@ -25,7 +24,6 @@ impl<S, P> Fragment<S, P> {
     }
 }
 
-#[async_trait]
 impl<S, P> Service<P::Message> for Fragment<S, P>
 where
     S: Service<Vec<P::Message>> + Send + Sync,
@@ -38,8 +36,9 @@ where
     type Error = GenericError;
     type Future = FragmentResponse<S::Future, P>;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> {
-        self.service.ready().await.map_err(Into::into)
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+            .map_err(Into::into)
     }
 
     fn call(&mut self, req: P::Message) -> Self::Future {

@@ -17,8 +17,11 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::timer::Delay;
+use tokio::timer::{delay, Delay};
 
 pub struct BackendHealth {
     cooloff_enabled: bool,
@@ -28,14 +31,17 @@ pub struct BackendHealth {
     in_cooloff: bool,
     epoch: u64,
     cooloff_done_at: Instant,
+    delay: Delay,
 }
 
 impl BackendHealth {
     pub fn new(cooloff_enabled: bool, cooloff_period_ms: u64, error_limit: usize) -> BackendHealth {
         debug!(
-            "[backend health] cooloff enabled: {}, cooloff period (ms): {}, error limit: {}",
+            "cooloff enabled: {}, cooloff period (ms): {}, error limit: {}",
             cooloff_enabled, cooloff_period_ms, error_limit
         );
+
+        let now = Instant::now();
 
         BackendHealth {
             cooloff_enabled,
@@ -44,7 +50,8 @@ impl BackendHealth {
             error_count: 0,
             in_cooloff: false,
             epoch: 0,
-            cooloff_done_at: Instant::now(),
+            cooloff_done_at: now,
+            delay: delay(now),
         }
     }
 
@@ -75,17 +82,17 @@ impl BackendHealth {
 
         // If we're over the error threshold, put ourselves into cooloff.
         if self.error_count >= self.error_limit && !self.in_cooloff {
-            debug!("[health] error count over limit, setting cooloff");
+            debug!("error count over limit, setting cooloff");
             self.in_cooloff = true;
             self.epoch += 1;
             let deadline = Instant::now() + Duration::from_millis(self.cooloff_period_ms);
             self.cooloff_done_at = deadline;
+            self.delay.reset(deadline);
         }
     }
 
-    pub async fn healthy(&mut self) {
-        if !self.is_healthy() {
-            Delay::new(self.cooloff_done_at).await;
-        }
+    pub fn poll_health(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let delay = Pin::new(&mut self.delay);
+        delay.poll(cx)
     }
 }

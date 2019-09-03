@@ -22,7 +22,7 @@ use crate::{
     common::{EnqueuedRequest, EnqueuedRequests, Message},
 };
 use crate::service::Service;
-use async_trait::async_trait;
+use std::task::{Context, Poll};
 
 #[derive(Clone)]
 pub struct FixedRouter<P, S>
@@ -44,7 +44,6 @@ where
     pub fn new(processor: P, inner: S) -> FixedRouter<P, S> { FixedRouter { processor, inner } }
 }
 
-#[async_trait]
 impl<P, S> Service<Vec<P::Message>> for FixedRouter<P, S>
 where
     P: Processor + Clone +  Send + Sync + Unpin,
@@ -55,8 +54,8 @@ where
     type Future = S::Future;
     type Response = S::Response;
 
-    async fn ready(&mut self) -> Result<(), Self::Error> {
-        self.inner.ready().await
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, req: Vec<P::Message>) -> Self::Future {

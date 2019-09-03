@@ -28,9 +28,10 @@ use crate::{
     errors::CreationError,
     protocol::errors::ProtocolError,
     routing::{FixedRouter, ShadowRouter},
-    service::{Service, Facade, Pipeline, Fragment, PipelineError},
+    service::{Service, Facade, Pipeline, Fragment, Timing, PipelineError},
 };
 use futures::{
+    select,
     future::{Shared, FutureExt},
     sink::Sink,
     stream::{Stream, StreamExt},
@@ -38,12 +39,13 @@ use futures::{
 use futures_turnstyle::Waiter;
 use metrics_runtime::Sink as MetricSink;
 use net2::TcpBuilder;
-use std::{collections::HashMap, future::Future, task::Poll, net::SocketAddr};
+use std::{collections::HashMap, future::Future, net::SocketAddr};
 use tokio::{io, net::TcpListener};
 use tokio_net::driver::Handle;
 use tokio_evacuate::{Evacuate, Warden};
 use tokio_executor::DefaultExecutor;
 use std::pin::Pin;
+use tracing_futures::Instrument;
 
 type GenericRuntimeFuture = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
 type BufferedPool<P, T> = Facade<BackendPool<P>, EnqueuedRequests<T>>;
@@ -201,7 +203,7 @@ fn build_router_chain<P, R, C>(
     processor: P,
     router: R,
     warden: Warden,
-    mut close: C,
+    close: C,
     mut sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
@@ -244,31 +246,35 @@ where
                             let warden = warden.clone();
                             let mut sink2 = sink.clone();
                             let client_addr = client.peer_addr().unwrap();
-                            debug!("[client] {} connected", client_addr);
+                            debug!(message = "client connected", client.addr = ?client_addr);
 
                             let transport = processor.get_transport(client);
                             let fragment = Fragment::new(router, processor);
-                            let mut pipeline = Pipeline::new(transport, fragment);
+                            let timing = Timing::new(fragment, &mut sink, "client_e2e");
+                            let mut pipeline = Pipeline::new(transport, timing);
 
                             tokio::spawn(async move {
-                                let mut pf = pipeline.boxed().fuse();
+                                let mut pf = pipeline
+                                    .instrument(tracing::span!(tracing::Level::TRACE, "pipeline", client.addr = ?client_addr))
+                                    .boxed()
+                                    .fuse();
                                 select! {
                                     r = pf => if let Err(e) = r {
                                         match e {
                                             PipelineError::TransportReceive(ie) => {
                                                 if !ie.client_closed() {
                                                     sink2.record_counter("client_errors", 1);
-                                                    error!("[client] transport error from {}: {}", client_addr, ie);
+                                                    error!("transport error from {}: {}", client_addr, ie);
                                                 }
                                             },
-                                            e => error!("[client] error from {}: {}", client_addr, e),
+                                            e => error!(message = "caught error while running client task", client.addr = ?client_addr, err = ?e),
                                         }
                                     },
                                     _ = close.fuse() => {
                                     },
                                 };
 
-                                debug!("[client] {} disconnected", client_addr);
+                                debug!(message = "client disconnected", client.addr = ?client_addr);
                                 warden.decrement();
                             });
                         },

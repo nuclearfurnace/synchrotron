@@ -17,13 +17,19 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use crate::util::Sizable;
+use crate::{
+    protocol::errors::ProtocolError,
+    util::Sizable
+};
 use bytes::BytesMut;
-use tokio::sync::oneshot::{channel, Receiver, Sender};
+use tokio::{
+    net::TcpStream,
+    sync::oneshot::{channel, Receiver, Sender}
+};
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::pin::Pin;
-use futures::stream::{Stream, FuturesOrdered};
+use futures::{ready, stream::{Stream, FuturesOrdered}};
 use pin_project::pin_project;
 
 pub type GenericError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -193,7 +199,7 @@ impl<T> ResponseFuture<T> {
 impl<T> Future for ResponseFuture<T> {
     type Output = Result<Responses<T>, GenericError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         while let Some(response) = ready!(this.pending.as_mut().poll_next(cx)) {
             match response {
@@ -204,5 +210,25 @@ impl<T> Future for ResponseFuture<T> {
 
         let responses = this.responses.take().expect("cannot poll future after completion");
         return Poll::Ready(Ok(responses))
+    }
+}
+
+pub struct ConnectionFuture {
+    inner: Pin<Box<dyn Future<Output = Result<TcpStream, ProtocolError>> + Send>>,
+}
+
+impl ConnectionFuture {
+    pub fn new(inner: impl Future<Output = Result<TcpStream, ProtocolError>> + Send + 'static) -> Self {
+        ConnectionFuture {
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl Future for ConnectionFuture {
+    type Output = Result<TcpStream, ProtocolError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
     }
 }
