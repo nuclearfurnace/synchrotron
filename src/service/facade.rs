@@ -375,8 +375,12 @@ where
                         break;
                     },
                     Poll::Ready(Err(e)) => {
+                        // We can't do anything more if we get an error while closing, so mark
+                        // ourselves as failed and then bow out.  Best we can do is that remaining
+                        // facades send the error to future calls.
                         tracing::debug!(status = "failed", message = "close svc");
                         this.mark_failed(e.into());
+                        return Poll::Ready(());
                     },
                 }
             } else {

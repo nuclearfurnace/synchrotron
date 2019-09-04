@@ -85,8 +85,12 @@ where
                 descriptor
             })
             .filter(|backend| backend.healthy)
-            .collect();
+            .collect::<Vec<_>>();
+
+        let descriptors_len = descriptors.len();
         self.distributor.update(descriptors);
+
+        tracing::debug!(message = "regenerating distribution", node_count = descriptors_len);
         self.sink.record_counter("distribution_updated", 1);
     }
 }
@@ -104,8 +108,12 @@ where
         let mut any_ready = false;
         let mut epoch = 0;
         for backend in &mut self.backends {
+            let name = backend.get_descriptor().identifier;
             match backend.poll_ready(cx) {
-                Poll::Ready(Ok(())) => any_ready = true,
+                Poll::Ready(Ok(())) => {
+                    tracing::debug!(message = "backend is ready", ?name);
+                    any_ready = true
+                },
                 // Catch everything else.  We don't immediately return an error because
                 // we need to be able to update the state of the pool.
                 //

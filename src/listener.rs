@@ -255,7 +255,7 @@ where
 
                             tokio::spawn(async move {
                                 let mut pf = pipeline
-                                    .instrument(tracing::span!(tracing::Level::TRACE, "pipeline", client.addr = ?client_addr))
+                                    .instrument(tracing::trace_span!("pipeline", client.addr = ?client_addr))
                                     .boxed()
                                     .fuse();
                                 select! {

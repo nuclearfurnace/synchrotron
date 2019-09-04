@@ -145,6 +145,29 @@ where
                     },
                     Poll::Ready(Err(e)) => {
                         tracing::error!("error while connecting to backend; resetting state");
+
+                        // This is a very deliberate action.
+                        //
+                        // Normally, we'd catch errors while running a request, and these errors
+                        // would usually be indicative of a problem with _that_ request.  The issue
+                        // here is that if we have many pending responses, and we get an error even
+                        // connecting to the backend -- be it for authentication or networking
+                        // reasons -- then we likely can't service any requests on this backend for
+                        // a short period of time, and further, we don't want to keep retrying
+                        // every single request up until the backend starts working again.... or
+                        // else we may end up with clients stacking their requests, forcing a
+                        // client-side timeout to occur, as they wait their turn in line to have
+                        // their message tried and failed for every poll in the "connecting" state,
+                        // which includes waiting for each message failure plus a likely cooloff
+                        // period.
+                        //
+                        // By clearing all pending messages, we fast fail ourselves.  If continual
+                        // traffic is coming in, it will still quickly trigger enough errors for
+                        // the cooloff feature to kick in, propetly downing the backend within the
+                        // pool, but we can get back to clients much faster on the fact that the
+                        // backend is experiencing issues.
+                        self.pending.clear();
+
                         (ConnectionState::Disconnected, Some(BackendError::Protocol(e)))
                     },
                 },
