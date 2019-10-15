@@ -18,9 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use crate::{
-    common::{EnqueuedRequests, Message},
+    common::{EnqueuedRequests, Message, Sizable},
     protocol::errors::ProtocolError,
-    util::Sizable,
 };
 use btoi::btoi;
 use bytes::{BufMut, BytesMut};
@@ -34,6 +33,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, Error, ErrorKind};
 use pin_project::pin_project;
+use std::fmt::Display;
 
 mod filtering;
 use self::filtering::check_command_validity;
@@ -55,6 +55,13 @@ const REDIS_INT_BUF: [u8; 1] = [REDIS_COMMAND_INTEGER];
 const REDIS_CRLF: [u8; 2] = [b'\r', b'\n'];
 const REDIS_BACKEND_CLOSED: &str = "backend closed prematurely";
 
+#[derive(PartialEq, Debug, Clone)]
+pub enum ReplyState {
+    On,
+    Skip,
+    Off
+}
+
 /// A Redis-specific transport.
 #[pin_project]
 pub struct RedisTransport<T>
@@ -66,6 +73,7 @@ where
     rbuf: BytesMut,
     wbuf: BytesMut,
     closed: bool,
+    reply_state: ReplyState,
 }
 
 pub struct RedisMultipleMessages<'a, T>
@@ -92,6 +100,11 @@ where
 /// for data values.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RedisMessage {
+    // These are variants used for internal controls.
+    Empty,
+    ReplyState(ReplyState),
+
+    // These types represent common response types -- scalars, etc -- sent by a server.
     Null,
     OK,
     Ping,
@@ -99,12 +112,25 @@ pub enum RedisMessage {
     Status(BytesMut, usize),
     Error(BytesMut, usize),
     Integer(BytesMut, i64),
+
+    // These represent the building blocks of commands.  Bulk is "multiple data messages" and data
+    // is something like "string here".  Servers will also reply with data messages in addition to
+    // the other common response types, so it's both client and server oriented.
     Data(BytesMut, usize),
-    Bulk(BytesMut, Vec<RedisMessage>),
+
+    // The boolean value here signifies whether or not this command should get a reply.  It's
+    // threaded through in a slightly precarious way, but is simple in principle.
+    Bulk(BytesMut, Vec<RedisMessage>, bool),
+}
+
+impl Default for RedisMessage {
+    fn default() -> Self {
+        RedisMessage::Empty
+    }
 }
 
 impl RedisMessage {
-    pub fn from_inline(cmd: &str) -> RedisMessage {
+    pub fn from_inline(cmd: &str, needs_reply: bool) -> RedisMessage {
         let args = cmd
             .split_whitespace()
             .map(|part| {
@@ -136,7 +162,7 @@ impl RedisMessage {
             buf.unsplit(arg_buf);
         }
 
-        RedisMessage::Bulk(buf, args)
+        RedisMessage::Bulk(buf, args, needs_reply)
     }
 
     pub fn from_status(status_str: &str) -> RedisMessage {
@@ -149,24 +175,15 @@ impl RedisMessage {
         RedisMessage::Status(rd, 1)
     }
 
-    pub fn from_error(e: Box<dyn std::error::Error>) -> RedisMessage {
-        let error_str = e.description();
-        let bytes = error_str.as_bytes();
+    pub fn from_error<E>(e: E) -> RedisMessage
+    where
+        E: Display,
+    {
+        let buf = e.to_string().into_bytes();
 
-        let mut rd = BytesMut::with_capacity(REDIS_ERR_BUF.len() + bytes.len() + 2);
+        let mut rd = BytesMut::with_capacity(REDIS_ERR_BUF.len() + buf.len() + 2);
         rd.put_slice(&REDIS_ERR_BUF[..]);
-        rd.put_slice(&bytes);
-        rd.put_slice(&REDIS_CRLF[..]);
-
-        RedisMessage::Error(rd, 5)
-    }
-
-    pub fn from_error_str(error_str: &str) -> RedisMessage {
-        let bytes = error_str.as_bytes();
-
-        let mut rd = BytesMut::with_capacity(REDIS_ERR_BUF.len() + bytes.len() + 2);
-        rd.put_slice(&REDIS_ERR_BUF[..]);
-        rd.put_slice(&bytes);
+        rd.put_slice(&buf);
         rd.put_slice(&REDIS_CRLF[..]);
 
         RedisMessage::Error(rd, 5)
@@ -185,7 +202,7 @@ impl RedisMessage {
 
     pub fn get_command(&self) -> Option<&[u8]> {
         match self {
-            RedisMessage::Bulk(_, ref args) => {
+            RedisMessage::Bulk(_, ref args, _) => {
                 match args.get(0) {
                     Some(RedisMessage::Data(buf, offset)) => {
                         let end = buf.len() - 2;
@@ -200,6 +217,11 @@ impl RedisMessage {
 
     pub fn into_resp(self) -> BytesMut {
         match self {
+            RedisMessage::Empty => BytesMut::new(),
+            RedisMessage::ReplyState(state) => match state {
+                ReplyState::Skip | ReplyState::Off => BytesMut::new(),
+                ReplyState::On => BytesMut::from(&REDIS_OK_BUF[..]),
+            },
             RedisMessage::Null => BytesMut::from(&REDIS_NULL_BUF[..]),
             RedisMessage::OK => BytesMut::from(&REDIS_OK_BUF[..]),
             RedisMessage::Ping => BytesMut::from(&REDIS_PING_RESP_BUF[..]),
@@ -208,12 +230,17 @@ impl RedisMessage {
             RedisMessage::Error(buf, _) => buf,
             RedisMessage::Integer(buf, _) => buf,
             RedisMessage::Data(buf, _) => buf,
-            RedisMessage::Bulk(buf, _) => buf,
+            RedisMessage::Bulk(buf, _, _) => buf,
         }
     }
 
     pub fn get_buf(&self) -> BytesMut {
         match self {
+            RedisMessage::Empty => BytesMut::new(),
+            RedisMessage::ReplyState(state) => match state {
+                ReplyState::Skip | ReplyState::Off => BytesMut::new(),
+                ReplyState::On => BytesMut::from(&REDIS_OK_BUF[..]),
+            },
             RedisMessage::Null => BytesMut::from(&REDIS_NULL_BUF[..]),
             RedisMessage::OK => BytesMut::from(&REDIS_OK_BUF[..]),
             RedisMessage::Ping => BytesMut::from(&REDIS_PING_RESP_BUF[..]),
@@ -222,7 +249,7 @@ impl RedisMessage {
             RedisMessage::Error(ref buf, _) => buf.clone(),
             RedisMessage::Integer(ref buf, _) => buf.clone(),
             RedisMessage::Data(ref buf, _) => buf.clone(),
-            RedisMessage::Bulk(ref buf, _) => buf.clone(),
+            RedisMessage::Bulk(ref buf, _, _) => buf.clone(),
         }
     }
 }
@@ -230,6 +257,11 @@ impl RedisMessage {
 impl Sizable for RedisMessage {
     fn size(&self) -> usize {
         match self {
+            RedisMessage::Empty => 0,
+            RedisMessage::ReplyState(state) => match state {
+                ReplyState::Skip | ReplyState::Off => 0,
+                ReplyState::On => REDIS_OK_BUF[..].len(),
+            },
             RedisMessage::Null => REDIS_NULL_BUF[..].len(),
             RedisMessage::OK => REDIS_OK_BUF[..].len(),
             RedisMessage::Ping => REDIS_PING_RESP_BUF[..].len(),
@@ -238,7 +270,7 @@ impl Sizable for RedisMessage {
             RedisMessage::Error(ref buf, _) => buf.len(),
             RedisMessage::Integer(ref buf, _) => buf.len(),
             RedisMessage::Data(ref buf, _) => buf.len(),
-            RedisMessage::Bulk(ref buf, _) => buf.len(),
+            RedisMessage::Bulk(ref buf, _, _) => buf.len(),
         }
     }
 }
@@ -246,7 +278,7 @@ impl Sizable for RedisMessage {
 impl Message for RedisMessage {
     fn key(&self) -> &[u8] {
         match self {
-            RedisMessage::Bulk(_, ref args) => {
+            RedisMessage::Bulk(_, ref args, _) => {
                 let arg_pos = if args.len() < 2 { 0 } else { 1 };
 
                 match args.get(arg_pos) {
@@ -270,7 +302,21 @@ impl Message for RedisMessage {
     fn is_inline(&self) -> bool {
         match self {
             RedisMessage::Data(_, _) => false,
-            RedisMessage::Bulk(_, _) => false,
+            RedisMessage::Bulk(_, _, _) => false,
+            _ => true,
+        }
+    }
+
+    fn needs_reply(&self) -> bool {
+        match self {
+            // If this is a bulk message, it's a "command", so follow what it was set as.
+            RedisMessage::Bulk(_, _, needs_reply) => *needs_reply,
+            // Otherwise, always reply.
+            //
+            // This is sort of pointless for response data -- status, integer, etc -- because the
+            // method won't ever be called on those messages, only messages that originate from a
+            // client, but we have to return true for inline messages like ping and reply state,
+            // otherwise our service stack won't properly hairpin the response back to the client.
             _ => true,
         }
     }
@@ -288,6 +334,7 @@ where
             rbuf: BytesMut::new(),
             wbuf: BytesMut::new(),
             closed: false,
+            reply_state: ReplyState::On,
         }
     }
 
@@ -301,6 +348,22 @@ where
                 Ok(_) => continue,
                 Err(e) => return Poll::Ready(Err(e)),
             }
+        }
+    }
+
+    fn update_reply_state(&mut self) -> bool {
+        debug!("current reply state: {:?}", self.reply_state);
+        match self.reply_state {
+            // We're replying to all commands normally.
+            ReplyState::On => true,
+            // We were told by a previous command to do a single skip.
+            ReplyState::Skip => {
+                self.reply_state = ReplyState::On;
+                debug!("updating reply state to {:?}", self.reply_state);
+                false
+            },
+            // Replies are off entirely.
+            ReplyState::Off => false,
         }
     }
 }
@@ -318,9 +381,10 @@ where
 
         let socket_closed = self.fill_read_buf(cx).is_ready();
 
-        match read_message(&mut self.rbuf) {
+        let needs_reply = self.update_reply_state();
+        match read_message(&mut self.rbuf, needs_reply) {
             Poll::Ready(Ok((bytes_read, cmd))) => {
-                trace!("[protocol] got message from client! ({} bytes)", bytes_read);
+                debug!("got message from client! ({} bytes)", bytes_read);
 
                 // If client has quit, mark the stream closed so that we return Ready(None) on the
                 // next call to poll.  This is the easiest way to ensure that all messages before
@@ -330,6 +394,12 @@ where
                     self.closed = true;
                 }
 
+                // If the client has updated their reply state, then put that into action here.
+                if let RedisMessage::ReplyState(ref state) = cmd {
+                    debug!("updating reply state to {:?}", state);
+                    self.reply_state = state.clone();
+                }
+
                 // If this command is invalid, kill the transport.  We also give the transport
                 // owner an error message, which is inlined and so we can kill the transport while
                 // still sending an error back to the client themselves.
@@ -337,7 +407,7 @@ where
                     if !check_command_validity(cmd_key) {
                         self.closed = true;
 
-                        let emsg = RedisMessage::from_error_str("command not valid");
+                        let emsg = RedisMessage::from_error("command not valid");
                         return Poll::Ready(Some(Ok(emsg)));
                     }
                 }
@@ -363,12 +433,14 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // keep this as a no-op for now; in the future, maybe we hold the actual TCP stream halves
         // and do poll_write_ready or some shit
         let this = self.project();
         if this.wbuf.len() >= MAX_OUTSTANDING_WBUF {
-            ready!(this.transport.poll_flush(cx));
+            if let Err(e) = ready!(this.transport.poll_flush(cx)) {
+                return Poll::Ready(Err(e))
+            }
 
             if this.wbuf.len() >= MAX_OUTSTANDING_WBUF {
                 return Poll::Pending;
@@ -383,7 +455,7 @@ where
         Ok(())
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut this = self.project();
         while !this.wbuf.is_empty() {
             let n = ready!(this.transport.as_mut().poll_write(cx, &this.wbuf))?;
@@ -439,12 +511,20 @@ where
         let socket_closed = self.fill_read_buf(cx).is_ready();
 
         loop {
-            // We've collected all the messages, time to return.
+            // We've collected all the messages we're supposed to, all done.
             if self.msgs.is_empty() {
                 return Poll::Ready(Ok(self.bytes_read));
             }
 
-            match read_message(&mut self.rbuf) {
+            // If the current message slot is already complete, drop it and try gain.
+            if self.msgs.get(0).map_or(false, |msg| msg.is_done()) {
+                self.msgs.remove(0);
+                continue;
+            }
+
+            // We set needs_reply to true here, hardcoded.  This is essentially a no-op: we're only
+            // reading responses back from the server, so it really doesn't matter what we put.
+            match read_message(&mut self.rbuf, true) {
                 Poll::Ready(Ok((bytes_read, msg))) => {
                     trace!("[protocol] got message from server! ({} bytes)", bytes_read);
 
@@ -456,7 +536,7 @@ where
                     return if socket_closed {
                         // If the socket is closed, let's also close up shop after responding to
                         // the client with errors.
-                        let err = RedisMessage::from_error_str(REDIS_BACKEND_CLOSED);
+                        let err = RedisMessage::from_error(REDIS_BACKEND_CLOSED);
                         while let Some(mut qmsg) = self.msgs.pop() {
                             qmsg.fulfill(err.clone())
                         }
@@ -478,7 +558,7 @@ where
     RedisMultipleMessages::new(rx, msgs)
 }
 
-fn read_message(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolError>> {
+fn read_message(rd: &mut BytesMut, needs_reply: bool) -> Poll<Result<(usize, RedisMessage), ProtocolError>> {
     // Check to see if we got any inline commands.
     //
     // This is either shortform commands -- like PING or QUIT -- or hard-coded responses like an OK
@@ -488,7 +568,7 @@ fn read_message(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), Protoco
         return Poll::Ready(Ok(msg_tuple));
     }
 
-    read_message_internal(rd)
+    read_message_internal(rd, needs_reply)
 }
 
 fn read_inline_messages(rd: &mut BytesMut) -> Option<(usize, RedisMessage)> {
@@ -527,10 +607,26 @@ fn read_inline_messages(rd: &mut BytesMut) -> Option<(usize, RedisMessage)> {
         return Some((5, RedisMessage::Null));
     }
 
+    // See if this is an CLIENT REPLY response: check for on, off, and skip.
+    if rd.starts_with(&b"*3\r\n$6\r\nCLIENT\r\n$5\r\nREPLY\r\n$3\r\nOFF\r\n"[..]) {
+        let _ = rd.split_to(36);
+        return Some((36, RedisMessage::ReplyState(ReplyState::Off)));
+    }
+
+    if rd.starts_with(&b"*3\r\n$6\r\nCLIENT\r\n$5\r\nREPLY\r\n$2\r\nON\r\n"[..]) {
+        let _ = rd.split_to(35);
+        return Some((35, RedisMessage::ReplyState(ReplyState::On)));
+    }
+
+    if rd.starts_with(&b"*3\r\n$6\r\nCLIENT\r\n$5\r\nREPLY\r\n$4\r\nSKIP\r\n"[..]) {
+        let _ = rd.split_to(37);
+        return Some((37, RedisMessage::ReplyState(ReplyState::Skip)));
+    }
+
     None
 }
 
-fn read_message_internal(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolError>> {
+fn read_message_internal(rd: &mut BytesMut, needs_reply: bool) -> Poll<Result<(usize, RedisMessage), ProtocolError>> {
     // Try reading a single byte to see if we have a message.  Match it against known
     // message types, and process accordingly.
     let first = match rd.len() {
@@ -542,7 +638,7 @@ fn read_message_internal(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage)
         None => Poll::Pending,
         Some(t) => {
             match &t {
-                &REDIS_COMMAND_BULK => read_bulk(rd),
+                &REDIS_COMMAND_BULK => read_bulk(rd, needs_reply),
                 &REDIS_COMMAND_DATA => read_data(rd),
                 &REDIS_COMMAND_STATUS => read_status(rd),
                 &REDIS_COMMAND_ERROR => read_error(rd),
@@ -649,7 +745,7 @@ fn read_data(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolEr
     }
 }
 
-fn read_bulk(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolError>> {
+fn read_bulk(rd: &mut BytesMut, needs_reply: bool) -> Poll<Result<(usize, RedisMessage), ProtocolError>> {
     let mut total = 0;
     let mut buf = rd.clone();
 
@@ -664,7 +760,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolEr
     // This can legitimately fail because, at this point, buf might not contain the full message.
     let mut args = Vec::new();
     for _ in 0..count {
-        let (n, msg) = ready!(read_message_internal(&mut buf))?;
+        let (n, msg) = ready!(read_message_internal(&mut buf, needs_reply))?;
         total += n;
 
         args.push(msg);
@@ -672,7 +768,7 @@ fn read_bulk(rd: &mut BytesMut) -> Poll<Result<(usize, RedisMessage), ProtocolEr
 
     // Slice off all the bytes we "read", updating the original in the process, and pass them along.
     let buf = rd.split_to(total);
-    Poll::Ready(Ok((total, RedisMessage::Bulk(buf, args))))
+    Poll::Ready(Ok((total, RedisMessage::Bulk(buf, args, needs_reply))))
 }
 
 pub async fn write_raw_message<T>(tx: &mut T, msg: RedisMessage) -> Result<usize, ProtocolError>
@@ -743,10 +839,10 @@ mod tests {
     static DATA_QUIT_FULL_LOWER: &[u8] = b"*1\r\n$4\r\nquit\r\n";
     static DATA_QUIT_FULL_UPPER: &[u8] = b"*1\r\n$4\r\nQUIT\r\n";
 
-    fn get_message_from_buf(buf: &[u8]) -> Poll<RedisMessage, ProtocolError> {
+    fn get_message_from_buf(buf: &[u8]) -> Poll<Result<RedisMessage, ProtocolError>> {
         let mut rd = BytesMut::with_capacity(buf.len());
         rd.put_slice(&buf[..]);
-        read_message(&mut rd).map(|res| res.map(|(_, msg)| msg))
+        read_message(&mut rd, true).map(|res| res.map(|(_, msg)| msg))
     }
 
     fn check_data_matches(msg: RedisMessage, data: &[u8]) {
@@ -788,7 +884,7 @@ mod tests {
 
     fn check_bulk_matches(mut msg: RedisMessage, values: Vec<&[u8]>) {
         match msg {
-            RedisMessage::Bulk(_, ref mut args) => {
+            RedisMessage::Bulk(_, ref mut args, _) => {
                 assert_that(args).has_length(values.len());
                 for value in &values {
                     check_data_matches(args.remove(0), value);
@@ -801,10 +897,9 @@ mod tests {
     #[test]
     fn parse_get_simple() {
         let res = get_message_from_buf(&DATA_GET_SIMPLE);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
-
-        match res.unwrap() {
-            Poll::Ready(msg) => check_bulk_matches(msg, vec![b"get", b"foobar"]),
+        assert!(res.is_ready());
+        match res {
+            Poll::Ready(Ok(msg)) => check_bulk_matches(msg, vec![b"get", b"foobar"]),
             _ => panic!("should have had message"),
         }
     }
@@ -812,10 +907,9 @@ mod tests {
     #[test]
     fn parse_ok() {
         let res = get_message_from_buf(&DATA_OK);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
-
-        match res.unwrap() {
-            Poll::Ready(msg) => assert_eq!(msg, RedisMessage::OK),
+        assert!(res.is_ready());
+        match res {
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::OK),
             _ => panic!("should have had message"),
         }
     }
@@ -823,10 +917,9 @@ mod tests {
     #[test]
     fn parse_status() {
         let res = get_message_from_buf(&DATA_STATUS);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
-
-        match res.unwrap() {
-            Poll::Ready(msg) => check_status_matches(msg, b"LIMITED"),
+        assert!(res.is_ready());
+        match res {
+            Poll::Ready(Ok(msg)) => check_status_matches(msg, b"LIMITED"),
             _ => panic!("should have had message"),
         }
     }
@@ -834,10 +927,9 @@ mod tests {
     #[test]
     fn parse_error() {
         let res = get_message_from_buf(&DATA_ERROR);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
-
-        match res.unwrap() {
-            Poll::Ready(msg) => check_error_matches(msg, b"ERR warning limit exceeded"),
+        assert!(res.is_ready());
+        match res {
+            Poll::Ready(Ok(msg)) => check_error_matches(msg, b"ERR warning limit exceeded"),
             _ => panic!("should have had message"),
         }
     }
@@ -845,10 +937,9 @@ mod tests {
     #[test]
     fn parse_null() {
         let res = get_message_from_buf(&DATA_NULL);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
-
-        match res.unwrap() {
-            Poll::Ready(msg) => assert_eq!(msg, RedisMessage::Null),
+        assert!(res.is_ready());
+        match res {
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Null),
             _ => panic!("should have had message"),
         }
     }
@@ -856,12 +947,11 @@ mod tests {
     #[test]
     fn parse_bulk_with_null() {
         let res = get_message_from_buf(&DATA_BULK_WITH_NULL);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
-
-        match res.unwrap() {
-            Poll::Ready(mut msg) => {
+        assert!(res.is_ready());
+        match res {
+            Poll::Ready(Ok(mut msg)) => {
                 match msg {
-                    RedisMessage::Bulk(_, ref mut args) => {
+                    RedisMessage::Bulk(_, ref mut args, _) => {
                         assert_that(args).has_length(2);
                         let arg0 = args.remove(0);
                         let arg1 = args.remove(0);
@@ -879,10 +969,9 @@ mod tests {
     #[test]
     fn parse_integer() {
         let res = get_message_from_buf(&DATA_INTEGER_1337);
-        assert_that(&res).is_ok().matches(|val| val.is_ready());
-
-        match res.unwrap() {
-            Poll::Ready(msg) => check_integer_matches(msg, 1337),
+        assert!(res.is_ready());
+        match res {
+            Poll::Ready(Ok(msg)) => check_integer_matches(msg, 1337),
             _ => panic!("should have had message"),
         }
     }
@@ -890,58 +979,58 @@ mod tests {
     #[test]
     fn parse_short_circuit_zero_data() {
         let res = get_message_from_buf(&DATA_SHORT_CIRCUIT_ZERO_DATA);
-        assert_that(&res).is_ok().matches(|val| val.is_not_ready());
+        assert!(res.is_pending());
     }
 
     #[test]
     fn parse_short_circuit_no_array_crlf() {
         let res = get_message_from_buf(&DATA_SHORT_CIRCUIT_NO_ARRAY_CRLF);
-        assert_that(&res).is_ok().matches(|val| val.is_not_ready());
+        assert!(res.is_pending());
     }
 
     #[test]
     fn parse_short_circuit_no_arg_len_crlf() {
         let res = get_message_from_buf(&DATA_SHORT_CIRCUIT_NO_ARG_LEN_CRLF);
-        assert_that(&res).is_ok().matches(|val| val.is_not_ready());
+        assert!(res.is_pending());
     }
 
     #[test]
     fn parse_short_circuit_partial_arg() {
         let res = get_message_from_buf(&DATA_SHORT_CIRCUIT_PARTIAL_ARG);
-        assert_that(&res).is_ok().matches(|val| val.is_not_ready());
+        assert!(res.is_pending());
     }
 
     #[test]
     fn parse_short_circuit_missing_arg() {
         let res = get_message_from_buf(&DATA_SHORT_CIRCUIT_MISSING_ARG);
-        assert_that(&res).is_ok().matches(|val| val.is_not_ready());
+        assert!(res.is_pending());
     }
 
     #[test]
     fn parse_short_circuit_arg_len_past_end() {
         let res = get_message_from_buf(&DATA_SHORT_CIRCUIT_ARG_LEN_PAST_END);
-        assert_that(&res).is_ok().matches(|val| val.is_not_ready());
+        assert!(res.is_pending());
     }
 
     #[test]
     fn parse_ping() {
         match get_message_from_buf(&DATA_PING_LOWER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Ping),
             _ => panic!("should have had message"),
         }
 
         match get_message_from_buf(&DATA_PING_UPPER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Ping),
             _ => panic!("should have had message"),
         }
 
         match get_message_from_buf(&DATA_PING_FULL_LOWER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Ping),
             _ => panic!("should have had message"),
         }
 
         match get_message_from_buf(&DATA_PING_FULL_UPPER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Ping),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Ping),
             _ => panic!("should have had message"),
         }
     }
@@ -949,22 +1038,22 @@ mod tests {
     #[test]
     fn parse_quit() {
         match get_message_from_buf(&DATA_QUIT_LOWER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Quit),
             _ => panic!("should have had message"),
         }
 
         match get_message_from_buf(&DATA_QUIT_UPPER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Quit),
             _ => panic!("should have had message"),
         }
 
         match get_message_from_buf(&DATA_QUIT_FULL_LOWER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Quit),
             _ => panic!("should have had message"),
         }
 
         match get_message_from_buf(&DATA_QUIT_FULL_UPPER) {
-            Ok(Poll::Ready(msg)) => assert_eq!(msg, RedisMessage::Quit),
+            Poll::Ready(Ok(msg)) => assert_eq!(msg, RedisMessage::Quit),
             _ => panic!("should have had message"),
         }
     }

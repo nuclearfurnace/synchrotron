@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use crate::common::GenericError;
-use crate::service::{DrivenService, Service};
+use crate::service::DrivenService;
 use futures::{ready, stream::Stream};
 use std::{
     fmt,
@@ -29,6 +29,7 @@ use std::{
 };
 use tokio_sync::{mpsc, oneshot};
 use tokio_executor::{SpawnError, TypedExecutor};
+use tower::Service;
 use pin_project::{pin_project, project};
 
 type InnerTx<R, F> = mpsc::Sender<Message<R, F>>;
@@ -150,9 +151,9 @@ where
 impl<S, Request> Service<Request> for Facade<S, Request>
 where
     S: DrivenService<Request>,
-    Request: Send + Sync,
+    Request: Send,
     S::Error: Into<GenericError> + Send + Sync,
-    S::Future: Send + Sync + Unpin,
+    S::Future: Send + Unpin,
 {
     type Error = GenericError;
     type Future = ResponseFuture<S::Future>;
@@ -294,7 +295,7 @@ where
 {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut any_outstanding = false;
         tracing::debug!("starting facade worker poll");
 

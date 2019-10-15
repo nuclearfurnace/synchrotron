@@ -25,11 +25,12 @@ serde_derive = "^1.0"
 #tokio-sync = { git = "https://github.com/tokio-rs/tokio", features = ["async-traits"] }
 #tokio-executor = { git = "https://github.com/tokio-rs/tokio" }
 #tokio-net = { git = "https://github.com/tokio-rs/tokio" }
-tokio = { version = "0.2.0-alpha.4", features = ["rt-full"] }
-tokio-sync = { version = "0.2.0-alpha.4", features = ["async-traits"] }
-tokio-executor = { version = "0.2.0-alpha.4" }
-tokio-net = { version = "0.2.0-alpha.4" }
-futures-preview = { version = "0.3.0-alpha.17", features = ["nightly", "async-await"] }
+tokio = { version = "0.2.0-alpha.6", features = ["rt-full"] }
+tokio-sync = { version = "0.2.0-alpha.6", features = ["async-traits"] }
+tokio-executor = { version = "0.2.0-alpha.6" }
+tokio-net = { version = "0.2.0-alpha.6" }
+tokio-test = { version = "0.2.0-alpha.6" }
+futures-preview = { version = "0.3.0-alpha.19", features = ["async-await"] }
 async-trait = "^0.1"
 net2 = "^0.2"
 libc = "^0.2"
@@ -47,12 +48,14 @@ tokio-evacuate = { path = "../tokio-evacuate" }
 metrics = { path = "../metrics/metrics" }
 metrics-runtime = { path = "../metrics/metrics-runtime" }
 lazycell = "1.2"
-pin-project = { version = "0.4.0-alpha.5", features = ["project_attr"] }
+pin-project = "0.4.2"
 tracing = "0.1.6"
 tracing-fmt = "0.0.1-alpha.3"
 tracing-log = "0.0.1-alpha.1"
 tracing-futures = { path = "../tracing/tracing-futures", default-features = false, features = ["tokio-alpha"] }
 quanta = "^0.3"
+tower = "0.3.0-alpha.2"
+tower-util = "0.3.0-alpha.1"
 
 [dependencies.config]
 version = "^0.9"
@@ -62,3 +65,5 @@ features = ["json"]
 [dev-dependencies]
 spectral = "^0.6"
 matches = "^0.1"
+lazy_static = "^1.4"
+mockall = { version = "^0.5", features = ["nightly"] }

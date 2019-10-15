@@ -19,16 +19,16 @@
 // SOFTWARE.
 use crate::{
     backend::{
-        pool::{BackendPool, BackendPoolBuilder},
+        pool::BackendPoolBuilder,
         processor::Processor,
         redis::RedisProcessor,
     },
-    common::{EnqueuedRequests, Message, Response, GenericError},
+    common::{Message, Response, GenericError},
     conf::ListenerConfiguration,
     errors::CreationError,
     protocol::errors::ProtocolError,
     routing::{FixedRouter, ShadowRouter},
-    service::{Service, Facade, Pipeline, Fragment, Timing, PipelineError},
+    service::{Pipeline, FragmentLayer, TimingLayer, ShuntLayer, PipelineError},
 };
 use futures::{
     select,
@@ -42,13 +42,13 @@ use net2::TcpBuilder;
 use std::{collections::HashMap, future::Future, net::SocketAddr};
 use tokio::{io, net::TcpListener};
 use tokio_net::driver::Handle;
+use tokio::net::TcpStream;
 use tokio_evacuate::{Evacuate, Warden};
-use tokio_executor::DefaultExecutor;
+use tower::{Service, ServiceBuilder};
 use std::pin::Pin;
 use tracing_futures::Instrument;
 
-type GenericRuntimeFuture = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
-type BufferedPool<P, T> = Facade<BackendPool<P>, EnqueuedRequests<T>>;
+type GenericRuntimeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Creates a listener from the given configuration.
 ///
@@ -92,11 +92,11 @@ fn routing_from_config<P, C>(
     sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Send + Sync + Unpin + 'static,
-    P::Message: Message + Clone + Send + Sync + Unpin + 'static,
-    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Sync + Unpin,
+    P: Processor<TcpStream> + Clone + Send + Sync + 'static,
+    P::Message: Message + Default + Clone + Send,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     <P::Transport as Sink<P::Message>>::Error: std::error::Error,
-    C: Future + Clone + Send + Sync + Unpin + 'static,
+    C: Future + Send + 'static,
 {
     let reload_timeout_ms = config.reload_timeout_ms.unwrap_or_else(|| 5000);
 
@@ -119,14 +119,8 @@ where
             config.address.clone()
         );
 
-        let pool = BackendPoolBuilder::new(pool_name.clone(), processor.clone(), pool_config, sink.clone()).build()?;
-        let buffered_pool = Facade::new(pool, DefaultExecutor::current(), 32).map_err(|_| {
-            CreationError::InvalidResource(format!(
-                "error while building pool '{}': failed to spawn task",
-                pool_name
-            ))
-        })?;
-        pools.insert(pool_name, buffered_pool);
+        let pool = BackendPoolBuilder::new(pool_name.clone(), processor.clone(), pool_config, sink.clone());
+        pools.insert(pool_name, pool);
     }
 
     // Figure out what sort of routing we're doing so we can grab the right handler.
@@ -144,24 +138,25 @@ where
 
 fn get_fixed_router<P, C>(
     listener: TcpListener,
-    pools: HashMap<String, BufferedPool<P, P::Message>>,
+    pools: HashMap<String, BackendPoolBuilder<P, TcpStream>>,
     processor: P,
     warden: Warden,
     close: C,
     sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Send + Sync + Unpin + 'static,
-    P::Message: Message + Clone + Send + Sync + Unpin + 'static,
-    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Sync + Unpin,
+    P: Processor<TcpStream> + Clone + Send + Sync + 'static,
+    P::Message: Message + Default + Clone + Send,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     <P::Transport as Sink<P::Message>>::Error: std::error::Error,
-    C: Future + Clone + Send + Sync + Unpin + 'static,
+    C: Future + Clone + Send + Unpin + 'static,
 {
     // Construct an instance of our router.
     let default_pool = pools
         .get("default")
         .cloned()
-        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for fixed router".to_string()))?;
+        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for fixed router".to_string()))?
+        .build_buffered()?;
     let router = FixedRouter::new(processor.clone(), default_pool);
 
     build_router_chain(listener, processor, router, warden, close, sink)
@@ -169,29 +164,32 @@ where
 
 fn get_shadow_router<P, C>(
     listener: TcpListener,
-    pools: HashMap<String, BufferedPool<P, P::Message>>,
+    pools: HashMap<String, BackendPoolBuilder<P, TcpStream>>,
     processor: P,
     warden: Warden,
     close: C,
     sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Send + Sync + Unpin + 'static,
-    P::Message: Message + Clone + Send + Sync + Unpin + 'static,
-    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Sync + Unpin,
+    P: Processor<TcpStream> + Clone + Send + Sync + 'static,
+    P::Message: Message + Default + Clone + Send,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     <P::Transport as Sink<P::Message>>::Error: std::error::Error,
-    C: Future + Clone + Send + Sync + Unpin + 'static,
+    C: Future + Clone + Send + Unpin + 'static,
 {
     // Construct an instance of our router.
     let default_pool = pools
         .get("default")
         .cloned()
-        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for shadow router".to_string()))?;
+        .ok_or_else(|| CreationError::InvalidResource("no default pool configured for shadow router".to_string()))?
+        .build_buffered()?;
 
     let shadow_pool = pools
         .get("shadow")
         .cloned()
-        .ok_or_else(|| CreationError::InvalidResource("no shadow pool configured for shadow router".to_string()))?;
+        .ok_or_else(|| CreationError::InvalidResource("no shadow pool configured for shadow router".to_string()))?
+        .set_noreply(true)
+        .build_buffered()?;
 
     let router = ShadowRouter::new(processor.clone(), default_pool, shadow_pool);
 
@@ -207,20 +205,25 @@ fn build_router_chain<P, R, C>(
     mut sink: MetricSink,
 ) -> Result<GenericRuntimeFuture, CreationError>
 where
-    P: Processor + Clone + Unpin + 'static,
-    P::Message: Message + Clone + Unpin + 'static,
-    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send + Unpin,
+    P: Processor<TcpStream> + Clone + Send + Sync + 'static,
+    P::Message: Message + Default + Clone + Send,
+    P::Transport: Sink<P::Message> + Stream<Item = Result<P::Message, ProtocolError>> + Send,
     <P::Transport as Sink<P::Message>>::Error: std::error::Error,
-    R: Service<Vec<P::Message>> + Clone + Send + Sync + 'static,
+    R: Service<Vec<P::Message>> + Clone + Send + 'static,
     R::Error: Into<GenericError> + Send + Sync,
     R::Response: IntoIterator<Item = Response<P::Message>> + Send,
     R::Future: Future + Send + Unpin,
-    C: Future + Clone + Send + Sync + Unpin + 'static,
+    C: Future + Clone + Send + Unpin + 'static,
 {
     let task = async move {
         let close2 = close.clone();
         let mut close = close.fuse();
         let mut incoming = listener.incoming().fuse();
+
+        let client_stack = ServiceBuilder::new()
+            .layer(TimingLayer::new(&mut sink, "client_e2e"))
+            .layer(ShuntLayer::new())
+            .layer(FragmentLayer::new(processor.clone()));
 
         loop {
             // Stop ourselves if need be.
@@ -240,18 +243,15 @@ where
                             warden.increment();
                             sink.record_counter("clients_connected", 1);
 
-                            let router = router.clone();
-                            let processor = processor.clone();
                             let close = close2.clone().fuse();
                             let warden = warden.clone();
                             let mut sink2 = sink.clone();
                             let client_addr = client.peer_addr().unwrap();
                             debug!(message = "client connected", client.addr = ?client_addr);
 
+                            let client_stack = client_stack.clone().service(router.clone());
                             let transport = processor.get_transport(client);
-                            let fragment = Fragment::new(router, processor);
-                            let timing = Timing::new(fragment, &mut sink, "client_e2e");
-                            let mut pipeline = Pipeline::new(transport, timing);
+                            let mut pipeline = Pipeline::new(transport, client_stack);
 
                             tokio::spawn(async move {
                                 let mut pf = pipeline

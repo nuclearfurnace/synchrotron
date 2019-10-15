@@ -13,6 +13,7 @@ mod redis_tests {
     use std::time::Duration;
     use redis::cmd as redis_cmd;
     use redis::Client as RedisClient;
+    use redis::Value as RedisValue;
     use redis::{Commands, RedisResult, ErrorKind as RedisErrorKind};
     use daemons::get_redis_daemons;
 
@@ -202,7 +203,7 @@ mod redis_tests {
         let _: () = conn.set("two", 4).unwrap();
 
         // Wait for a hot second just to make sure the shadow pool is hit.
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(500));
 
         // Both pools should have the same value now.
         let value3: isize = r1conn.get("two").unwrap();
@@ -210,7 +211,6 @@ mod redis_tests {
 
         let value4: isize = r2conn.get("two").unwrap();
         assert_eq!(value4, 4);
-
     }
 
     #[test]
@@ -272,5 +272,47 @@ mod redis_tests {
         // it means it tried the downed server again.
         let result: RedisResult<isize> = conn.get("two");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_reply() {
+        let (sd, _rd1, _rd2) = get_redis_daemons();
+
+        let client = RedisClient::open(sd.get_fixed_conn_str()).unwrap();
+        let conn = client.get_connection().unwrap();
+
+        // Make sure our connection is up and set two values.
+        let _: () = conn.set("one", 1).unwrap();
+        let value: isize = conn.get("one").unwrap();
+        assert_eq!(value, 1);
+
+        let _: () = conn.set("two", 2).unwrap();
+        let value: isize = conn.get("two").unwrap();
+        assert_eq!(value, 2);
+
+        // Test out reply skipping.
+        let reply_skip = redis_cmd("CLIENT").arg("REPLY").arg("SKIP").get_packed_command();
+        let reply_on = redis_cmd("CLIENT").arg("REPLY").arg("ON").get_packed_command();
+        let reply_off = redis_cmd("CLIENT").arg("REPLY").arg("OFF").get_packed_command();
+        let get_one = redis_cmd("GET").arg("one").get_packed_command();
+        let get_two = redis_cmd("GET").arg("two").get_packed_command();
+
+        // Skip a single response.
+        let _ = conn.send_packed_command(&reply_skip).unwrap();
+        let _ = conn.send_packed_command(&get_two).unwrap();
+        let _ = conn.send_packed_command(&get_one).unwrap();
+        let value: RedisValue = conn.recv_response().unwrap();
+        assert_eq!(value, RedisValue::Data(vec![u8::from_ne_bytes(*b"1")]));
+
+        // Turn off replies entirely.
+        let _ = conn.send_packed_command(&reply_off).unwrap();
+        let _ = conn.send_packed_command(&get_two).unwrap();
+        let _ = conn.send_packed_command(&get_one).unwrap();
+
+        // Now turn them back on.
+        let _ = conn.send_packed_command(&reply_on).unwrap();
+        let _ = conn.send_packed_command(&get_two).unwrap();
+        let value: RedisValue = conn.recv_response().unwrap();
+        assert_eq!(value, RedisValue::Okay);
     }
 }

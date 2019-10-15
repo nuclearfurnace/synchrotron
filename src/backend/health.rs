@@ -49,7 +49,7 @@ impl BackendHealth {
             error_limit,
             error_count: 0,
             in_cooloff: false,
-            epoch: 0,
+            epoch: 1,
             cooloff_done_at: now,
             delay: delay(now),
         }

@@ -19,4 +19,5 @@
 // SOFTWARE.
 pub mod errors;
 pub mod redis;
+pub mod mock;
 // pub mod memcached;

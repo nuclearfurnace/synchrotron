@@ -23,16 +23,8 @@ use crate::{
     util::Sizable,
 };
 use btoi::btoi;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::prelude::*;
-use nom::{
-  IResult,
-  Err as NomErr,
-  branch::alt,
-  combinator::map,
-  bytes::complete::tag,
-  character::complete::crlf,
-  sequence::terminated};
 use tokio::io::{write_all, AsyncRead, AsyncWrite, Error, ErrorKind};
 use std::str;
 use std::pin::Pin;
@@ -70,9 +62,7 @@ where
 #[derive(Clone, Debug, PartialEq)]
 pub enum MemcachedCommand {
     Get,
-    Gets,
     Gat,
-    Gats,
     Set,
     Delete,
     Add,
@@ -87,15 +77,15 @@ pub enum MemcachedCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MemcachedMessage {
-    Storage(BytesMut, MemcachedCommand, Option<StorageOptions>),
-    Retrieval(BytesMut, MemcachedCommand, Option<RetrievalOptions>),
-    Data(BytesMut),
-    Unstructured(BytesMut),
-    Status(BytesMut),
+    Storage(Bytes, MemcachedCommand, Option<StorageOptions>),
+    Retrieval(Bytes, MemcachedCommand, RetrievalOptions),
+    Data(Bytes),
+    Unstructured(Bytes),
+    Status(Bytes),
     GeneralError,
-    ClientError(BytesMut),
-    ServerError(BytesMut),
-    Raw(BytesMut),
+    ClientError(Bytes),
+    ServerError(Bytes),
+    Raw(Bytes),
     Version,
     Quit,
 }
@@ -110,7 +100,8 @@ pub struct StorageOptions {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetrievalOptions {
-    expiration: u64,
+    expiration: Option<u64>,
+    keys: Vec<Bytes>,
 }
 
 impl MemcachedMessage {
@@ -212,7 +203,7 @@ impl Message for MemcachedMessage {
         match self {
             MemcachedMessage::Retrieval(buf, cmd, _) => {
                 match cmd {
-                    MemcachedCommand::Gat | MemcachedCommand::Gats => {
+                    MemcachedCommand::Gat => {
                         buf.split(|c| *c == 0x20).nth(2).expect("message has no key field")
                     },
                     _ => buf.split(|c| *c == 0x20).nth(1).expect("message has no key field"),
@@ -416,32 +407,6 @@ where
     MemcachedMultipleMessages::new(rx, msgs)
 }
 
-fn parse_message(input: &[u8]) -> Poll<(usize, MemcachedMessage), ProtocolError> {
-    let start = input.len();
-    match alt((cmd_quit, cmd_version))(input) {
-        Ok((remaining, msg)) => {
-            let count = start - remaining.len();
-            Ok(Async::Ready((count, msg)))
-        },
-        Err(NomErr::Incomplete(_)) => Ok(Async::NotReady),
-        Err(_) => Err(ProtocolError::InvalidProtocol),
-    }
-}
-
-fn cmd_quit(input: &[u8]) -> IResult<&[u8], MemcachedMessage> {
-    map(
-        terminated(tag(b"quit"), crlf),
-        |_| MemcachedMessage::Quit,
-    )(input)
-}
-
-fn cmd_version(input: &[u8]) -> IResult<&[u8], MemcachedMessage> {
-    map(
-        terminated(tag(b"version"), crlf),
-        |_| MemcachedMessage::Version,
-    )(input)
-}
-
 fn read_message(rd: &mut BytesMut) -> Poll<(usize, MemcachedMessage), ProtocolError> {
     // Check to see if we got any inline commands.
     //
@@ -541,33 +506,35 @@ fn read_unstructured(rd: &mut BytesMut) -> Poll<(usize, MemcachedMessage), Proto
 fn read_retrieval(rd: &mut BytesMut) -> Poll<(usize, MemcachedMessage), ProtocolError> {
     // Make sure there's at least a CRLF-terminated line in the buffer.
     let pos = try_ready!(read_line(rd));
-    let buf = rd.split_to(pos + 2);
+    let mut buf = rd.split_to(pos + 2).freeze();
 
     // Figure out which get command it is.
-    let cmd = if buf.starts_with(b"get") {
+    let cmd = if buf.starts_with(b"get") || buf.starts_with(b"gets") {
         MemcachedCommand::Get
-    } else if buf.starts_with(b"gets") {
-        MemcachedCommand::Gets
-    } else if buf.starts_with(b"gat") {
+    } else if buf.starts_with(b"gat") || buf.starts_with(b"gats") {
         MemcachedCommand::Gat
-    } else if buf.starts_with(b"gats") {
-        MemcachedCommand::Gats
     } else {
         unreachable!("read_retrieval called for command that is not get/gets/gat/gats");
     };
 
-    let options = if cmd == MemcachedCommand::Gat || cmd == MemcachedCommand::Gats {
+    let expiration = if cmd == MemcachedCommand::Gat {
         // We have to pull out the first "key" as it's actually the expiration time to reset all of
         // the keys to in the given command.
-        let expiration = &buf[..pos-2].split(|c| *c == 0x20)
+        &buf[..pos-2].split(|c| *c == 0x20)
             .nth(1)
             .ok_or(ProtocolError::InvalidProtocol)
-            .and_then(|b| btoi::<u64>(b).map_err(|_| ProtocolError::InvalidProtocol))?;
-
-        Some(RetrievalOptions { expiration: *expiration })
+            .and_then(|b| btoi::<u64>(b).map_err(|_| ProtocolError::InvalidProtocol))?
     } else {
-        None
+        0
     };
+
+    let keys = {
+        // Split all the keys to get their bounds.
+        let mut start = 0;
+        // TODO TODO TODO
+    };
+
+    let options = RetrievalOptions { expiration: *expiration, keys };
 
     Ok(Async::Ready((pos + 2, MemcachedMessage::Retrieval(buf, cmd, options))))
 }

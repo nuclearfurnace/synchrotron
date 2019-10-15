@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use crate::service::Service;
 use crate::common::GenericError;
 use std::future::Future;
 use std::task::{Context, Poll};
@@ -7,28 +6,46 @@ use std::pin::Pin;
 
 use futures::ready;
 use metrics_runtime::{Sink, data::Histogram};
+use tower::{Service, layer::Layer};
 use quanta::Clock;
 
-pub struct Timing<S> {
+#[derive(Clone)]
+pub struct TimingLayer {
     hist: Arc<Histogram>,
-    service: S,
     clock: Arc<Clock>,
 }
 
-impl<S> Timing<S> {
-    pub fn new<K>(service: S, sink: &mut Sink, key: K) -> Self
+impl TimingLayer {
+    pub fn new<K>(sink: &mut Sink, key: K) -> Self
     where
         K: Into<String>,
     {
         let hist = sink.histogram(key.into());
         let clock = Clock::new();
 
-        Timing {
-            service,
+        TimingLayer {
             hist: Arc::new(hist),
             clock: Arc::new(clock),
         }
     }
+}
+
+impl<S> Layer<S> for TimingLayer {
+    type Service = Timing<S>;
+
+    fn layer(&self, service: S) -> Self::Service {
+        Timing {
+            service,
+            hist: self.hist.clone(),
+            clock: self.clock.clone(),
+        }
+    }
+}
+
+pub struct Timing<S> {
+    hist: Arc<Histogram>,
+    service: S,
+    clock: Arc<Clock>,
 }
 
 impl<S, Request> Service<Request> for Timing<S>

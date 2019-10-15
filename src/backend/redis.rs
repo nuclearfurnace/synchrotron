@@ -25,15 +25,18 @@ use crate::{
     protocol::{
         redis::{self, RedisMessage, RedisTransport},
     },
+    util,
 };
-use async_trait::async_trait;
 use bytes::BytesMut;
 use itoa;
-use std::{borrow::Borrow, error::Error, net::SocketAddr};
+use std::{fmt::Display, net::SocketAddr};
 use tokio::net::TcpStream;
 
-const REDIS_DEL: &[u8] = b"del";
-const REDIS_SET: &[u8] = b"set";
+const REDIS_MGET: &[u8] = b"MGET";
+const REDIS_MSET: &[u8] = b"MSET";
+const REDIS_DEL: &[u8] = b"DEL";
+const REDIS_SET: &[u8] = b"SET";
+const REDIS_GET: &[u8] = b"GET";
 
 #[derive(Clone)]
 pub struct RedisProcessor;
@@ -42,8 +45,7 @@ impl RedisProcessor {
     pub fn new() -> RedisProcessor { RedisProcessor {} }
 }
 
-#[async_trait]
-impl Processor for RedisProcessor {
+impl Processor<TcpStream> for RedisProcessor {
     type Message = RedisMessage;
     type Transport = RedisTransport<TcpStream>;
 
@@ -55,33 +57,36 @@ impl Processor for RedisProcessor {
         redis_defragment_message(fragments)
     }
 
-    fn get_error_message(&self, e: Box<dyn Error>) -> Self::Message { RedisMessage::from_error(e) }
+    fn get_error_message<E: Display>(&self, e: E) -> Self::Message { RedisMessage::from_error(e) }
 
-    fn get_error_message_str(&self, e: &str) -> Self::Message { RedisMessage::from_error_str(e) }
+    fn get_transport(&self, client: TcpStream) -> Self::Transport {
+        RedisTransport::new(client)
+    }
 
-    fn get_transport(&self, client: TcpStream) -> Self::Transport { RedisTransport::new(client) }
-
-    fn preconnect(&self, addr: SocketAddr, noreply: bool) -> ConnectionFuture {
+    fn preconnect(&self, addr: SocketAddr, noreply: bool) -> ConnectionFuture<TcpStream> {
         let inner = async move {
             tracing::debug!("trying to establish redis connection");
             let mut conn = TcpStream::connect(&addr).await?;
             tracing::debug!("got redis connection");
             if noreply {
-                let noreply_req = RedisMessage::from_inline("CLIENT REPLY OFF");
+                let noreply_req = RedisMessage::from_inline("CLIENT REPLY OFF", false);
                 tracing::debug!("about to configure redis noreply on new connection");
                 redis::write_raw_message(&mut conn, noreply_req).await?;
             }
 
+            tracing::debug!("handing back new connection");
             Ok(conn)
         };
 
         ConnectionFuture::new(inner)
     }
 
-    fn process(&self, req: EnqueuedRequests<Self::Message>, mut conn: TcpStream) -> ConnectionFuture {
+    fn process(&self, req: EnqueuedRequests<Self::Message>, mut conn: TcpStream) -> ConnectionFuture<TcpStream> {
         let inner = async move {
             let (msgs, _n) = redis::write_messages(&mut conn, req).await?;
+            tracing::debug!("wrote messages to backend");
             let _n = redis::read_messages(&mut conn, msgs).await?;
+            tracing::debug!("read back any responses from backend");
             Ok(conn)
         };
 
@@ -102,17 +107,18 @@ fn redis_fragment_message(msg: RedisMessage) -> Result<Vec<(MessageState, RedisM
         fragments.push((state, msg));
     } else {
         match msg {
-            RedisMessage::Bulk(_, mut args) => {
+            RedisMessage::Bulk(_, mut args, needs_reply) => {
                 // Split off the actual command string and figure out what the new command string
                 // will be for our fragments.
                 let cmd = args.remove(0);
                 let cmd_buf = redis_get_data_buffer(&cmd);
                 let new_cmd_buf = match cmd_buf {
                     Some(buf) => {
-                        match buf {
-                            b"mget" => b"get",
-                            b"del" => b"del",
-                            b"mset" => b"set",
+                        let ubuf = util::to_upper_owned(buf);
+                        match &ubuf as &[u8] {
+                            REDIS_MGET => REDIS_GET,
+                            REDIS_DEL => REDIS_DEL,
+                            REDIS_MSET => REDIS_SET,
                             x => {
                                 return Err(ProcessorError::FragmentError(format!(
                                     "tried to fragment command '{:?}' but command is not fragmentable!",
@@ -136,8 +142,9 @@ fn redis_fragment_message(msg: RedisMessage) -> Result<Vec<(MessageState, RedisM
                 let cmd_arg = redis_new_data_buffer(&new_cmd_buf[..]);
                 let mut cmd_type = BytesMut::with_capacity(new_cmd_buf.len());
                 cmd_type.extend_from_slice(&new_cmd_buf[..]);
+                let mut cmd_type = Some(cmd_type);
 
-                let arg_take_cnt = if new_cmd_buf == b"set" { 2 } else { 1 };
+                let arg_take_cnt = if new_cmd_buf == REDIS_SET { 2 } else { 1 };
                 let total_fragments = args.len();
 
                 // Make sure we won't be left with extra arguments.
@@ -150,18 +157,6 @@ fn redis_fragment_message(msg: RedisMessage) -> Result<Vec<(MessageState, RedisM
                     )));
                 }
 
-                // For get requests, we can stream back the fragments so long as they're in
-                // order.  We also need to make sure we provide the proper header (aka the data
-                // that tells the client the response is going to be multiple items) to the
-                // first fragment so that we generate valid output.
-                let is_streaming = new_cmd_buf == b"get";
-                let mut streaming_hdr = if is_streaming {
-                    Some(redis_new_bulk_buffer(total_fragments))
-                } else {
-                    None
-                };
-
-                let mut fragment_count = 0;
                 while !args.is_empty() {
                     // This is contorted but we split off the first N arguments, which leaves `args`
                     // with those N and `new_args` with the rest.  We feed those to a function which
@@ -169,20 +164,14 @@ fn redis_fragment_message(msg: RedisMessage) -> Result<Vec<(MessageState, RedisM
                     // so that we can continue on.
                     let new_args = args.split_off(arg_take_cnt);
                     args.insert(0, cmd_arg.clone());
-                    let new_bulk = redis_new_bulk_from_args(args);
-                    let is_last = new_args.is_empty();
+                    let new_bulk = redis_new_bulk_from_args(args, needs_reply);
 
-                    let state = if is_streaming {
-                        MessageState::StreamingFragmented(streaming_hdr.take(), is_last)
-                    } else {
-                        // Normal fragments need to know the command they're being used for so
-                        // we can properly form a command-specific response when we ultimate
-                        // defragment these messages later on.
-                        MessageState::Fragmented(cmd_type.clone(), fragment_count, total_fragments)
-                    };
+                    // Give the command type to the very first fragment we generate, so that the
+                    // defragmenter can probe that upfront and know what to do.  We only need to
+                    // read it once during defragmentation.
+                    let state = MessageState::Fragmented(cmd_type.take());
 
                     fragments.push((state, new_bulk));
-                    fragment_count += 1;
                     args = new_args;
                 }
             },
@@ -212,7 +201,7 @@ fn redis_defragment_message(mut fragments: Vec<(MessageState, RedisMessage)>) ->
     // something isn't right and we need to bomb out.
     let first = fragments.first().unwrap();
     let cmd_type = match first {
-        (MessageState::Fragmented(buf, _, _), _) => buf.clone(),
+        (MessageState::Fragmented(Some(buf)), _) => buf.clone(),
         _ => {
             return Err(ProcessorError::DefragmentError(
                 "tried to defragment messages, but got non-fragmented message in list".to_owned(),
@@ -221,7 +210,7 @@ fn redis_defragment_message(mut fragments: Vec<(MessageState, RedisMessage)>) ->
     };
 
     // We have the command type, so let's actually defragment now.
-    match cmd_type.borrow() {
+    match &cmd_type as &[u8] {
         // DEL returns the number of keys it deleted, so we have to tally up the integer responses.
         REDIS_DEL => {
             let mut keys_deleted = 0;
@@ -256,6 +245,11 @@ fn redis_defragment_message(mut fragments: Vec<(MessageState, RedisMessage)>) ->
 
             Ok(RedisMessage::OK)
         },
+        REDIS_GET => {
+            let args = fragments.into_iter().map(|(_, fragment)| fragment).collect();
+            let complete = redis_new_bulk_from_args(args, false);
+            Ok(complete)
+        },
         x => {
             Err(ProcessorError::DefragmentError(format!(
                 "unknown command type '{:?}'",
@@ -274,15 +268,16 @@ fn redis_get_data_buffer(msg: &RedisMessage) -> Option<&[u8]> {
 
 fn redis_is_multi_message(msg: &RedisMessage) -> bool {
     match msg {
-        RedisMessage::Bulk(_, args) => {
+        RedisMessage::Bulk(_, args, _) => {
             match args.len() {
                 0 => false,
                 _ => {
                     let arg = &args[0];
                     match redis_get_data_buffer(arg) {
                         Some(buf) => {
-                            match buf {
-                                b"mget" | b"mset" | b"del" => true,
+                            let ubuf = util::to_upper_owned(buf);
+                            match &ubuf as &[u8] {
+                                REDIS_MGET | REDIS_MSET | REDIS_DEL => true,
                                 _ => false,
                             }
                         },
@@ -326,7 +321,7 @@ fn redis_new_bulk_buffer(arg_count: usize) -> BytesMut {
     buf
 }
 
-fn redis_new_bulk_from_args(args: Vec<RedisMessage>) -> RedisMessage {
+fn redis_new_bulk_from_args(args: Vec<RedisMessage>, needs_reply: bool) -> RedisMessage {
     let mut buf = redis_new_bulk_buffer(args.len());
     let mut new_args = Vec::new();
     for arg in args {
@@ -336,13 +331,14 @@ fn redis_new_bulk_from_args(args: Vec<RedisMessage>) -> RedisMessage {
         new_args.push(arg);
     }
 
-    RedisMessage::Bulk(buf, new_args)
+    RedisMessage::Bulk(buf, new_args, needs_reply)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+    use lazy_static::lazy_static;
 
     const STATUS_BUF: &str = "StAtUs_BuF";
     const DATA_BUF: &[u8; 8] = b"DaTa_BuF";
@@ -360,9 +356,9 @@ mod tests {
         static ref DATA_MSG_2: RedisMessage = redis_new_data_buffer(&DATA_BUF_2[..]);
         static ref DATA_MSG_3: RedisMessage = redis_new_data_buffer(&DATA_BUF_3[..]);
         static ref BULK_MSG: RedisMessage =
-            redis_new_bulk_from_args(vec![DATA_MSG.clone(), DATA_MSG_2.clone(), DATA_MSG_3.clone()]);
+            redis_new_bulk_from_args(vec![DATA_MSG.clone(), DATA_MSG_2.clone(), DATA_MSG_3.clone()], true);
         static ref BULK_MULTI_MSG: RedisMessage =
-            redis_new_bulk_from_args(vec![DATA_MSG_3.clone(), DATA_MSG_2.clone(), DATA_MSG.clone()]);
+            redis_new_bulk_from_args(vec![DATA_MSG_3.clone(), DATA_MSG_2.clone(), DATA_MSG.clone()], true);
     }
 
     #[test]
@@ -395,5 +391,75 @@ mod tests {
         assert!(dm_buf.is_some());
         assert_eq!(dm_buf, Some(&DATA_BUF[..]));
         assert!(bm_buf.is_none());
+    }
+
+    #[test]
+    fn test_fragment_messages() {
+        match redis_fragment_message(RedisMessage::Ping) {
+            Ok(mut fragments) => {
+                assert_eq!(fragments.len(), 1);
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Inline);
+                assert_eq!(fragment, RedisMessage::Ping);
+            },
+            Err(_) => panic!("should not panic"),
+        }
+
+        let simple_get = RedisMessage::from_inline("GET foo", true);
+        match redis_fragment_message(simple_get.clone()) {
+            Ok(mut fragments) => {
+                assert_eq!(fragments.len(), 1);
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Standalone);
+                assert_eq!(fragment, simple_get);
+            },
+            Err(_) => panic!("should not panic"),
+        }
+
+
+        let multi_get = RedisMessage::from_inline("MGET foo bar", true);
+        let fragment_ident = BytesMut::from(REDIS_GET);
+        match redis_fragment_message(multi_get) {
+            Ok(mut fragments) => {
+                assert_eq!(fragments.len(), 2);
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Fragmented(Some(fragment_ident)));
+                assert_eq!(fragment, RedisMessage::from_inline("GET foo", true));
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Fragmented(None));
+                assert_eq!(fragment, RedisMessage::from_inline("GET bar", true));
+            },
+            Err(_) => panic!("should not panic"),
+        }
+
+        let multi_set = RedisMessage::from_inline("MSET foo bar baz quux", true);
+        let fragment_ident = BytesMut::from(REDIS_SET);
+        match redis_fragment_message(multi_set) {
+            Ok(mut fragments) => {
+                assert_eq!(fragments.len(), 2);
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Fragmented(Some(fragment_ident)));
+                assert_eq!(fragment, RedisMessage::from_inline("SET foo bar", true));
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Fragmented(None));
+                assert_eq!(fragment, RedisMessage::from_inline("SET baz quux", true));
+            },
+            Err(_) => panic!("should not panic"),
+        }
+
+        let del = RedisMessage::from_inline("DEL foo quux", true);
+        let fragment_ident = BytesMut::from(REDIS_DEL);
+        match redis_fragment_message(del) {
+            Ok(mut fragments) => {
+                assert_eq!(fragments.len(), 2);
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Fragmented(Some(fragment_ident)));
+                assert_eq!(fragment, RedisMessage::from_inline("DEL foo", true));
+                let (state, fragment) = fragments.remove(0);
+                assert_eq!(state, MessageState::Fragmented(None));
+                assert_eq!(fragment, RedisMessage::from_inline("DEL quux", true));
+            },
+            Err(_) => panic!("should not panic"),
+        }
     }
 }

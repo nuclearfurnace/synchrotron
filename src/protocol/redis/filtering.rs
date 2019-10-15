@@ -17,6 +17,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+use crate::util;
 use phf::phf_set;
 
 static VALID_COMMANDS: phf::Set<&'static str> = phf_set! {
@@ -127,22 +128,11 @@ static VALID_COMMANDS: phf::Set<&'static str> = phf_set! {
 };
 
 pub fn check_command_validity(cmd: &[u8]) -> bool {
-    // This is goofy but redis only supports commands with ASCII characters, so we munge
-    // these bytes to make sure that, if they were lowercase ASCII, they now become
-    // uppercase ASCII... and we do it by hand instead of using str::to_uppercase because
-    // this is 2x as fast. Really feels stupid to pay a constant perf penalty if we don't
-    // really have to.  Could probably unroll this to work on 8-byte chunks, 4-byte chunks,
-    // etc, but that'd require full on pointers and this is good enough for now, I think.
+    // Our to_upper is 2x as fast as str::to_uppercase, because we only need to care about
+    // uppercasing ASCII characters, since that's all Redis supports for commands.
     let mut c = cmd.to_owned();
     let m = c.as_mut_slice();
-
-    let count = m.len();
-    let mut offset = 0;
-
-    while offset < count {
-        m[offset] = m[offset] & 0b11011111;
-        offset += 1;
-    }
+    util::to_upper(m);
 
     let as_str = unsafe { std::str::from_utf8_unchecked(m) };
     VALID_COMMANDS.contains(as_str)

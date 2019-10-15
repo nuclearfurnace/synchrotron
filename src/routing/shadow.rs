@@ -24,22 +24,20 @@ use crate::{
 use futures::stream::{Stream, futures_unordered::FuturesUnordered};
 use std::{
     future::Future,
-    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
 use tokio::sync::mpsc;
-use crate::service::Service;
+use tower::Service;
 use pin_project::pin_project;
 
 #[derive(Derivative)]
 #[derivative(Clone)]
 pub struct ShadowRouter<P, S>
 where
-    P: Processor + Clone + Unpin,
-    P::Message: Message + Clone,
-    S: Service<EnqueuedRequests<P::Message>> + Clone,
-    S::Future: Future + Send,
+    P: Processor,
+    S: Service<EnqueuedRequests<P::Message>>,
+    S::Future: Send,
 {
     processor: P,
     default_inner: S,
@@ -48,46 +46,39 @@ where
 }
 
 #[pin_project]
-struct ShadowWorker<S, Request>
-where
-    S: Service<Request>,
-{
+struct ShadowWorker<F: Future> {
     #[pin]
-    rx: mpsc::UnboundedReceiver<S::Future>,
+    rx: mpsc::UnboundedReceiver<F>,
     finish: bool,
     #[pin]
-    inner: FuturesUnordered<S::Future>,
-    _service: PhantomData<S>,
+    inner: FuturesUnordered<F>,
 }
 
-impl<S, Request> ShadowWorker<S, Request>
-where
-    S: Service<Request>,
-{
-    pub fn new(rx: mpsc::UnboundedReceiver<S::Future>) -> ShadowWorker<S, Request> {
+impl<F: Future> ShadowWorker<F> {
+    pub fn new(rx: mpsc::UnboundedReceiver<F>) -> ShadowWorker<F> {
         ShadowWorker {
             rx,
             finish: false,
             inner: FuturesUnordered::new(),
-            _service: PhantomData,
         }
     }
 }
 
-impl<S, Request> Future for ShadowWorker<S, Request>
-where
-    S: Service<Request>,
-{
+impl<F: Future> Future for ShadowWorker<F> {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         if !*this.finish {
             while let Poll::Ready(result) = this.rx.as_mut().poll_next(cx) {
                 match result {
-                    Some(fut) => this.inner.push(fut),
+                    Some(fut) => {
+                        this.inner.push(fut);
+                        tracing::debug!("pushed pending response into queue");
+                    },
                     None => {
                         *this.finish = true;
+                        tracing::debug!("marked as finished");
                         break;
                     },
                 }
@@ -98,11 +89,14 @@ where
         while let Poll::Ready(result) = this.inner.as_mut().poll_next(cx) {
             match result {
                 // These are successful results, so we just drop the value and keep on moving on.
-                Some(_) => {},
+                Some(_) => {
+                    tracing::debug!("processed a response");
+                },
                 // If we have no more futures to drive, and we've been instructed to close, it's
                 // time to go.
                 None => {
                     if *this.finish {
+                        tracing::debug!("finished");
                         return Poll::Ready(());
                     } else {
                         break;
@@ -117,16 +111,16 @@ where
 
 impl<P, S> ShadowRouter<P, S>
 where
-    P: Processor + Clone + Unpin,
-    P::Message: Message + Clone + Send + 'static,
-    S: Service<EnqueuedRequests<P::Message>> + Clone + Send + 'static,
-    S::Future: Future + Send,
+    P: Processor,
+    P::Message: Send,
+    S: Service<EnqueuedRequests<P::Message>> + Send,
+    S::Future: Send + 'static,
 {
     pub fn new(processor: P, default_inner: S, shadow_inner: S) -> ShadowRouter<P, S> {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Spin off a task that drives all of the shadow responses.
-        let shadow: ShadowWorker<S, EnqueuedRequests<P::Message>> = ShadowWorker::new(rx);
+        let shadow = ShadowWorker::new(rx);
         tokio::spawn(shadow);
 
         ShadowRouter {
@@ -140,10 +134,10 @@ where
 
 impl<P, S> Service<Vec<P::Message>> for ShadowRouter<P, S>
 where
-    P: Processor + Clone + Unpin,
-    P::Message: Message + Clone,
-    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
-    S::Future: Future + Send,
+    P: Processor,
+    P::Message: Message + Clone + Send,
+    S: Service<EnqueuedRequests<P::Message>>,
+    S::Future: Send,
 {
     type Error = S::Error;
     type Future = S::Future;

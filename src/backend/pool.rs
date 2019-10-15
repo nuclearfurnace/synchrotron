@@ -26,52 +26,54 @@ use crate::{
     common::{EnqueuedRequests, Message, Responses, GenericError},
     conf::PoolConfiguration,
     errors::CreationError,
-    service::DrivenService,
+    service::{DrivenService, Facade},
     util::IntegerMappedVec,
 };
+use std::marker::PhantomData;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use metrics_runtime::Sink as MetricSink;
+use tokio_executor::DefaultExecutor;
+use tokio::io::{AsyncRead, AsyncWrite};
 use std::{
     collections::HashMap,
     task::{Context, Poll},
 };
 
-pub struct BackendPool<P>
+type BufferedPool<P, RW, T> = Facade<BackendPool<P, RW>, EnqueuedRequests<T>>;
+
+pub struct BackendPool<P, RW>
 where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Send + Sync,
+    P: Processor<RW> + Clone + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     distributor: Box<dyn Distributor>,
     key_hasher: Box<dyn KeyHasher>,
-    backends: Vec<Backend<P>>,
-    noreply: bool,
+    backends: Vec<Backend<P, RW>>,
     epoch: u64,
     sink: MetricSink,
 }
 
-impl<P> BackendPool<P>
+impl<P, RW> BackendPool<P, RW>
 where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Send + Sync,
+    P: Processor<RW> + Clone + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     pub fn new(
-        backends: Vec<Backend<P>>,
+        backends: Vec<Backend<P, RW>>,
         distributor: Box<dyn Distributor>,
         key_hasher: Box<dyn KeyHasher>,
-        noreply: bool,
         sink: MetricSink,
-    ) -> BackendPool<P> {
-        let mut pool = BackendPool {
+    ) -> BackendPool<P, RW> {
+        BackendPool {
             distributor,
             key_hasher,
             backends,
-            noreply,
             epoch: 0,
             sink,
-        };
-        pool.regenerate_distribution();
-        pool
+        }
     }
 
     pub fn regenerate_distribution(&mut self) {
@@ -95,13 +97,15 @@ where
     }
 }
 
-impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendPool<P>
+impl<P, RW> DrivenService<EnqueuedRequests<P::Message>> for BackendPool<P, RW>
 where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Send + Sync + 'static,
+    P: Processor<RW> + Clone + Send + Sync,
+    P::Message: Message + Send + 'static,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     type Error = GenericError;
-    type Future = Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync + Unpin>;
+    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
+    //type Future = Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Unpin>;
     type Response = Responses<P::Message>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -109,16 +113,11 @@ where
         let mut epoch = 0;
         for backend in &mut self.backends {
             let name = backend.get_descriptor().identifier;
-            match backend.poll_ready(cx) {
-                Poll::Ready(Ok(())) => {
-                    tracing::debug!(message = "backend is ready", ?name);
-                    any_ready = true
-                },
-                // Catch everything else.  We don't immediately return an error because
-                // we need to be able to update the state of the pool.
-                //
-                // TODO: should we return an error if no backends are ready?
-                _ => {},
+
+            // We don't bother with the other states because we're effectively shunting errors.
+            if let Poll::Ready(Ok(())) = backend.poll_ready(cx) {
+                tracing::debug!(message = "backend is ready", %name);
+                any_ready = true
             }
 
             epoch += backend.health().epoch();
@@ -172,6 +171,8 @@ where
     }
 
     fn call(&mut self, msgs: EnqueuedRequests<P::Message>) -> Self::Future {
+        tracing::debug!("calling backends for fragmented requests");
+
         // Dispatch all requests to their respective backends.
         let mut futs = FuturesOrdered::new();
         let mut batches = IntegerMappedVec::new();
@@ -180,6 +181,7 @@ where
             let msg_key = msg.key();
             let msg_hashed = self.key_hasher.hash(msg_key);
             let backend_idx = self.distributor.choose(msg_hashed);
+            tracing::debug!(message = "assigning to batch", backend_idx, ?msg_key);
 
             batches.push(backend_idx, msg);
         }
@@ -189,40 +191,56 @@ where
             futs.push(fut);
         }
 
-        Box::new(futs.collect::<Vec<_>>().map(|xs| {
-            let mut responses = Vec::new();
-            for x in xs {
-                match x {
-                    Ok(resp) => responses.extend(resp),
-                    Err(e) => return Err(e),
+        futs
+            .collect::<Vec<_>>()
+            .map(|xs| {
+                let mut responses = Vec::new();
+                for x in xs {
+                    responses.extend(x?);
                 }
-            }
-            Ok(responses)
-        }))
+                Ok(responses)
+            })
     }
 }
 
-pub struct BackendPoolBuilder<P>
-where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Send + Sync,
-{
+pub struct BackendPoolBuilder<P, RW> {
+    name: String,
     processor: P,
+    _rw: PhantomData<RW>,
     config: PoolConfiguration,
     noreply: bool,
     sink: MetricSink,
 }
 
-impl<P> BackendPoolBuilder<P>
+impl<P, RW> Clone for BackendPoolBuilder<P, RW>
 where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Send + Sync,
+    P: Clone,
 {
-    pub fn new(name: String, processor: P, config: PoolConfiguration, mut sink: MetricSink) -> BackendPoolBuilder<P> {
-        sink.add_default_labels(&[("pool", name)]);
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            processor: self.processor.clone(),
+            _rw: PhantomData,
+            config: self.config.clone(),
+            noreply: self.noreply,
+            sink: self.sink.clone(),
+        }
+    }
+}
+
+impl<P, RW> BackendPoolBuilder<P, RW>
+where
+    P: Processor<RW> + Clone + Send + Sync + 'static,
+    P::Message: Message + Send + 'static,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
+{
+    pub fn new(name: String, processor: P, config: PoolConfiguration, mut sink: MetricSink) -> BackendPoolBuilder<P, RW> {
+        sink.add_default_labels(&[("pool", name.clone())]);
 
         BackendPoolBuilder {
+            name,
             processor,
+            _rw: PhantomData,
             config,
             noreply: false,
             sink,
@@ -234,11 +252,7 @@ where
         self
     }
 
-    pub fn build(self) -> Result<BackendPool<P>, CreationError>
-    where
-        P: Processor + Clone + Send + Sync,
-        P::Message: Message + Send + Sync,
-    {
+    pub fn build(self) -> Result<BackendPool<P, RW>, CreationError> {
         let mut options = self.config.options.unwrap_or_else(HashMap::new);
         let dist_type = options
             .entry("distribution".to_owned())
@@ -268,6 +282,86 @@ where
             backends.push(backend);
         }
 
-        Ok(BackendPool::new(backends, distributor, hasher, self.noreply, self.sink))
+        let sink = self.sink;
+        let backend_len = backends.len();
+        tracing::debug!(message = "pool created", backend_len);
+
+        Ok(BackendPool::new(backends, distributor, hasher, sink))
+    }
+
+    pub fn build_buffered(self) -> Result<BufferedPool<P, RW, P::Message>, CreationError> {
+        let name = self.name.clone();
+        let pool = self.build()?;
+        Facade::new(pool, DefaultExecutor::current(), 32).map_err(|_| {
+            CreationError::InvalidResource(format!(
+                "error while building pool '{}': failed to spawn task",
+                name
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendPoolBuilder;
+    use crate::conf::{BackendAddress, PoolConfiguration};
+    use crate::common::EnqueuedRequest;
+    use crate::backend::processor::MockProcessor;
+    use crate::protocol::mock::MockMessage;
+    use crate::util::MockStream;
+    use crate::service::DrivenService;
+    use std::net::SocketAddr;
+    use metrics_runtime::Receiver;
+    use tokio_test::{clock::mock as clock_mock, task::MockTask};
+    use std::sync::Arc;
+
+    #[test]
+    #[should_panic]
+    fn test_backend_pool_panics_without_poll_ready() {
+        let processor = MockProcessor::<MockStream>::new();
+        let processor = Arc::new(processor);
+
+        let address = SocketAddr::new([127, 0, 0, 1].into(), 12345);
+        let config = PoolConfiguration {
+            addresses: vec![BackendAddress { address, identifier: "backend".to_owned() }],
+            options: None,
+        };
+        let receiver = Receiver::builder().build().unwrap();
+        let sink = receiver.get_sink();
+
+        let builder = BackendPoolBuilder::new("mock".to_owned(), processor, config, sink);
+        let mut pool = builder.build().unwrap();
+
+        let er = EnqueuedRequest::new(MockMessage::Empty);
+
+        let _ = pool.call(vec![er]);
+    }
+
+    #[test]
+    fn test_backend_pool() {
+        let processor = MockProcessor::<MockStream>::new();
+        let processor = Arc::new(processor);
+
+        let address = SocketAddr::new([127, 0, 0, 1].into(), 12345);
+        let config = PoolConfiguration {
+            addresses: vec![BackendAddress { address, identifier: "backend".to_owned() }],
+            options: None,
+        };
+        let receiver = Receiver::builder().build().unwrap();
+        let sink = receiver.get_sink();
+
+        let builder = BackendPoolBuilder::new("mock".to_owned(), processor, config, sink);
+        let mut pool = builder.build().unwrap();
+
+        let req = MockMessage::from_data(&b"set"[..], &b"foo"[..], Some(&b"bar"[..]));
+        let ereq = EnqueuedRequest::new(req);
+
+        clock_mock(|handle| {
+            let mut task = MockTask::new();
+            let result = task.enter(|cx| pool.poll_ready(cx));
+            assert!(result.is_ready());
+        });
+
+        let _ = pool.call(vec![ereq]);
     }
 }

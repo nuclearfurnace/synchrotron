@@ -55,7 +55,6 @@ use std::thread;
 use tokio::{
     prelude::*,
     sync::{mpsc, oneshot},
-    runtime::Builder,
 };
 
 use crate::{
@@ -107,7 +106,7 @@ fn main() {
     // Configure tracing and the default stdout subscriber.
     let fmt = FmtSubscriber::new();
     let dispatch = Dispatch::new(fmt);
-    let _ = tracing::dispatcher::set_global_default(dispatch).expect("failed to set tracing subscriber");
+    tracing::dispatcher::set_global_default(dispatch).expect("failed to set tracing subscriber");
     info!("logging configured");
 
     // Configure our metrics.  We want to do this pretty early on before anything actually tries to

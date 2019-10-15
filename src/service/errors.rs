@@ -17,22 +17,16 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use crate::{
-    protocol::errors::ProtocolError,
-    service::Service,
-};
-use std::future::Future;
+use crate::protocol::errors::ProtocolError;
 use futures::{Sink, Stream};
 use std::fmt;
-
-pub type ServiceError = Box<dyn std::error::Error + Send + Sync + 'static>;
+use tower::Service;
 
 /// Error type for `Pipeline`.
 pub enum PipelineError<T, S, Request>
 where
-    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>>,
     S: Service<Request>,
-    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
 {
     /// An error occurred while reading from the transport.
     TransportReceive(ProtocolError),
@@ -46,9 +40,8 @@ where
 
 impl<T, S, Request> PipelineError<T, S, Request>
 where
-    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>>,
     S: Service<Request>,
-    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
 {
     pub fn receive(e: ProtocolError) -> PipelineError<T, S, Request> {
         PipelineError::TransportReceive(e)
@@ -65,10 +58,9 @@ where
 
 impl<T, S, Request> fmt::Display for PipelineError<T, S, Request>
 where
-    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>>,
     <T as Sink<S::Response>>::Error: fmt::Display,
     S: Service<Request>,
-    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
     S::Error: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -82,10 +74,9 @@ where
 
 impl<T, S, Request> fmt::Debug for PipelineError<T, S, Request>
 where
-    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>> + Unpin,
+    T: Sink<S::Response> + Stream<Item = Result<Request, ProtocolError>>,
     <T as Sink<S::Response>>::Error: fmt::Debug,
     S: Service<Request>,
-    S::Future: Future<Output = Result<S::Response, S::Error>> + Unpin,
     S::Error: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

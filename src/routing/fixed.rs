@@ -21,34 +21,26 @@ use crate::{
     backend::processor::Processor,
     common::{EnqueuedRequest, EnqueuedRequests, Message},
 };
-use crate::service::Service;
+use tower::Service;
 use std::task::{Context, Poll};
 
 #[derive(Clone)]
-pub struct FixedRouter<P, S>
-where
-    P: Processor + Clone + Send + Sync + Unpin,
-    P::Message: Message + Send + Sync,
-    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
-{
+pub struct FixedRouter<P, S> {
     processor: P,
     inner: S,
 }
 
-impl<P, S> FixedRouter<P, S>
-where
-    P: Processor + Clone + Send + Sync + Unpin,
-    P::Message: Message + Send + Sync,
-    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
-{
-    pub fn new(processor: P, inner: S) -> FixedRouter<P, S> { FixedRouter { processor, inner } }
+impl<P, S> FixedRouter<P, S> {
+    pub fn new(processor: P, inner: S) -> FixedRouter<P, S> {
+        FixedRouter { processor, inner }
+    }
 }
 
 impl<P, S> Service<Vec<P::Message>> for FixedRouter<P, S>
 where
-    P: Processor + Clone +  Send + Sync + Unpin,
-    P::Message: Message + Send + Sync,
-    S: Service<EnqueuedRequests<P::Message>> + Clone + Send,
+    P: Processor,
+    P::Message: Message + Send,
+    S: Service<EnqueuedRequests<P::Message>>,
 {
     type Error = S::Error;
     type Future = S::Future;

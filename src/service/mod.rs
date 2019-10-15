@@ -22,13 +22,15 @@ mod facade;
 mod fragment;
 mod pipeline;
 mod timing;
+mod shunt;
 mod svc;
 
 pub use self::{
     errors::PipelineError,
     facade::Facade,
     pipeline::Pipeline,
-    fragment::{Fragment, FragmentResponse},
-    timing::{Timing, TimingResponse},
-    svc::{DrivenService, Service},
+    fragment::{Fragment, FragmentLayer, FragmentResponse},
+    timing::{Timing, TimingLayer, TimingResponse},
+    shunt::{Shunt, ShuntLayer, ShuntResponse},
+    svc::DrivenService,
 };

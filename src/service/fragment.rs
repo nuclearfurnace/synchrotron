@@ -1,36 +1,51 @@
 use std::sync::Arc;
-use crate::service::Service;
 use crate::backend::processor::Processor;
 use crate::common::{Response, MessageResponse, GenericError};
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::pin::Pin;
 use futures::{ready, future::FutureExt};
+use tower::{Service, layer::Layer};
 use crate::common::MessageState;
 
 const ERR_INTERNAL_RECV: &str = "failed to receive internal message (SSF12)";
+
+#[derive(Clone)]
+pub struct FragmentLayer<P> {
+    processor: Arc<P>,
+}
+
+impl<P> FragmentLayer<P> {
+    pub fn new(processor: P) -> Self {
+        FragmentLayer {
+            processor: Arc::new(processor),
+        }
+    }
+}
+
+impl<S, P> Layer<S> for FragmentLayer<P> {
+    type Service = Fragment<S, P>;
+
+    fn layer(&self, service: S) -> Self::Service {
+        Fragment {
+            service,
+            processor: self.processor.clone(),
+        }
+    }
+}
 
 pub struct Fragment<S, P> {
     processor: Arc<P>,
     service: S,
 }
 
-impl<S, P> Fragment<S, P> {
-    pub fn new(service: S, processor: P) -> Fragment<S, P> {
-        Fragment {
-            service,
-            processor: Arc::new(processor),
-        }
-    }
-}
-
 impl<S, P> Service<P::Message> for Fragment<S, P>
 where
-    S: Service<Vec<P::Message>> + Send + Sync,
+    S: Service<Vec<P::Message>>,
     S::Future: Unpin,
     S::Response: IntoIterator<Item = Response<P::Message>>,
-    S::Error: Into<GenericError> + Send + Sync,
-    P: Processor,
+    S::Error: Into<GenericError>,
+    P: Processor + Send + Sync,
 {
     type Response = P::Message;
     type Error = GenericError;
@@ -53,6 +68,7 @@ where
         // message, we can turn around and hand it back.
         if freq.len() == 1 && freq[0].0 == MessageState::Inline {
             let pair = freq.remove(0);
+            debug!("passing as inline");
             return FragmentResponse::inline(pair.1);
         }
 
@@ -72,6 +88,7 @@ where
         // Now, pass along the subrequests that actually need to hit a backend node to the
         // underlying service, and pass our laid-out response slots and the "actual" subrequest
         // response futures along so we can defragment when all subrequests are ready.
+        debug!("request is fragmented");
         let response = self.service.call(sreq);
         FragmentResponse::new(slots, response, self.processor.clone())
     }
@@ -148,10 +165,10 @@ where
                 let mut ordered = Vec::with_capacity(self.msg_states.len());
                 for msg in responses {
                     let amsg = match msg {
-                        MessageResponse::Complete(m) => m,
                         MessageResponse::Failed => {
-                            self.processor.as_ref().unwrap().get_error_message_str(ERR_INTERNAL_RECV)
+                            self.processor.as_ref().unwrap().get_error_message(ERR_INTERNAL_RECV)
                         },
+                        MessageResponse::Complete(m) => m,
                     };
 
                     ordered.push((self.msg_states.remove(0), amsg));

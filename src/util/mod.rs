@@ -17,33 +17,11 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-use std::future::Future;
-
-mod timed;
-mod untyped;
-pub use self::{timed::Timed, untyped::Untyped};
-
 mod container;
 pub use self::container::IntegerMappedVec;
 
-impl<T: ?Sized> FutureExt for T where T: Future {}
+mod mock;
+pub use self::mock::MockStream;
 
-pub trait FutureExt: Future {
-    fn timed(self, start: u64) -> Timed<Self>
-    where
-        Self: Sized + Unpin,
-    {
-        Timed::new(self, start)
-    }
-
-    fn untyped(self) -> Untyped<Self>
-    where
-        Self: Sized + Unpin,
-    {
-        Untyped::new(self)
-    }
-}
-
-pub trait Sizable {
-    fn size(&self) -> usize;
-}
+mod string;
+pub use self::string::*;

@@ -29,33 +29,36 @@ pub use self::errors::{BackendError, PoolError};
 
 use crate::{
     backend::{distributor::BackendDescriptor, health::BackendHealth, processor::Processor},
-    common::{EnqueuedRequests, Message, ResponseFuture, Responses, GenericError, ConnectionFuture},
+    common::{EnqueuedRequest, EnqueuedRequests, Message, ResponseFuture, Responses, GenericError, ConnectionFuture},
     errors::CreationError,
-    protocol::errors::ProtocolError,
     service::DrivenService,
 };
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::pin::Pin;
+use std::mem;
 use futures::{ready, stream::FuturesOrdered, future::FutureExt};
 use metrics_runtime::{data::Counter, Sink as MetricSink};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     net::SocketAddr,
     str::FromStr,
     time::Duration,
 };
-use tokio::net::tcp::TcpStream;
 use tokio::future::FutureExt as TokioFutureExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 // Don't talk to me about this, I don't wanna talk about it.
 const LONG_ASS_TIME: u64 = 5 * 365 * 24 * 60 * 60;
 
-enum ConnectionState {
+enum ConnectionState<RW>
+where
+    RW: AsyncRead + AsyncWrite + Send + 'static,
+{
     Disconnected,
-    Connecting(ConnectionFuture),
-    Connected(Option<TcpStream>),
-    Processing(Pin<Box<dyn Future<Output = Result<TcpStream, BackendError>> + Send>>),
+    Connecting(ConnectionFuture<RW>),
+    Connected(Option<RW>),
+    Processing(Pin<Box<dyn Future<Output = Result<RW, BackendError>> + Send>>),
 }
 
 /// A backend connection.
@@ -63,26 +66,28 @@ enum ConnectionState {
 /// This represents a one-to-one mapping with a TCP connection to the given backend server.  This
 /// connection will independently poll the work queue for the backend and run requests when
 /// available.
-pub struct BackendConnection<P>
+pub struct BackendConnection<P, RW>
 where
-    P: Processor + Send + Sync,
-    P::Message: Message + Clone + Send + Sync,
+    P: Processor<RW> + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     processor: P,
     address: SocketAddr,
     timeout_ms: u64,
     noreply: bool,
 
-    state: ConnectionState,
-    pending: VecDeque<EnqueuedRequests<P::Message>>,
+    state: ConnectionState<RW>,
+    pending: Vec<EnqueuedRequest<P::Message>>,
 
     connects: Counter,
 }
 
-impl<P> BackendConnection<P>
+impl<P, RW> BackendConnection<P, RW>
 where
-    P: Processor + Send + Sync,
-    P::Message: Message + Clone + Send + Sync,
+    P: Processor<RW> + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     pub fn new(
         address: SocketAddr,
@@ -90,23 +95,24 @@ where
         timeout_ms: u64,
         noreply: bool,
         mut sink: MetricSink,
-    ) -> BackendConnection<P> {
+    ) -> BackendConnection<P, RW> {
         BackendConnection {
             processor,
             address,
             timeout_ms,
             noreply,
             state: ConnectionState::Disconnected,
-            pending: VecDeque::new(),
+            pending: Vec::new(),
             connects: sink.counter("connects"),
         }
     }
 }
 
-impl<P> DrivenService<EnqueuedRequests<P::Message>> for BackendConnection<P>
+impl<P, RW> DrivenService<EnqueuedRequests<P::Message>> for BackendConnection<P, RW>
 where
-    P: Processor + Send + Sync,
-    P::Message: Message + Clone + Send + Sync,
+    P: Processor<RW> + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     type Error = GenericError;
     type Future = ResponseFuture<P::Message>;
@@ -117,7 +123,7 @@ where
     }
 
     fn poll_service(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let span = tracing::trace_span!("poll service", backend.addr = ?self.address);
+        let span = tracing::debug_span!("poll service", backend.addr = ?self.address);
         let _guard = span.enter();
 
         loop {
@@ -125,11 +131,11 @@ where
                 ConnectionState::Disconnected => {
                     // If we're disconnected, we only need to both connecting if we have requests.
                     if self.pending.is_empty() {
-                        tracing::trace!("no requests to process; sleeping");
+                        tracing::debug!("no requests to process; sleeping");
                         return Poll::Ready(Ok(()));
                     }
 
-                    tracing::trace!("pending requests, trying to connect to backend");
+                    tracing::debug!("pending requests, trying to connect to backend");
                     // We have items to process, so we need to start by actually connecting.
                     (ConnectionState::Connecting(self.processor.preconnect(self.address, self.noreply)), None)
                 },
@@ -139,7 +145,7 @@ where
                         return Poll::Pending
                     },
                     Poll::Ready(Ok(conn)) => {
-                        tracing::trace!("successfully connected");
+                        tracing::debug!("successfully connected");
                         self.connects.increment();
                         (ConnectionState::Connected(Some(conn)), None)
                     },
@@ -159,11 +165,12 @@ where
                         // client-side timeout to occur, as they wait their turn in line to have
                         // their message tried and failed for every poll in the "connecting" state,
                         // which includes waiting for each message failure plus a likely cooloff
-                        // period.
+                        // period. Messages could easily spend minutes waiting without client-side
+                        // timeouts to fail the request from the other side.
                         //
                         // By clearing all pending messages, we fast fail ourselves.  If continual
                         // traffic is coming in, it will still quickly trigger enough errors for
-                        // the cooloff feature to kick in, propetly downing the backend within the
+                        // the cooloff feature to kick in, properly downing the backend within the
                         // pool, but we can get back to clients much faster on the fact that the
                         // backend is experiencing issues.
                         self.pending.clear();
@@ -173,16 +180,24 @@ where
                 },
                 ConnectionState::Connected(ref mut conn) => {
                     if !self.pending.is_empty() {
-                        let next = self.pending.pop_front().expect("self.pending should not be empty");
+                        let batch_size = 32;
+                        let batch = if batch_size > self.pending.len() {
+                            mem::replace(&mut self.pending, Vec::new())
+                        } else {
+                            let new = self.pending.split_off(batch_size);
+                            mem::replace(&mut self.pending, new)
+                        };
+
                         let timeout_ms = if self.timeout_ms == 0 {
                             LONG_ASS_TIME
                         } else {
                             self.timeout_ms
                         };
+                        tracing::debug!("timeout is {}", timeout_ms);
 
                         let conn = conn.take().expect("conn should have been existing connection");
                         let process = self.processor
-                            .process(next, conn)
+                            .process(batch, conn)
                             .timeout(Duration::from_millis(timeout_ms))
                             .map(|r| {
                                 match r {
@@ -195,11 +210,11 @@ where
                             })
                             .boxed();
 
-                        tracing::trace!("took pending request, trying to process");
+                        tracing::debug!("took pending request, trying to process");
 
                         (ConnectionState::Processing(process), None)
                     } else {
-                        tracing::trace!("connected but no requests to process; sleeping");
+                        tracing::debug!("connected but no requests to process; sleeping");
                         // We're connected but have no items to process; we're done for now.
                         return Poll::Ready(Ok(()));
                     }
@@ -208,7 +223,7 @@ where
                     // We processed the request just fine, so reset ourselves by taking back the
                     // connection and seeing if we have any more requests to process.
                     Ok(conn) => {
-                        tracing::trace!("successfully processed request; resetting state");
+                        tracing::debug!("successfully processed request; resetting state");
                         (ConnectionState::Connected(Some(conn)), None)
                     },
                     // We encountered an error while processing, which is _likely_ going to mean
@@ -228,7 +243,7 @@ where
     }
 
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        tracing::trace!(message = "poll close", backend.addr = ?self.address);
+        tracing::debug!(message = "poll close", backend.addr = ?self.address);
         self.poll_service(cx)
     }
 
@@ -245,8 +260,8 @@ where
             });
 
 
-        tracing::trace!(message = "call", backend.addr = ?self.address, count = batch.len(), pending = self.pending.len());
-        self.pending.push_back(batch);
+        tracing::debug!(message = "call", backend.addr = ?self.address, count = batch.len(), pending = self.pending.len());
+        self.pending.extend(batch);
 
         ResponseFuture::new(fut)
     }
@@ -263,22 +278,24 @@ where
 ///
 /// Backends maintain a given number of connections to their underlying service, and track error
 /// states, recycling connections and pausing work when required.
-pub struct Backend<P>
+pub struct Backend<P, RW>
 where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Clone + Send + Sync,
+    P: Processor<RW> + Clone + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     identifier: String,
     health: BackendHealth,
-    conns: Vec<BackendConnection<P>>,
+    conns: Vec<BackendConnection<P, RW>>,
     conns_index: usize,
     sink: MetricSink,
 }
 
-impl<P> Backend<P>
+impl<P, RW> Backend<P, RW>
 where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Clone + Send + Sync,
+    P: Processor<RW> + Clone + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     pub fn new(
         address: SocketAddr,
@@ -287,10 +304,10 @@ where
         mut options: HashMap<String, String>,
         noreply: bool,
         sink: MetricSink,
-    ) -> Result<Backend<P>, CreationError>
+    ) -> Result<Backend<P, RW>, CreationError>
     where
-        P: Processor + Clone + Send + Sync,
-        P::Message: Message + Clone + Send + Sync,
+        P: Processor<RW> + Clone + Send + Sync,
+        P::Message: Message + Send,
     {
         let sink = sink.scoped("backend");
 
@@ -344,10 +361,11 @@ where
     }
 }
 
-impl<P> DrivenService<EnqueuedRequests<P::Message>> for Backend<P>
+impl<P, RW> DrivenService<EnqueuedRequests<P::Message>> for Backend<P, RW>
 where
-    P: Processor + Clone + Send + Sync,
-    P::Message: Message + Clone + Send + Sync,
+    P: Processor<RW> + Clone + Send + Sync,
+    P::Message: Message + Send,
+    RW: AsyncRead + AsyncWrite + Send + 'static,
 {
     type Error = GenericError;
     type Future = ResponseFuture<P::Message>;
@@ -374,7 +392,10 @@ where
             match conn.poll_service(cx) {
                 Poll::Pending => any_pending = true,
                 Poll::Ready(Ok(())) => {},
-                Poll::Ready(Err(_)) => self.health.increment_error(),
+                Poll::Ready(Err(e)) => {
+                    tracing::error!("caught error driving connection {}", e);
+                    self.health.increment_error()
+                },
             }
         }
 

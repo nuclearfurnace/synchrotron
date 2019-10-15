@@ -36,11 +36,11 @@ impl<'de> Deserialize<'de> for BackendAddress {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        let mut parts = s.split(" ");
+        let mut parts = s.split(' ');
 
         let address = parts
             .next()
-            .ok_or(D::Error::custom("missing address"))?
+            .ok_or_else(|| D::Error::custom("missing address"))?
             .parse::<SocketAddr>()
             .map_err(D::Error::custom)?;
         let identifier = parts

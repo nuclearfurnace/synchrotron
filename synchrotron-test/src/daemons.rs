@@ -76,6 +76,7 @@ impl SynchrotronRunner {
         // Now try and launch Synchrotron.
         let handle = Command::new("../target/debug/synchrotron")
             .env("SYNC_CONFIG", file_path)
+            .env("RUST_LOG", "debug")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
