@@ -12,6 +12,10 @@
 
 Synchrotron is a caching layer load balancer, in the spirit of [Twemproxy](https://github.com/twitter/twemproxy) and [mcrouter](https://github.com/facebook/mcrouter).
 
+# archived!
+
+After going another direction at work, this project is now archived!  My hope is that some of the design can act as an inspiration, although given the heavy `futures@0.1` basis of the project, it may be less relevant in the async/await world than I think.
+
 # Why another one?
 
 There's a few things here:
